@@ -5,14 +5,49 @@ concurrent audio streams without blocking or interference.
 """
 
 import logging
+import os
 import queue
 import threading
+import time
 from typing import Optional
 
 import numpy as np
 import sounddevice as sd
 
 logger = logging.getLogger("voicemode.audio_player")
+
+# --- Convomode live pause (interrupt mid-sentence) ---------------------------
+# The menu-bar widget (or `convomode-floor.py`) can pause live speech the instant
+# William taps Pause — e.g. an incoming phone call — by creating the flag file
+# below; removing it (Proceed) lets the next utterance play normally.
+#
+# The realtime audio callback must NOT do file I/O (it runs on the audio thread),
+# so a single daemon watcher polls the flag (~50ms) and reflects it into an
+# in-memory Event; the callback only reads that Event. When set, the current
+# stream is stopped immediately, cutting speech mid-word.
+PAUSE_FLAG_PATH = os.path.expanduser("~/.voicemode/pause.flag")
+_pause_event = threading.Event()
+
+
+def convomode_paused() -> bool:
+    """True while convomode is paused (the pause flag file exists)."""
+    return _pause_event.is_set()
+
+
+def _pause_flag_watcher():
+    while True:
+        try:
+            if os.path.exists(PAUSE_FLAG_PATH):
+                _pause_event.set()
+            else:
+                _pause_event.clear()
+        except Exception:
+            _pause_event.clear()
+        time.sleep(0.05)
+
+
+# Daemon so it never blocks interpreter exit; started once at import.
+threading.Thread(target=_pause_flag_watcher, daemon=True, name="convomode-pause-watcher").start()
 
 
 class NonBlockingAudioPlayer:
@@ -52,6 +87,13 @@ class NonBlockingAudioPlayer:
         """
         if status:
             logger.warning(f"Audio callback status: {status}")
+
+        # Convomode pause — cut speech instantly, mid-sentence, the moment the
+        # pause flag is set (e.g. William taps Pause for an incoming call).
+        if _pause_event.is_set():
+            outdata[:] = 0
+            self.playback_complete.set()
+            raise sd.CallbackStop()
 
         try:
             # Get audio chunk from queue
