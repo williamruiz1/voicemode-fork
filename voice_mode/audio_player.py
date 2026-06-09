@@ -87,29 +87,6 @@ def _speaking_dec():
                 pass
 
 
-# --- Force TTS to the built-in speakers (William 2026-06-08) ------------------
-# AirPods roam between William's three Macs; when they wander off, TTS on the
-# system-default output became inaudible. Pin playback to the built-in Mac
-# speakers, RE-RESOLVED on every utterance so a disconnected/roamed Bluetooth
-# device can never steal it. Fail open to the default device if speakers aren't
-# found. Disable with VOICEMODE_FORCE_BUILTIN_SPEAKER=0.
-def _resolve_output_device():
-    if os.environ.get("VOICEMODE_FORCE_BUILTIN_SPEAKER", "1").lower() in ("0", "false", "no"):
-        return None
-    try:
-        for i, d in enumerate(sd.query_devices()):
-            if d.get("max_output_channels", 0) <= 0:
-                continue
-            name = (d.get("name") or "").lower()
-            # macOS built-in output is "<Model> Speakers" or "Built-in Output";
-            # AirPods / external monitors never match these.
-            if "speaker" in name or "built-in output" in name:
-                return i
-    except Exception:
-        pass
-    return None  # → sounddevice default device
-
-
 class NonBlockingAudioPlayer:
     """Non-blocking audio player using callback-based playback.
 
@@ -236,8 +213,7 @@ class NonBlockingAudioPlayer:
                 channels=channels,
                 callback=self._audio_callback,
                 blocksize=self.buffer_size,
-                dtype=np.float32,
-                device=_resolve_output_device(),   # built-in speakers, not roaming AirPods
+                dtype=np.float32
             )
             self.stream.start()
             _speaking_inc()   # TTS is now audibly playing → raise the "speaking" flag
