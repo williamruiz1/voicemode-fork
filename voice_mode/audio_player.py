@@ -50,6 +50,43 @@ def _pause_flag_watcher():
 threading.Thread(target=_pause_flag_watcher, daemon=True, name="convomode-pause-watcher").start()
 
 
+# --- Convomode "speaking" signal (drives the menu-bar live-audio indicator) ---
+# While TTS is ACTUALLY playing, this flag file exists so VibeDispatcher's waveform
+# bars animate ONLY when an agent is really talking (William 2026-06-08: "I only want
+# it to move when it's talking" — before, the bars looped continuously whenever a
+# session held the floor). Ref-counted so overlapping playbacks don't clear it early;
+# the flag is removed only when the LAST active playback finishes.
+SPEAKING_FLAG_PATH = os.path.expanduser("~/.voicemode/speaking.flag")
+_speaking_lock = threading.Lock()
+_speaking_count = 0
+
+
+def _speaking_inc():
+    global _speaking_count
+    with _speaking_lock:
+        _speaking_count += 1
+        if _speaking_count == 1:
+            try:
+                os.makedirs(os.path.dirname(SPEAKING_FLAG_PATH), exist_ok=True)
+                open(SPEAKING_FLAG_PATH, "w").close()
+            except Exception:
+                pass
+
+
+def _speaking_dec():
+    global _speaking_count
+    with _speaking_lock:
+        if _speaking_count > 0:
+            _speaking_count -= 1
+        if _speaking_count == 0:
+            try:
+                os.remove(SPEAKING_FLAG_PATH)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+
+
 class NonBlockingAudioPlayer:
     """Non-blocking audio player using callback-based playback.
 
@@ -179,9 +216,22 @@ class NonBlockingAudioPlayer:
                 dtype=np.float32
             )
             self.stream.start()
+            _speaking_inc()   # TTS is now audibly playing → raise the "speaking" flag
 
             if blocking:
-                self.wait()
+                try:
+                    self.wait()
+                finally:
+                    _speaking_dec()
+            else:
+                # Non-blocking: clear the flag when THIS playback finishes. The
+                # callback always sets playback_complete (end-of-stream, error, or
+                # pause), so this never strands the flag.
+                def _clear_speaking_when_done(ev=self.playback_complete):
+                    ev.wait()
+                    _speaking_dec()
+                threading.Thread(target=_clear_speaking_when_done, daemon=True,
+                                 name="convomode-speaking-clear").start()
 
         except Exception as e:
             self.playback_error = e
