@@ -47,6 +47,7 @@ from voice_mode.config import (
     VAD_AGGRESSIVENESS,
     SILENCE_THRESHOLD_MS,
     MIN_RECORDING_DURATION,
+    VAD_ENERGY_THRESHOLD,
     SKIP_TTS,
     TTS_SPEED,
     VAD_CHUNK_DURATION_MS,
@@ -1036,8 +1037,34 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                                blocksize=chunk_samples):
                 
                 logger.debug("Started continuous audio stream")
-                
+
+                # Manual turn-end signal (push-to-talk "I'm done"). A reachable-while-
+                # driving surface (Apple Shortcut → SSH → `touch`) drops this file to end
+                # the listen window IMMEDIATELY, no VAD needed. Cleaned up on each entry so
+                # a stale signal can't pre-end the next turn.
+                _turn_end_signal = os.path.expanduser("~/.voicemode/turn-end.signal")
+                try:
+                    if os.path.exists(_turn_end_signal):
+                        os.remove(_turn_end_signal)
+                except Exception:
+                    pass
+
                 while recording_duration < max_duration and not stop_recording:
+                    # Honor a manual turn-end signal first (push-to-talk). If William
+                    # tapped his "done" Shortcut, end the recording now (only after the
+                    # min duration so a too-fast tap can't return empty audio).
+                    try:
+                        if os.path.exists(_turn_end_signal) and recording_duration >= max(MIN_RECORDING_DURATION, min_duration):
+                            logger.info("✓ Manual turn-end signal received — stopping recording")
+                            try:
+                                os.remove(_turn_end_signal)
+                            except Exception:
+                                pass
+                            stop_recording = True
+                            speech_detected = True  # he spoke and signaled done; transcribe it
+                            break
+                    except Exception:
+                        pass
                     try:
                         # Get audio chunk from queue with timeout
                         chunk = audio_queue.get(timeout=0.1)
@@ -1065,11 +1092,24 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                         # Check if chunk contains speech
                         try:
                             is_speech = vad.is_speech(chunk_bytes, vad_sample_rate)
+                            # ENERGY GATE (driving profile): webrtcvad has no energy
+                            # floor, so steady road/engine noise reads as "speech" and
+                            # the silence counter never accumulates → the mic hangs.
+                            # When an energy threshold is set, a chunk only counts as
+                            # speech if it ALSO clears the RMS floor; below-floor chunks
+                            # (road rumble) are treated as silence so end-of-turn is
+                            # detected. Disabled (==0) → pure-webrtcvad, unchanged.
+                            if is_speech and VAD_ENERGY_THRESHOLD > 0:
+                                chunk_rms = float(np.sqrt(np.mean(chunk.astype(float) ** 2)))
+                                if chunk_rms < VAD_ENERGY_THRESHOLD:
+                                    is_speech = False
+                                    if VAD_DEBUG and int(recording_duration * 1000) % 500 == 0:
+                                        logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: energy-gated (RMS={chunk_rms:.0f} < floor={VAD_ENERGY_THRESHOLD:.0f}) -> silence")
                             if VAD_DEBUG:
                                 # Log VAD decision every 500ms for less spam
                                 if int(recording_duration * 1000) % 500 == 0:
                                     rms = np.sqrt(np.mean(chunk.astype(float)**2))
-                                    logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: speech={is_speech}, RMS={rms:.0f}, state={'WAITING' if not speech_detected else 'ACTIVE'}")
+                                    logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: speech={is_speech}, RMS={rms:.0f}, floor={VAD_ENERGY_THRESHOLD:.0f}, state={'WAITING' if not speech_detected else 'ACTIVE'}")
                         except Exception as vad_e:
                             logger.warning(f"VAD error: {vad_e}, treating as speech")
                             is_speech = True

@@ -747,6 +747,19 @@ VAD_AGGRESSIVENESS = int(os.getenv("VOICEMODE_VAD_AGGRESSIVENESS", "3"))  # 0-3,
 SILENCE_THRESHOLD_MS = int(os.getenv("VOICEMODE_SILENCE_THRESHOLD_MS", "1000"))  # Stop after 1000ms (1 second) of silence
 MIN_RECORDING_DURATION = float(os.getenv("VOICEMODE_MIN_RECORDING_DURATION", "0.5"))  # Minimum 0.5s recording
 VAD_CHUNK_DURATION_MS = 30  # VAD frame size (must be 10, 20, or 30ms)
+
+# Energy floor for the VAD (the "driving profile" noise gate). webrtcvad has NO
+# energy threshold of its own — in a noisy environment (road/engine noise) it
+# classifies the noise floor itself as "speech", so the trailing-silence counter
+# never accumulates and the mic hangs until listen_duration_max. Requiring a
+# chunk to ALSO clear an RMS energy floor makes steady low-level noise read as
+# silence (so end-of-turn is detected) while a real spoken voice — which is much
+# louder than road rumble at a close-talking AirPods mic — still passes.
+#   0      = OFF (default; pure-webrtcvad behavior, unchanged for quiet rooms).
+#   ~250-400 = a sensible DRIVING value at the 24kHz int16 close-mic scale.
+# Calibrate with VOICEMODE_VAD_DEBUG=true (the [VAD_DEBUG] lines print per-chunk
+# RMS): pick a floor above the "WAITING" road-noise RMS and below your speech RMS.
+VAD_ENERGY_THRESHOLD = float(os.getenv("VOICEMODE_VAD_ENERGY_THRESHOLD", "0"))  # 0 = disabled (off by default)
 INITIAL_SILENCE_GRACE_PERIOD = float(os.getenv("VOICEMODE_INITIAL_SILENCE_GRACE_PERIOD", "1"))  # No initial silence grace period by default
 
 # Default listen duration for converse tool
