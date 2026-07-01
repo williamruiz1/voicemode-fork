@@ -41,6 +41,15 @@ def _get_lock_expiry() -> float:
         return 120.0  # Default 2 minutes
 
 
+def _get_wanted_fresh() -> float:
+    """Get the conch-wanted freshness window from config, with fallback."""
+    try:
+        from voice_mode.config import CONCH_WANTED_FRESH
+        return CONCH_WANTED_FRESH
+    except ImportError:
+        return 5.0
+
+
 class Conch:
     """Simple lock file for voice conversation coordination.
 
@@ -317,6 +326,129 @@ class Conch:
             return json.loads(cls.LOCK_FILE.read_text())
         except (json.JSONDecodeError, OSError):
             return None
+
+    # ---- Yield-request channel (transient + preemptible audio focus) ----
+    #
+    # A waiter that wants the mic writes/refreshes ~/.voicemode/conch-wanted.
+    # A holder that is merely LISTENING (idle) polls is_wanted() and ends its
+    # listen early to hand the mic over; a holder that is SPEAKING ignores it
+    # (TTS is never preempted mid-utterance). The request goes stale after
+    # CONCH_WANTED_FRESH seconds (waiters refresh every poll), so a crashed
+    # waiter can't force yields forever.
+
+    WANTED_FILE = Path.home() / ".voicemode" / "conch-wanted"
+
+    @classmethod
+    def request_yield(cls, agent_name: Optional[str] = None) -> None:
+        """Write/refresh the conch-wanted request as this process.
+
+        Best-effort: any failure is swallowed (the waiter still has the
+        timeout/preempt path as its backstop).
+        """
+        try:
+            cls.WANTED_FILE.parent.mkdir(parents=True, exist_ok=True)
+            cls.WANTED_FILE.write_text(json.dumps({
+                "pid": os.getpid(),
+                "agent": agent_name or "unknown",
+                "requested": datetime.now().isoformat(),
+            }, indent=2))
+        except OSError:
+            pass
+
+    @classmethod
+    def clear_yield_request(cls) -> None:
+        """Remove this process's conch-wanted request (no-op if it isn't ours).
+
+        Only the requester clears its own request — clearing another waiter's
+        fresh request would silently cancel their preemption.
+        """
+        try:
+            data = json.loads(cls.WANTED_FILE.read_text())
+            if data.get("pid") == os.getpid():
+                cls.WANTED_FILE.unlink()
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    @classmethod
+    def is_wanted(cls) -> bool:
+        """True if another live process is currently requesting the conch.
+
+        A request counts only when ALL of:
+        - the wanted file exists and parses,
+        - the requester is not this process,
+        - the requester PID is still alive,
+        - the request timestamp is within CONCH_WANTED_FRESH seconds.
+
+        Fails open to False on any error (never yields on a bad read).
+        """
+        try:
+            data = json.loads(cls.WANTED_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return False
+
+        pid = data.get("pid")
+        if not isinstance(pid, int) or pid == os.getpid():
+            return False
+
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            # Requester is dead — reap its stale request.
+            try:
+                cls.WANTED_FILE.unlink()
+            except OSError:
+                pass
+            return False
+        except (PermissionError, OSError):
+            pass  # Exists but not signalable — treat as alive.
+
+        requested_str = data.get("requested")
+        if not requested_str:
+            return False
+        try:
+            requested_time = datetime.fromisoformat(requested_str)
+        except ValueError:
+            return False
+
+        age = (datetime.now() - requested_time).total_seconds()
+        return age <= _get_wanted_fresh()
+
+    def preempt_acquire(self, agent_name: Optional[str] = None) -> bool:
+        """Forcibly take the conch from a holder that never yielded.
+
+        Used by the waiter's hard-timeout path (the old CONCH_TIMEOUT failure
+        becomes preempt-and-acquire). Unlinks the current lock file — the
+        stuck holder keeps its flock on the old inode, but new acquisitions
+        get a fresh file — then does a normal atomic try_acquire (so two
+        concurrent preempters still serialize; only one wins).
+
+        Callers are responsible for the never-mid-utterance grace (checking
+        the speaking flag) BEFORE preempting.
+        """
+        old_holder = None
+        try:
+            old_holder = json.loads(self.LOCK_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+        try:
+            self.LOCK_FILE.unlink()
+        except OSError:
+            pass
+        acquired = self.try_acquire(agent_name)
+        if acquired:
+            try:
+                from voice_mode.utils.event_logger import get_event_logger
+                event_logger = get_event_logger()
+                if event_logger:
+                    event_logger.log_event("CONCH_PREEMPT", {
+                        "pid": os.getpid(),
+                        "agent": agent_name or self.agent_name or "unknown",
+                        "preempted_pid": (old_holder or {}).get("pid"),
+                        "preempted_agent": (old_holder or {}).get("agent"),
+                    })
+            except Exception:
+                pass
+        return acquired
 
     def __enter__(self):
         """Context manager entry - acquire the lock."""

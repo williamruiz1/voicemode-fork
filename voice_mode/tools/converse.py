@@ -5,7 +5,7 @@ import logging
 import os
 import time
 import traceback
-from typing import Optional, Literal, Tuple, Dict, Union
+from typing import Callable, Optional, Literal, Tuple, Dict, Union
 from pathlib import Path
 from datetime import datetime
 
@@ -65,6 +65,8 @@ from voice_mode.config import (
     CONCH_ENABLED,
     CONCH_TIMEOUT,
     CONCH_CHECK_INTERVAL,
+    CONCH_YIELD_ENABLED,
+    CONCH_PREEMPT_TTS_GRACE,
     AUTO_FOCUS_PANE,
     STT_MODEL
 )
@@ -81,7 +83,7 @@ from voice_mode.core import (
     play_chime_end,
     play_system_audio
 )
-from voice_mode.audio_player import NonBlockingAudioPlayer
+from voice_mode.audio_player import NonBlockingAudioPlayer, SPEAKING_FLAG_PATH
 from voice_mode.statistics_tracking import track_voice_interaction
 from voice_mode.utils import (
     get_event_logger,
@@ -931,18 +933,48 @@ def record_audio(duration: float) -> np.ndarray:
             sys.stderr = original_stderr
 
 
-def record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None) -> Tuple[np.ndarray, bool]:
+async def _preempt_conch_after_tts_grace(conch: Conch, speaking_flag_path: str = None) -> bool:
+    """Preempt-and-acquire the conch at the waiter's hard timeout — never mid-utterance.
+
+    While the current holder is actually playing TTS (the speaking flag is
+    present), grant up to CONCH_PREEMPT_TTS_GRACE extra seconds — the holder
+    normally releases (or its idle listen yields) in that window. Only after
+    the flag clears or the grace is exhausted does the force-clear happen.
+
+    Returns True if the conch ended up acquired.
+    """
+    flag_path = speaking_flag_path or SPEAKING_FLAG_PATH
+    grace = 0.0
+    while (not conch.try_acquire()
+           and os.path.exists(flag_path)
+           and grace < CONCH_PREEMPT_TTS_GRACE):
+        await asyncio.sleep(CONCH_CHECK_INTERVAL)
+        grace += CONCH_CHECK_INTERVAL
+    if not conch._acquired:
+        conch.preempt_acquire("converse")
+    return conch._acquired
+
+
+def record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, yield_check: Optional[Callable[[], bool]] = None, yield_state: Optional[dict] = None) -> Tuple[np.ndarray, bool]:
     """Record audio from microphone with automatic silence detection.
-    
+
     Uses WebRTC VAD to detect when the user stops speaking and automatically
     stops recording after a configurable silence threshold.
-    
+
     Args:
         max_duration: Maximum recording duration in seconds
         disable_silence_detection: If True, disables silence detection and uses fixed duration recording
         min_duration: Minimum recording duration before silence detection can stop (default: 0.0)
         vad_aggressiveness: VAD aggressiveness level (0-3). If None, uses VAD_AGGRESSIVENESS from config
-        
+        yield_check: Optional callable polled during the listen loop. When it
+            returns True while the listen is still IDLE (no speech detected
+            yet), recording ends early so the caller can yield the mic to
+            another agent (vibedispatcher#132). Never fires once speech has
+            been detected — an in-progress utterance always completes.
+        yield_state: Optional dict; when the listen ends because of
+            yield_check, ``yield_state["yielded"]`` is set True. (Out-of-band
+            so the 2-tuple return stays stable for existing callers.)
+
     Returns:
         Tuple of (audio_data, speech_detected):
             - audio_data: Numpy array of recorded audio samples
@@ -1065,6 +1097,20 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                             break
                     except Exception:
                         pass
+
+                    # Yieldable listen (vibedispatcher#132): another agent is asking
+                    # for the mic. Yield ONLY while idle — once speech has been
+                    # detected, the in-progress utterance completes via VAD as usual.
+                    if yield_check is not None and not speech_detected:
+                        try:
+                            if yield_check():
+                                logger.info("✓ Conch requested by another agent — yielding idle listen")
+                                if yield_state is not None:
+                                    yield_state["yielded"] = True
+                                stop_recording = True
+                                break
+                        except Exception:
+                            pass
                     try:
                         # Get audio chunk from queue with timeout
                         chunk = audio_queue.get(timeout=0.1)
@@ -1223,7 +1269,7 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                     
                     # Try recording again with the new device (recursive call in sync context)
                     logger.info("Retrying recording with new audio device...")
-                    return record_audio_with_silence_detection(max_duration, disable_silence_detection, min_duration, vad_aggressiveness)
+                    return record_audio_with_silence_detection(max_duration, disable_silence_detection, min_duration, vad_aggressiveness, yield_check, yield_state)
                     
                 except Exception as reinit_error:
                     logger.error(f"Failed to reinitialize audio: {reinit_error}")
@@ -1532,8 +1578,20 @@ consult the MCP resources listed above.
 
                 waited = 0.0
                 while not conch.try_acquire() and waited < CONCH_TIMEOUT:
+                    # Ask a merely-listening holder to hand the mic over
+                    # (vibedispatcher#132). Refreshed every poll so the request
+                    # stays fresh; an idle holder yields within seconds.
+                    if CONCH_YIELD_ENABLED:
+                        Conch.request_yield("converse")
                     await asyncio.sleep(CONCH_CHECK_INTERVAL)
                     waited += CONCH_CHECK_INTERVAL
+
+                if not conch._acquired and CONCH_YIELD_ENABLED:
+                    # Hard timeout: preempt-and-acquire instead of failing — but
+                    # NEVER mid-utterance (see _preempt_conch_after_tts_grace).
+                    await _preempt_conch_after_tts_grace(conch)
+
+                Conch.clear_yield_request()
 
                 if event_logger:
                     event_logger.log_event("CONCH_WAIT_END", {
@@ -1739,20 +1797,47 @@ consult the MCP resources listed above.
                 if event_logger:
                     event_logger.log_event(event_logger.RECORDING_START)
 
+                # Yieldable listen (vibedispatcher#132): while we hold the conch
+                # and are merely LISTENING (idle), another agent's request ends
+                # the listen early so the mic can be handed over. Only wired when
+                # we actually hold the conch (skip_conch bypass never yields).
+                yield_state = {"yielded": False}
+                listen_yield_check = (
+                    Conch.is_wanted
+                    if (CONCH_ENABLED and CONCH_YIELD_ENABLED and conch._acquired)
+                    else None
+                )
+
                 record_start = time.perf_counter()
                 logger.debug(f"About to call record_audio_with_silence_detection with duration={listen_duration_max}, disable_silence_detection={disable_silence_detection}, min_duration={listen_duration_min}, vad_aggressiveness={vad_aggressiveness}")
                 audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                    None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                    None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness, listen_yield_check, yield_state
                 )
                 timings['record'] = time.perf_counter() - record_start
-                
+
                 # Log recording end
                 if event_logger:
                     event_logger.log_event(event_logger.RECORDING_END, {
                         "duration": timings['record'],
                         "samples": len(audio_data)
                     })
-                
+
+                if yield_state["yielded"]:
+                    # Hand the mic over: skip the finished chime (the requester is
+                    # about to speak), release via the finally block, and tell the
+                    # caller this turn ended without a response.
+                    if event_logger:
+                        event_logger.log_event("CONCH_YIELDED", {
+                            "pid": os.getpid(),
+                            "agent": "converse",
+                            "listened_seconds": timings['record'],
+                        })
+                    success = True  # a clean hand-off, not an error
+                    result = ("Yielded the mic — another agent requested the floor while "
+                              "you were idle-listening. No response was captured. Re-call "
+                              "converse (wait_for_conch=true) when you want to continue.")
+                    return result
+
                 # Play "finished" feedback sound
                 await play_audio_feedback(
                     "finished",
@@ -1924,10 +2009,23 @@ consult the MCP resources listed above.
                         # Record audio
                         record_start = time.perf_counter()
                         audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness, listen_yield_check, yield_state
                         )
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
+
+                        if yield_state["yielded"]:
+                            if event_logger:
+                                event_logger.log_event("CONCH_YIELDED", {
+                                    "pid": os.getpid(),
+                                    "agent": "converse",
+                                    "listened_seconds": record_time,
+                                })
+                            success = True
+                            result = ("Yielded the mic — another agent requested the floor while "
+                                      "you were idle-listening. No response was captured. Re-call "
+                                      "converse (wait_for_conch=true) when you want to continue.")
+                            return result
 
                         # Play "finished" feedback sound
                         await play_audio_feedback(
@@ -1980,10 +2078,23 @@ consult the MCP resources listed above.
                         # Record audio
                         record_start = time.perf_counter()
                         audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness, listen_yield_check, yield_state
                         )
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
+
+                        if yield_state["yielded"]:
+                            if event_logger:
+                                event_logger.log_event("CONCH_YIELDED", {
+                                    "pid": os.getpid(),
+                                    "agent": "converse",
+                                    "listened_seconds": record_time,
+                                })
+                            success = True
+                            result = ("Yielded the mic — another agent requested the floor while "
+                                      "you were idle-listening. No response was captured. Re-call "
+                                      "converse (wait_for_conch=true) when you want to continue.")
+                            return result
 
                         # Play "finished" feedback sound
                         await play_audio_feedback(
@@ -2213,6 +2324,10 @@ consult the MCP resources listed above.
         return result
 
     finally:
+        # Drop any yield request we wrote while waiting (own-pid guarded no-op
+        # if we never requested or another waiter's request is newer).
+        Conch.clear_yield_request()
+
         # Release the conch to signal voice conversation has ended
         if CONCH_ENABLED and conch._acquired:
             held_seconds = conch.release()
