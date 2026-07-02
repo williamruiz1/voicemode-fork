@@ -579,6 +579,23 @@ CONCH_CHECK_INTERVAL = float(os.getenv("VOICEMODE_CONCH_CHECK_INTERVAL", "0.5"))
 # Default 300s (5 min) covers 2 min listen + long TTS. Set to 0 to disable.
 CONCH_LOCK_EXPIRY = float(os.getenv("VOICEMODE_CONCH_LOCK_EXPIRY", "300"))
 
+# Yieldable listen (transient + preemptible audio-focus, vibedispatcher#132):
+# the conch stays EXCLUSIVE during TTS, but while the holder is merely
+# LISTENING (idle, no speech detected) it yields to another agent's request.
+# Set to false to restore the old hold-through-the-whole-turn behavior.
+CONCH_YIELD_ENABLED = os.getenv("VOICEMODE_CONCH_YIELD_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+
+# A conch-wanted request counts only if refreshed within this many seconds
+# (waiters refresh every CONCH_CHECK_INTERVAL, so a crashed waiter's request
+# goes stale quickly and can't force yields forever)
+CONCH_WANTED_FRESH = float(os.getenv("VOICEMODE_CONCH_WANTED_FRESH", "5"))
+
+# When a waiter hits CONCH_TIMEOUT it preempts the lock instead of failing —
+# but never mid-utterance: if the holder is actually playing TTS (speaking
+# flag present), the waiter grants up to this many extra seconds of grace
+# before force-clearing.
+CONCH_PREEMPT_TTS_GRACE = float(os.getenv("VOICEMODE_CONCH_PREEMPT_TTS_GRACE", "30"))
+
 # Auto-focus tmux pane when conch is acquired (for multi-agent setups)
 # When enabled, automatically switches tmux focus to the speaking agent's pane
 AUTO_FOCUS_PANE = env_bool("VOICEMODE_AUTO_FOCUS_PANE", False)
