@@ -84,6 +84,7 @@ from voice_mode.core import (
     play_system_audio
 )
 from voice_mode.audio_player import NonBlockingAudioPlayer, SPEAKING_FLAG_PATH
+from voice_mode import barge_in
 from voice_mode.statistics_tracking import track_voice_interaction
 from voice_mode.utils import (
     get_event_logger,
@@ -955,7 +956,7 @@ async def _preempt_conch_after_tts_grace(conch: Conch, speaking_flag_path: str =
     return conch._acquired
 
 
-def record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, yield_check: Optional[Callable[[], bool]] = None, yield_state: Optional[dict] = None) -> Tuple[np.ndarray, bool]:
+def record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, yield_check: Optional[Callable[[], bool]] = None, yield_state: Optional[dict] = None, pre_roll: Optional[np.ndarray] = None) -> Tuple[np.ndarray, bool]:
     """Record audio from microphone with automatic silence detection.
 
     Uses WebRTC VAD to detect when the user stops speaking and automatically
@@ -974,6 +975,10 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
         yield_state: Optional dict; when the listen ends because of
             yield_check, ``yield_state["yielded"]`` is set True. (Out-of-band
             so the 2-tuple return stays stable for existing callers.)
+        pre_roll: Optional audio already captured BEFORE this call started (natural-mode
+            barge-in: the mic audio that triggered the interruption). When provided, it
+            seeds the recording as already-in-progress speech, so his interruption
+            becomes the start of this turn instead of being discarded and re-prompted.
 
     Returns:
         Tuple of (audio_data, speech_detected):
@@ -1013,11 +1018,14 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
         vad_sample_rate = 16000
         vad_chunk_samples = int(vad_sample_rate * VAD_CHUNK_DURATION_MS / 1000)
         
-        # Recording state
-        chunks = []
+        # Recording state -- seed from natural-mode barge-in pre-roll if given,
+        # so his interruption becomes the start of this turn's speech rather
+        # than being thrown away.
+        has_pre_roll = pre_roll is not None and len(pre_roll) > 0
+        chunks = [pre_roll] if has_pre_roll else []
         silence_duration_ms = 0
-        recording_duration = 0
-        speech_detected = False
+        recording_duration = (len(pre_roll) / SAMPLE_RATE) if has_pre_roll else 0
+        speech_detected = has_pre_roll
         stop_recording = False
         
         # Use a queue for thread-safe communication
@@ -1269,7 +1277,10 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                     
                     # Try recording again with the new device (recursive call in sync context)
                     logger.info("Retrying recording with new audio device...")
-                    return record_audio_with_silence_detection(max_duration, disable_silence_detection, min_duration, vad_aggressiveness, yield_check, yield_state)
+                    return record_audio_with_silence_detection(
+                        max_duration, disable_silence_detection, min_duration, vad_aggressiveness,
+                        yield_check=yield_check, yield_state=yield_state, pre_roll=pre_roll
+                    )
                     
                 except Exception as reinit_error:
                     logger.error(f"Failed to reinitialize audio: {reinit_error}")
@@ -1634,6 +1645,7 @@ consult the MCP resources listed above.
             async with audio_operation_lock:
                 # Speak the message
                 tts_start = time.perf_counter()
+                barge_in_result = None  # set below only when natural mode actually armed a listener
                 if should_skip_tts:
                     # Skip TTS entirely for faster response
                     tts_success = True
@@ -1645,6 +1657,16 @@ consult the MCP resources listed above.
                     }
                     tts_config = {'provider': 'no-op', 'voice': 'none'}
                 else:
+                    # Natural mode (Phase 1 barge-in): arm a concurrent mic
+                    # listener for the duration of this TTS playback. Inert
+                    # (never constructed) in turn mode, the default -- this
+                    # branch only fires when the natural-mode flag file is
+                    # present. See voice_mode/barge_in.py for the mechanism.
+                    barge_in_listener = None
+                    if barge_in.natural_mode_enabled():
+                        barge_in_listener = barge_in.BargeInListener()
+                        barge_in_listener.start()
+
                     # Duck DJ volume during TTS playback
                     with DJDucker():
                         tts_success, tts_metrics, tts_config = await text_to_speech_with_failover(
@@ -1657,7 +1679,12 @@ consult the MCP resources listed above.
                             speed=speed,
                             ref_text=resolved_ref_text
                         )
-                
+
+                    if barge_in_listener is not None:
+                        barge_in_result = barge_in_listener.stop()
+                        if barge_in_result.triggered:
+                            logger.info("🗣️ Natural mode: William spoke over the agent — treating it as the next turn")
+
                 # Add TTS sub-metrics
                 if tts_metrics:
                     timings['ttfa'] = tts_metrics.get('ttfa', 0)
@@ -1777,21 +1804,31 @@ consult the MCP resources listed above.
                     logger.info(f"Speak-only result: {result}")
                     return result
 
-                # Brief pause before listening
-                await asyncio.sleep(0.5)
-                
-                # Play "listening" feedback sound
-                await play_audio_feedback(
-                    "listening",
-                    openai_clients,
-                    chime_enabled,
-                    "whisper",
-                    chime_leading_silence=chime_leading_silence,
-                    chime_trailing_silence=chime_trailing_silence
-                )
-                
-                # Record response
-                logger.info(f"🎤 Listening for {listen_duration_max} seconds...")
+                natural_mode_barge_in = barge_in_result is not None and barge_in_result.triggered
+
+                if natural_mode_barge_in:
+                    # He was already mid-utterance when he interrupted -- a
+                    # "listening" chime now would be a confusing non-sequitur
+                    # (and a fresh 0.5s pause would just eat the start of what
+                    # he's saying). Skip both; go straight to recording, seeded
+                    # with the audio the barge-in listener already captured.
+                    logger.info("🎤 Natural mode barge-in — continuing to listen without a chime")
+                else:
+                    # Brief pause before listening
+                    await asyncio.sleep(0.5)
+
+                    # Play "listening" feedback sound
+                    await play_audio_feedback(
+                        "listening",
+                        openai_clients,
+                        chime_enabled,
+                        "whisper",
+                        chime_leading_silence=chime_leading_silence,
+                        chime_trailing_silence=chime_trailing_silence
+                    )
+
+                    # Record response
+                    logger.info(f"🎤 Listening for {listen_duration_max} seconds...")
 
                 # Log recording start
                 if event_logger:
@@ -1809,9 +1846,10 @@ consult the MCP resources listed above.
                 )
 
                 record_start = time.perf_counter()
-                logger.debug(f"About to call record_audio_with_silence_detection with duration={listen_duration_max}, disable_silence_detection={disable_silence_detection}, min_duration={listen_duration_min}, vad_aggressiveness={vad_aggressiveness}")
+                logger.debug(f"About to call record_audio_with_silence_detection with duration={listen_duration_max}, disable_silence_detection={disable_silence_detection}, min_duration={listen_duration_min}, vad_aggressiveness={vad_aggressiveness}, natural_mode_barge_in={natural_mode_barge_in}")
                 audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                    None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness, listen_yield_check, yield_state
+                    None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness,
+                    listen_yield_check, yield_state, (barge_in_result.pre_roll if natural_mode_barge_in else None)
                 )
                 timings['record'] = time.perf_counter() - record_start
 

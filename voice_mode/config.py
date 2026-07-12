@@ -779,6 +779,72 @@ VAD_CHUNK_DURATION_MS = 30  # VAD frame size (must be 10, 20, or 30ms)
 VAD_ENERGY_THRESHOLD = float(os.getenv("VOICEMODE_VAD_ENERGY_THRESHOLD", "0"))  # 0 = disabled (off by default)
 INITIAL_SILENCE_GRACE_PERIOD = float(os.getenv("VOICEMODE_INITIAL_SILENCE_GRACE_PERIOD", "1"))  # No initial silence grace period by default
 
+# ==================== NATURAL MODE / BARGE-IN CONFIGURATION (Phase 1) ====================
+#
+# "Natural mode" lets the mic stay hot WHILE TTS is playing, so speaking over the
+# agent instantly cuts playback mid-word and becomes the next turn -- unlike the
+# default "turn mode" (unchanged, sequential: speak, THEN listen). Toggled via a
+# flag file (mirrors the existing focus-hold / pause-flag pattern already in this
+# codebase), never an env var, because it's a runtime session choice, not a
+# deployment config. See voice_mode/barge_in.py + docs/guides/natural-mode.md.
+#
+# All values below are TUNING KNOBS for the barge-in trigger + the software echo
+# canceller. They ship with conservative defaults and are EXPECTED to need
+# live, on-device retuning (per the natural-voice-mode research doc, Phase 1
+# task list item 4) -- there is no way to validate AEC/VAD thresholds against a
+# real microphone + speaker acoustic path from code alone.
+
+# Flag file whose presence turns natural mode ON for this machine. Absence (the
+# default) is turn mode, byte-for-byte the existing behavior -- natural mode is
+# fully inert unless this file exists, so it can never regress turn mode.
+NATURAL_MODE_FLAG_PATH = os.path.expanduser(
+    os.getenv("VOICEMODE_NATURAL_MODE_FLAG_PATH", "~/.voicemode/natural-mode.flag")
+)
+
+# How many consecutive ms of post-AEC VAD speech, WHILE TTS is audibly playing,
+# before we treat it as a genuine barge-in (not a brief cough/click/AEC residual).
+# webrtcvad frames are VAD_CHUNK_DURATION_MS (30ms) each, so 300ms ~= 10 frames.
+BARGE_IN_TRIGGER_MS = int(os.getenv("VOICEMODE_BARGE_IN_TRIGGER_MS", "300"))
+
+# VAD aggressiveness used by the CONCURRENT barge-in listener specifically (kept
+# separate from the turn-taking VAD_AGGRESSIVENESS above -- barge-in runs on a
+# post-AEC signal that may still carry echo residual, so a stricter default
+# reduces self-triggering while AEC settles). Falls back to VAD_AGGRESSIVENESS
+# when unset.
+_barge_in_vad_env = os.getenv("VOICEMODE_BARGE_IN_VAD_AGGRESSIVENESS")
+BARGE_IN_VAD_AGGRESSIVENESS = int(_barge_in_vad_env) if _barge_in_vad_env is not None else VAD_AGGRESSIVENESS
+
+# Length of the adaptive echo-cancellation filter, in milliseconds of reference
+# audio. This bounds how much acoustic delay (speaker -> room/AirPods -> mic)
+# the canceller can model; longer = handles more delay/reverb but adapts slower
+# and costs more CPU per frame. ~200ms covers a single close-talking Bluetooth
+# device (the common case here -- AirPods serve both directions, a SHORTER and
+# more linear acoustic path than a laptop's speaker-to-mic leak).
+AEC_FILTER_MS = int(os.getenv("VOICEMODE_AEC_FILTER_MS", "200"))
+
+# Static offset (ms) between when a sample is HANDED to the output stream and
+# when its echo actually reaches the mic (Bluetooth codec + OS buffering delay).
+# 0 = assume no fixed offset; the adaptive filter's tap window still absorbs
+# some misalignment, but if echo consistently leaks through, measure the real
+# round-trip delay on-device and set this explicitly. THIS is one of the two
+# values the live-trial task is expected to retune (the other is
+# VOICEMODE_AEC_FILTER_MS / VOICEMODE_BARGE_IN_TRIGGER_MS).
+AEC_REF_DELAY_MS = int(os.getenv("VOICEMODE_AEC_REF_DELAY_MS", "0"))
+
+# NLMS adaptation step size (0 < mu <= 1). Higher converges faster but is more
+# prone to a known NLMS limitation called "double-talk misadjustment": while
+# BOTH the echo and William's real voice are present at once (exactly the
+# barge-in window we're trying to detect), a high mu makes the filter partly
+# try to "explain away" his uncorrelated speech as unmodeled echo, attenuating
+# the very speech we need the VAD to see. A synthetic-signal sweep (see
+# tests/test_aec.py) showed mu=0.5 preserves only ~19% of a real-speech burst's
+# energy during double-talk vs mu=0.15 preserving more, for near-identical echo
+# attenuation -- so we default LOW, biased toward "don't cancel his real voice"
+# over "cancel the echo perfectly". A real double-talk detector (freeze
+# adaptation when both sides are active) is the textbook fix and a reasonable
+# Phase 2 refinement; out of scope here.
+AEC_STEP_SIZE = float(os.getenv("VOICEMODE_AEC_STEP_SIZE", "0.15"))
+
 # Default listen duration for converse tool
 DEFAULT_LISTEN_DURATION = float(os.getenv("VOICEMODE_DEFAULT_LISTEN_DURATION", "120.0"))  # Default 120s listening time
 

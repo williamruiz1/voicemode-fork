@@ -87,6 +87,133 @@ def _speaking_dec():
                 pass
 
 
+def is_tts_speaking() -> bool:
+    """True while TTS is audibly playing (in-process ref count, not the flag
+    file -- no I/O race, and this is the same signal the barge-in listener
+    needs to decide "is there anything to barge in on right now")."""
+    return _speaking_count > 0
+
+
+# --- Natural-mode barge-in (Phase 1) -----------------------------------------
+# Natural mode (voice_mode/barge_in.py) runs a CONCURRENT mic listener while
+# TTS plays. When it detects sustained post-AEC speech during playback, it
+# calls trigger_barge_in() below -- a SEPARATE event from the manual pause
+# flag above (pause = "William tapped Pause for an incoming call, no new turn
+# implied"; barge-in = "he's talking, that IS the next turn, and the caller
+# needs to know to seed the recording with what was just captured"), but it
+# reuses the EXACT SAME instant mid-buffer stop mechanism -- the callback
+# below checks both events, so no new stop-playback code path was needed.
+_barge_in_event = threading.Event()
+
+
+def trigger_barge_in():
+    """Called by the natural-mode listener the instant it detects a genuine
+    barge-in. Halts the current TTS stream within one audio buffer."""
+    _barge_in_event.set()
+
+
+def barge_in_triggered() -> bool:
+    return _barge_in_event.is_set()
+
+
+def reset_barge_in_event():
+    """Clear the barge-in flag before starting a new listen cycle, so a
+    trigger from a prior turn can't stale-fire the next one."""
+    _barge_in_event.clear()
+
+
+# --- Far-end reference ring buffer (the AEC's known-echo-source signal) ------
+# Acoustic echo cancellation needs the EXACT reference signal being sent to
+# the speaker so it can predict what echoes back into the mic. Rather than
+# re-deriving that from scratch, every audio buffer NonBlockingAudioPlayer
+# actually writes to the output stream is copied into this fixed-size
+# circular buffer, keyed by a monotonically increasing sample counter so a
+# reader can ask for "the reference audio as of N samples ago" (accounting
+# for the acoustic/Bluetooth round-trip delay -- see config.AEC_REF_DELAY_MS).
+#
+# NOTE: if multiple players overlap (e.g. DJ background music playing
+# alongside TTS), this buffer reflects whichever callback wrote most
+# recently -- natural mode + concurrent DJ audio is an acknowledged Phase 1
+# gap, not silently handled.
+_REF_BUFFER_SECONDS = 5
+_ref_buffer_lock = threading.Lock()
+_ref_buffer: Optional[np.ndarray] = None
+_ref_buffer_capacity = 0
+_ref_write_pos = 0  # monotonically increasing total samples written
+
+
+def _ref_buffer_init(sample_rate: int):
+    global _ref_buffer, _ref_buffer_capacity
+    with _ref_buffer_lock:
+        capacity = int(sample_rate * _REF_BUFFER_SECONDS)
+        if _ref_buffer is None or _ref_buffer_capacity != capacity:
+            _ref_buffer = np.zeros(capacity, dtype=np.float32)
+            _ref_buffer_capacity = capacity
+
+
+def _ref_buffer_write(samples: np.ndarray):
+    """Append played samples (mono, float32) to the ring buffer."""
+    global _ref_write_pos
+    if _ref_buffer is None or _ref_buffer_capacity == 0:
+        return
+    mono = samples if samples.ndim == 1 else samples[:, 0]
+    n = len(mono)
+    if n == 0:
+        return
+    with _ref_buffer_lock:
+        cap = _ref_buffer_capacity
+        start_idx = _ref_write_pos % cap
+        end_idx = start_idx + n
+        if end_idx <= cap:
+            _ref_buffer[start_idx:end_idx] = mono
+        else:
+            first_part = cap - start_idx
+            _ref_buffer[start_idx:] = mono[:first_part]
+            _ref_buffer[: n - first_part] = mono[first_part:]
+        _ref_write_pos += n
+
+
+def get_reference_audio(n_samples: int, delay_samples: int = 0) -> np.ndarray:
+    """Return the `n_samples` of TTS reference audio ending `delay_samples`
+    samples ago (float32, mono). Missing history (buffer not warmed up yet,
+    or asking further back than what's been written) is zero-filled --
+    silence is the correct reference when nothing has played yet.
+    """
+    with _ref_buffer_lock:
+        if _ref_buffer is None or _ref_buffer_capacity == 0:
+            return np.zeros(n_samples, dtype=np.float32)
+        cap = _ref_buffer_capacity
+        end_total = _ref_write_pos - delay_samples
+        start_total = end_total - n_samples
+
+        out = np.zeros(n_samples, dtype=np.float32)
+        if end_total <= 0:
+            return out  # nothing written yet at all, within the delay window
+
+        # Clip the readable range to what's actually been written.
+        read_start = max(start_total, 0)
+        read_end = min(end_total, _ref_write_pos)
+        if read_end <= read_start:
+            return out
+        # Also never read further back than the buffer's capacity holds.
+        oldest_available = max(read_start, _ref_write_pos - cap)
+        read_start = max(read_start, oldest_available)
+        if read_end <= read_start:
+            return out
+
+        n_read = read_end - read_start
+        out_offset = read_start - start_total  # where in `out` this slice lands
+        start_idx = read_start % cap
+        end_idx = start_idx + n_read
+        if end_idx <= cap:
+            out[out_offset:out_offset + n_read] = _ref_buffer[start_idx:end_idx]
+        else:
+            first_part = cap - start_idx
+            out[out_offset:out_offset + first_part] = _ref_buffer[start_idx:]
+            out[out_offset + first_part:out_offset + n_read] = _ref_buffer[: n_read - first_part]
+        return out
+
+
 class NonBlockingAudioPlayer:
     """Non-blocking audio player using callback-based playback.
 
@@ -127,7 +254,10 @@ class NonBlockingAudioPlayer:
 
         # Convomode pause — cut speech instantly, mid-sentence, the moment the
         # pause flag is set (e.g. William taps Pause for an incoming call).
-        if _pause_event.is_set():
+        # Natural-mode barge-in reuses this SAME instant mid-buffer stop path —
+        # see trigger_barge_in() above — via a separate event (a barge-in
+        # implies a new turn is starting; a manual pause does not).
+        if _pause_event.is_set() or _barge_in_event.is_set():
             outdata[:] = 0
             self.playback_complete.set()
             raise sd.CallbackStop()
@@ -164,6 +294,17 @@ class NonBlockingAudioPlayer:
                 else:
                     # Multi-channel audio
                     outdata[:] = chunk[:frames]
+
+            # Mirror what was ACTUALLY sent to the speaker into the far-end
+            # reference ring buffer -- this is the exact known-echo-source
+            # signal the natural-mode AEC needs (see get_reference_audio()
+            # above). Cheap (a numpy copy of one buffer) and unconditional --
+            # harmless when natural mode / barge-in isn't running, since
+            # nothing reads the buffer in that case.
+            try:
+                _ref_buffer_write(outdata[:, 0] if outdata.ndim > 1 else outdata)
+            except Exception:
+                pass  # never let reference-buffer bookkeeping break playback
 
         except queue.Empty:
             # No data available - output silence
@@ -205,6 +346,10 @@ class NonBlockingAudioPlayer:
 
         # Add end-of-stream marker
         self.audio_queue.put(None)
+
+        # Size the far-end reference ring buffer to this stream's sample rate
+        # (a no-op after the first call at a given rate).
+        _ref_buffer_init(sample_rate)
 
         # Create and start output stream
         try:
