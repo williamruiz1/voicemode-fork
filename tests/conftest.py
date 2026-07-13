@@ -134,6 +134,24 @@ def isolate_home_directory(tmp_path, monkeypatch):
 
     monkeypatch.setattr("os.path.expanduser", mock_expanduser)
 
+    # Conch.LOCK_FILE / Conch.WANTED_FILE are class attributes computed ONCE
+    # at module-import time (`Path.home() / ".voicemode" / "conch"`), which
+    # happens at collection time -- before this per-test monkeypatch of
+    # Path.home()/expanduser takes effect. So without patching them directly,
+    # test_conch_yield.py's `clean_conch` fixture unlinks and rewrites the
+    # REAL ~/.voicemode/conch + conch-wanted lock files on every run -- files
+    # that a live voice-mode session elsewhere on the machine may be actively
+    # holding to signal "don't let another agent barge in on my mic." A test
+    # run deleting that lock mid-conversation would let a concurrent session
+    # think the mic is free. Patch the class attributes directly so tests
+    # only ever touch the fake home's conch files.
+    try:
+        from voice_mode.conch import Conch
+        monkeypatch.setattr(Conch, "LOCK_FILE", fake_home / ".voicemode" / "conch")
+        monkeypatch.setattr(Conch, "WANTED_FILE", fake_home / ".voicemode" / "conch-wanted")
+    except ImportError:
+        pass
+
     yield fake_home
 
 
