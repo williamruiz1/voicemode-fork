@@ -845,6 +845,51 @@ AEC_REF_DELAY_MS = int(os.getenv("VOICEMODE_AEC_REF_DELAY_MS", "0"))
 # Phase 2 refinement; out of scope here.
 AEC_STEP_SIZE = float(os.getenv("VOICEMODE_AEC_STEP_SIZE", "0.15"))
 
+# Adaptive echo-floor margin gate (added 2026-07-14, after the first real
+# acoustic-hardware trial showed the AEC alone -- across the FULL sweep of the
+# three tunables above -- provides only ~3-4dB of real cancellation on William's
+# MacBook Pro built-in mic/speakers: 96.5% of post-AEC frames during an
+# 11-second TTS-alone clip were misclassified as "speech" by webrtcvad at
+# aggressiveness=3, with a longest continuous false run of 4.35s. No value of
+# AEC_STEP_SIZE (0.15-0.9), AEC_REF_DELAY_MS (0-300ms), or the TTS output
+# buffer's time-resolution (2048 vs 720 samples) changed that. Raising
+# BARGE_IN_TRIGGER_MS only delayed the inevitable self-interruption, never
+# prevented it (see scripts/barge_in_acoustic_test.py sweep results).
+#
+# This is a SUPPLEMENTARY gate, not a replacement for AEC+VAD: it requires the
+# post-AEC signal to be not just VAD-positive but MEASURABLY LOUDER than the
+# recent echo-only residual floor -- a real interruption adds a second,
+# uncorrelated sound source on top of the echo residual, so it should push
+# rms_clean well above whatever level echo-alone settles at, even when the
+# AEC's absolute cancellation is poor. echo_floor is an ASYMMETRIC
+# minimum-statistics tracker of rms_clean (fast down / slow up, updated every
+# frame -- see voice_mode/barge_in.py), so it can calibrate even when TTS is
+# loud from frame 1 and can't be dragged up by a genuine interruption's own
+# energy. BARGE_IN_ENERGY_MARGIN is the multiplier a frame's rms_clean must
+# clear (relative to the floor BEFORE that frame's update) to count toward
+# the speech run. 0 (default) disables the gate entirely -- byte-for-byte the
+# pre-2026-07-14 behavior -- so shipping this constant changes nothing until
+# a value >1.0 is explicitly set.
+#
+# EMPIRICAL RESULT (2026-07-14, full sweep in scripts/barge_in_acoustic_test.py
+# against real MacBook Pro built-in mic/speakers): margin=3.0 eliminated the
+# TTS-alone false positive across 7/7 repeated 11-second trials, but the SAME
+# setting then missed 2 of 3 real double-talk (TTS + a second real speech
+# clip) trials, and the one trial it did register triggered BEFORE the
+# injected interruption even started (i.e. that "hit" was itself a
+# coincidental false positive, not a real detection). Lower margins (1.3-2.5)
+# reduced but did not reliably eliminate the false positive. Conclusion: on
+# this hardware, no single margin value gets both "doesn't self-interrupt"
+# and "detects a real interruption" -- the two failure modes trade off
+# against each other because the underlying post-AEC signal doesn't actually
+# separate echo from real speech by amplitude alone (the root problem is the
+# ~3-4dB of real cancellation, not this gate's tuning). This constant is left
+# in the codebase as a documented, off-by-default, honestly-labeled
+# experimental knob -- NOT a validated fix -- for whoever picks up the AEC
+# quality problem itself (a real native AEC library, or a learned/nonlinear
+# echo suppressor, is the credible next step; see docs/guides/natural-mode.md).
+BARGE_IN_ENERGY_MARGIN = float(os.getenv("VOICEMODE_BARGE_IN_ENERGY_MARGIN", "0"))
+
 # Default listen duration for converse tool
 DEFAULT_LISTEN_DURATION = float(os.getenv("VOICEMODE_DEFAULT_LISTEN_DURATION", "120.0"))  # Default 120s listening time
 

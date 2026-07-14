@@ -44,13 +44,76 @@ turn-taking behavior.
    mechanism already built for the manual Pause flag — and what you said
    becomes the start of your turn (no chime, no re-prompt).
 
+## 2026-07-13 live trial: what happened, and what we now know (2026-07-14 update)
+
+The first live trial (2026-07-13) failed silently: William tried it twice on
+his AirPods, playback never got cut, and it was turned off. **There was no
+usable evidence of why** — `barge_in.py`'s log lines only reached stderr
+(`config.setup_logging` only adds a file handler when `VOICEMODE_DEBUG=true`,
+which it wasn't that day), and no event types existed to record whether the
+listener even armed. That gap is now closed (see `voice_mode/barge_in.py`'s
+`log_barge_in_armed/unavailable/triggered/disarmed` events in
+`~/.voicemode/logs/events/` + the opt-in per-frame trace below) — the *next*
+trial, pass or fail, will leave a real record.
+
+**A real-hardware acoustic test harness** (`scripts/barge_in_acoustic_test.py`)
+was then built to stop guessing: it drives the ACTUAL production code
+(`NonBlockingAudioPlayer` + `BargeInListener`) against this Mac's real
+built-in speakers/mic (not a mock), playing a real TTS clip and, for
+double-talk trials, a second real speech clip through a separate `afplay`
+process so it mixes acoustically through real air into the real mic — the
+same physical phenomenon barge-in has to survive.
+
+**The finding, on built-in mic/speakers (not AirPods — see caveat below):**
+the AEC provides only ~3-4dB of real echo cancellation (measured: mean
+`rms_clean`/`rms_near` ratio ≈0.67 across an 11-second TTS-alone clip — for
+reference, a usable AEC typically needs 15-30dB). As a direct result, **96.5%
+of post-AEC frames during that clip were misclassified as "speech" by
+webrtcvad at aggressiveness=3**, with a longest continuous false run of
+**4.35 seconds**. A full sweep of every documented tunable failed to fix
+this:
+
+| Swept | Range | Effect on the false trigger |
+|---|---|---|
+| `AEC_STEP_SIZE` | 0.15 → 0.9 | none (trigger time identical ±0.04s across the whole range) |
+| `AEC_REF_DELAY_MS` | 0 → 300ms | none (trigger time identical ±0.05s across the whole range) |
+| TTS output buffer granularity | 2048 → 720 samples | none |
+| `BARGE_IN_TRIGGER_MS` | 300 → 1800ms | delayed the self-interruption, never prevented it |
+
+A fifth, new, **off-by-default** knob was added and tested —
+`VOICEMODE_BARGE_IN_ENERGY_MARGIN` (an adaptive echo-floor gate, see
+`voice_mode/config.py` for the mechanism) — and it also failed to find a
+usable middle ground: `margin=3.0` eliminated the false positive across 7/7
+repeated silence trials, but the SAME setting then missed 2 of 3 real
+double-talk trials (and the one "hit" was itself a coincidental false
+positive that fired before the injected interruption even started). Lower
+margins reduced but didn't reliably eliminate the false positive. **The two
+failure modes trade off against each other on this hardware — no single
+value of any tunable, alone or combined, gets both "doesn't self-interrupt"
+and "detects a real interruption."**
+
+**What this does NOT prove:** this harness necessarily ran on the MacBook
+Pro's built-in mic/speakers (two independent, physically-separated devices)
+— not William's AirPods (one shared Bluetooth device serving both
+directions, a fundamentally different and likely HARDER acoustic/codec
+path per the concern already documented in `voice_mode/aec.py`). It is
+possible AirPods behave differently (better OR worse); the instrumentation
+above is what will tell us, the next time natural mode is turned on for a
+real trial. But this result is strong evidence that Phase 1's linear
+software AEC, as built, does not reach the cancellation quality barge-in
+needs — on the friendlier of the two hardware paths. **The credible next
+step is fixing the AEC's cancellation quality itself** (a real native AEC
+library, or a nonlinear/learned echo suppressor) rather than continuing to
+tune the existing knobs.
+
 ## Live-trial instructions (the part that needs YOU)
 
 The mechanism has been validated with **synthetic echo signals** (see
 `tests/test_aec.py`, `tests/test_barge_in.py`) — that proves the algorithm
-converges and the state machine triggers correctly. It has **not** been
-tuned against a real microphone + real speaker/AirPods acoustic path, because
-that genuinely can't be done from code alone. To trial it:
+converges and the state machine triggers correctly. Per the section above,
+it has ALSO now been validated against real (built-in) hardware, and found
+wanting — this section is preserved for when AirPods are actually trialed,
+since that acoustic path is still unverified. To trial it:
 
 1. Turn natural mode on: `convomode-natural-mode.sh on`.
 2. Start (or continue) a convomode voice session.
@@ -74,12 +137,24 @@ that genuinely can't be done from code alone. To trial it:
    - **A consistent lag between when you'd expect the echo and when it
      actually shows up in the mic** (e.g. Bluetooth codec delay) → set
      `VOICEMODE_AEC_REF_DELAY_MS` to the measured round-trip delay.
-5. Record what worked in this doc / a follow-up note so the defaults can be
-   updated once they're proven on real hardware.
+5. **Whatever happens, this trial now leaves evidence** — check
+   `~/.voicemode/logs/events/voicemode_events_<date>.jsonl` for
+   `BARGE_IN_ARMED` / `BARGE_IN_UNAVAILABLE` / `BARGE_IN_TRIGGERED` /
+   `BARGE_IN_DISARMED` entries (this answers "did it even try to listen" —
+   the exact question 2026-07-13 couldn't answer). For frame-by-frame detail,
+   set `VOICEMODE_BARGE_IN_TRACE=1` before the session starts; it writes one
+   JSON line per processed mic frame (rms_near/rms_far/rms_clean/is_speech/
+   speech_run_ms) to `~/.voicemode/logs/barge_in/trace_<date>.jsonl`. Record
+   what worked in this doc / a follow-up note so the defaults can be updated
+   once they're proven on real hardware.
 
 None of this has been claimed as "working" — only as built and mechanism-
 tested. The live trial IS the acceptance test for whether it actually feels
-natural on your AirPods.
+natural on your AirPods. **Per the 2026-07-14 update above, expect this to
+likely self-interrupt** unless AirPods' acoustic path behaves meaningfully
+better than the built-in mic/speakers already tested — treat a trial on
+AirPods primarily as gathering AirPods-specific evidence, not as a
+pass/fail usability test of the current build.
 
 ## Tunables reference
 
@@ -95,6 +170,8 @@ itself):
 | `VOICEMODE_AEC_FILTER_MS` | `200` | Adaptive filter length — how much acoustic delay it can model |
 | `VOICEMODE_AEC_REF_DELAY_MS` | `0` | Fixed offset between "sample sent to speaker" and "echo reaches mic" — set this if echo consistently leaks through |
 | `VOICEMODE_AEC_STEP_SIZE` | `0.15` | NLMS adaptation rate — lower = slower to converge but preserves more of your real voice during double-talk |
+| `VOICEMODE_BARGE_IN_ENERGY_MARGIN` | `0` (disabled) | Adaptive echo-floor gate multiplier — added 2026-07-14, tested and found NOT to resolve the false-positive/false-negative trade-off on built-in hardware (see `voice_mode/config.py` docstring). Leave at 0 unless deliberately experimenting. |
+| `VOICEMODE_BARGE_IN_TRACE` | unset (disabled) | Set to `1` to write a per-frame decision trace to `~/.voicemode/logs/barge_in/trace_<date>.jsonl` — the evidence trail added 2026-07-14 so a failed trial is diagnosable instead of a repeat of 2026-07-13's silence |
 | `VOICEMODE_NATURAL_MODE_FLAG_PATH` | `~/.voicemode/natural-mode.flag` | Override the toggle flag's location |
 
 ## Known Phase 1 limitations (by design, not bugs)
