@@ -910,6 +910,62 @@ AEC_STEP_SIZE = float(os.getenv("VOICEMODE_AEC_STEP_SIZE", "0.15"))
 # echo suppressor, is the credible next step; see docs/guides/natural-mode.md).
 BARGE_IN_ENERGY_MARGIN = float(os.getenv("VOICEMODE_BARGE_IN_ENERGY_MARGIN", "0"))
 
+# ==================== PAUSE / STEP-AWAY / APPEND-TO-TURN (founder-os#11655) ==========
+#
+# Three graceful-conversation additions to the LISTEN side of convomode. ALL are
+# INERT BY DEFAULT: with none enabled, the record/VAD/turn loop runs byte-for-byte
+# as before (proven by tests/test_pause_stepaway_append.py). Each mirrors the
+# existing flag-file discipline already in this codebase (natural-mode.flag,
+# pause.flag, focus-hold) so the features can be toggled live — the NEXT convomode
+# session picks a change up — without editing MCP env or respawning the server.
+#
+# 1) STEP-AWAY (Gaps 1 & 2 of the dispatch): when the LISTEN loop is idle (no
+#    speech yet) and convomode is PAUSED (the existing ~/.voicemode/pause.flag —
+#    William taps Pause, or the tool sets it when he says "hold on"), the loop
+#    WAITS longer instead of timing out at listen_duration_max, speaks ONE check-in
+#    ("Still there?") after STEP_AWAY_CHECKIN_SECONDS, then ends gracefully (not
+#    silently) at STEP_AWAY_GRACE_SECONDS. This reuses the SAME pause primitive
+#    that already pauses TTS — extended to the listen loop. Enabled by
+#    VOICEMODE_STEP_AWAY_ENABLED=true OR the presence of the flag file below.
+STEP_AWAY_ENV = os.getenv("VOICEMODE_STEP_AWAY_ENABLED", "false").lower() in ("true", "1", "yes", "on")
+STEP_AWAY_FLAG_PATH = os.path.expanduser(
+    os.getenv("VOICEMODE_STEP_AWAY_FLAG_PATH", "~/.voicemode/step-away.enabled")
+)
+# How long (s) the idle listen keeps waiting once paused, before giving up.
+STEP_AWAY_GRACE_SECONDS = float(os.getenv("VOICEMODE_STEP_AWAY_GRACE_SECONDS", "180"))
+# How long (s) of continuous pause before the ONE spoken "Still there?" check-in.
+STEP_AWAY_CHECKIN_SECONDS = float(os.getenv("VOICEMODE_STEP_AWAY_CHECKIN_SECONDS", "45"))
+
+# 2) APPEND-TO-TURN (Gap 3): after the trailing-silence timer fires, keep the mic
+#    open a short EXTRA window; if new speech starts within it ("also—", "and—"),
+#    it is appended to the SAME turn instead of starting a new exchange. Mechanically
+#    this just extends the effective trailing-silence threshold by APPEND_WINDOW_MS.
+#    0 (default) = OFF, byte-for-byte the prior single-shot behavior. A live knob
+#    file ~/.voicemode/append-window-ms (integer contents) overrides the env so it
+#    can be tuned without a respawn.
+APPEND_WINDOW_MS = int(os.getenv("VOICEMODE_APPEND_WINDOW_MS", "0"))
+APPEND_WINDOW_FLAG_PATH = os.path.expanduser(
+    os.getenv("VOICEMODE_APPEND_WINDOW_FLAG_PATH", "~/.voicemode/append-window-ms")
+)
+
+# Spoken-keyword triggers (only consulted when STEP_AWAY is enabled). A completed
+# transcription matching a step-away phrase makes the tool set the pause flag +
+# wait; a resume phrase (or the widget clearing the flag) resumes with a recap.
+# Matched as a WHOLE utterance (near-exact, punctuation/spacing-insensitive) so a
+# passing mention mid-sentence never false-triggers.
+STEP_AWAY_PHRASES = [
+    p.strip().lower() for p in os.getenv(
+        "VOICEMODE_STEP_AWAY_PHRASES",
+        "hold on,one sec,one second,hang on,hold up,give me a sec,give me a second,pause,wait a sec",
+    ).split(",") if p.strip()
+]
+STEP_AWAY_RESUME_PHRASES = [
+    p.strip().lower() for p in os.getenv(
+        "VOICEMODE_STEP_AWAY_RESUME_PHRASES",
+        "okay i'm back,i'm back,im back,ok i'm back,resume,let's continue,lets continue,continue,i'm here,im here",
+    ).split(",") if p.strip()
+]
+
 # Default listen duration for converse tool
 DEFAULT_LISTEN_DURATION = float(os.getenv("VOICEMODE_DEFAULT_LISTEN_DURATION", "120.0"))  # Default 120s listening time
 
