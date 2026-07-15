@@ -205,8 +205,32 @@ class SpeexEchoCanceller:
         if n == 0:
             return near.astype(near.dtype)
         out_dtype = near.dtype if near.dtype.kind == "f" else np.float64
-        near_i16 = np.clip(near[:n], -32768, 32767).astype(np.int16)
-        far_i16 = np.clip(far[:n], -32768, 32767).astype(np.int16)
+
+        # SCALE CONTRACT (founder-os#11658 — this was a real bug, caught on
+        # hardware): the NLMS `EchoCanceller` this class drops in for works in
+        # NORMALISED FLOAT [-1, 1], and that is what `BargeInListener` passes
+        # (`barge_in.py`: `chunk_flat.astype(np.float64) / 32768.0`). speexdsp
+        # needs int16 PCM. The first cut clipped to +/-32768 and cast straight
+        # to int16 — on float [-1, 1] the clip is a no-op and the cast TRUNCATES
+        # every sample to 0, so speex was handed pure silence and returned pure
+        # silence: rms_clean was 0.000 for all 441 frames of the first real
+        # acoustic run. That reads as "infinite cancellation" (and as "no false
+        # positive") while actually meaning the canceller is DEAD — it would
+        # also swallow the real speech barge-in has to detect.
+        #
+        # The synthetic convergence test missed this because it fed int16-scale
+        # values, where the cast is correct. So: scale float input INTO the
+        # int16 domain here, and scale the result back on the way out, so the
+        # float-in/float-out contract matches NLMS exactly.
+        float_in = near.dtype.kind == "f"
+        if float_in:
+            near_s = np.asarray(near[:n], dtype=np.float64) * 32768.0
+            far_s = np.asarray(far[:n], dtype=np.float64) * 32768.0
+        else:
+            near_s = np.asarray(near[:n], dtype=np.float64)
+            far_s = np.asarray(far[:n], dtype=np.float64)
+        near_i16 = np.clip(near_s, -32768, 32767).astype(np.int16)
+        far_i16 = np.clip(far_s, -32768, 32767).astype(np.int16)
         fs = self.frame_size
         out = np.empty(n, dtype=np.int16)
         pos = 0
@@ -220,4 +244,8 @@ class SpeexEchoCanceller:
             cleaned = np.asarray(self._aec.cancel_echo(rec.tolist(), ref.tolist()), dtype=np.int16)
             out[pos:end] = cleaned[: end - pos]
             pos = end
+        # Back to the caller's domain: float in => normalised float out, so the
+        # rms_clean/rms_near ratio the trace computes is dimensionally sane.
+        if float_in:
+            return (out.astype(np.float64) / 32768.0).astype(out_dtype)
         return out.astype(out_dtype)

@@ -181,3 +181,70 @@ class TestEchoCancellerConvergence:
             f"independent speech was over-cancelled during double-talk: "
             f"survived {survival_ratio*100:.0f}% of original energy"
         )
+
+
+class TestSpeexEchoCancellerScaleContract:
+    """The scale contract SpeexEchoCanceller must honour (founder-os#11658).
+
+    This is the regression guard for a REAL bug caught on hardware, not a
+    hypothetical. `BargeInListener` passes NORMALISED FLOAT [-1, 1]
+    (`barge_in.py`: `chunk_flat.astype(np.float64) / 32768.0`), matching the
+    NLMS `EchoCanceller` this class drops in for. The first cut assumed int16
+    PCM and did `np.clip(near, -32768, 32767).astype(np.int16)` — on float
+    [-1, 1] the clip is a no-op and the cast truncates EVERY sample to 0, so
+    speex was fed silence and returned silence: `rms_clean` was 0.000 across
+    all 441 frames of the first real acoustic run.
+
+    That failure is dangerous precisely because it LOOKS like success — an
+    all-zero output reads as "infinite cancellation" and as "no false
+    positive", while actually meaning the canceller is dead and would swallow
+    the real speech barge-in exists to detect. The original synthetic
+    convergence test missed it by feeding int16-scale values, where the cast
+    happens to be correct. Hence: assert on the float path specifically.
+    """
+
+    def _skip_if_unavailable(self):
+        try:
+            from voice_mode.aec import SPEEX_AVAILABLE
+        except Exception:
+            pytest.skip("voice_mode.aec unavailable")
+        if not SPEEX_AVAILABLE:
+            pytest.skip("pyaec/speexdsp not installed")
+
+    def _echo_pair(self, n=SR):
+        t = np.arange(n) / SR
+        far = (0.5 * np.sin(2 * np.pi * 300 * t)).astype(np.float64)
+        near = (0.3 * np.roll(far, 80) + 0.02 * np.random.RandomState(0).randn(n)).astype(np.float64)
+        return near, far
+
+    def test_float_input_does_not_collapse_to_silence(self):
+        """THE regression: float [-1,1] in must NOT yield an all-zero output."""
+        self._skip_if_unavailable()
+        from voice_mode.aec import SpeexEchoCanceller
+        near, far = self._echo_pair()
+        out = SpeexEchoCanceller(sample_rate=SR).process(near, far)
+        assert np.abs(out).max() > 0.0, (
+            "speex returned all-zeros on float[-1,1] input — the int16 truncation "
+            "bug is back; the canceller is dead, not perfect"
+        )
+
+    def test_float_in_float_out_same_scale_as_nlms(self):
+        """Output must come back in the caller's normalised float domain."""
+        self._skip_if_unavailable()
+        from voice_mode.aec import SpeexEchoCanceller
+        near, far = self._echo_pair()
+        out = SpeexEchoCanceller(sample_rate=SR).process(near, far)
+        assert out.dtype.kind == "f"
+        assert len(out) == len(near)
+        # Normalised domain: a [-1,1] input can never produce int16-scale output.
+        assert np.abs(out).max() <= 1.5, f"output escaped the [-1,1] domain: {np.abs(out).max()}"
+
+    def test_actually_reduces_echo_on_float_input(self):
+        """Beyond 'not zero': it must cancel SOMETHING on the float path."""
+        self._skip_if_unavailable()
+        from voice_mode.aec import SpeexEchoCanceller
+        near, far = self._echo_pair()
+        out = SpeexEchoCanceller(sample_rate=SR).process(near, far)
+        rms = lambda x: float(np.sqrt(np.mean(np.square(x))))
+        # Converged tail only — the filter needs time to adapt.
+        assert rms(out[SR // 2:]) < rms(near[SR // 2:]), "no echo reduction on the float path"
