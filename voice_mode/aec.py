@@ -147,3 +147,77 @@ class EchoCanceller:
         self.weights = w
         self._far_history = hist
         return out.astype(near.dtype if near.dtype.kind == "f" else np.float64)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# founder-os#11658 — speexdsp/pyaec echo canceller (drop-in for EchoCanceller).
+#
+# The hand-rolled NLMS EchoCanceller above measured only ~3-4 dB of real
+# cancellation on William's hardware against ~20 dB of echo (voicemode-fork
+# 83a4407). speexdsp is a ~20-year VoIP-grade frequency-domain adaptive echo
+# canceller WITH a built-in double-talk-aware preprocessor — directly addressing
+# the NLMS limitation (real speech partially swallowed at the interruption
+# point). This wraps the `pyaec` speexdsp binding behind the SAME interface as
+# EchoCanceller so it drops into the barge-in listener unchanged.
+#
+# Availability is soft: if pyaec / the native speexdsp lib isn't importable the
+# module flag SPEEX_AVAILABLE is False and callers fall back to the NLMS filter.
+try:
+    import pyaec as _pyaec  # ctypes binding over the bundled speexdsp lib
+    SPEEX_AVAILABLE = True
+except Exception:  # pragma: no cover - import guard
+    _pyaec = None
+    SPEEX_AVAILABLE = False
+
+
+class SpeexEchoCanceller:
+    """speexdsp echo canceller with the EchoCanceller interface.
+
+    Same constructor + `process(near, far)` + `reset()` contract as the NLMS
+    `EchoCanceller`, so it is a literal drop-in. `mu`/`eps` are accepted for
+    signature-compatibility and ignored (speex is not an NLMS filter).
+
+    speex operates on fixed-size int16 frames and keeps adaptation state across
+    calls, so `process` frames the (possibly longer) input into `frame_size`
+    sub-frames; a final partial sub-frame is zero-padded and the output trimmed
+    back to the input length, preserving the same-length contract.
+    """
+
+    def __init__(self, sample_rate: int, filter_ms: int = 200, mu: float = 0.5,
+                 eps: float = 1e-6, frame_size: int = 160):
+        if not SPEEX_AVAILABLE:
+            raise RuntimeError("pyaec/speexdsp not available")
+        self.sample_rate = int(sample_rate)
+        self.frame_size = int(frame_size)
+        # Echo-tail length in samples (speexdsp models this much speaker->mic delay).
+        self.filter_len = max(self.frame_size, int(sample_rate * filter_ms / 1000))
+        self._new_aec = lambda: _pyaec.Aec(self.frame_size, self.filter_len, self.sample_rate, True)
+        self._aec = self._new_aec()
+
+    def reset(self):
+        """Clear learned echo-path state (e.g. after a device/route change)."""
+        self._aec = self._new_aec()
+
+    def process(self, near: np.ndarray, far: np.ndarray) -> np.ndarray:
+        near = np.asarray(near)
+        far = np.asarray(far)
+        n = int(min(len(near), len(far)))
+        if n == 0:
+            return near.astype(near.dtype)
+        out_dtype = near.dtype if near.dtype.kind == "f" else np.float64
+        near_i16 = np.clip(near[:n], -32768, 32767).astype(np.int16)
+        far_i16 = np.clip(far[:n], -32768, 32767).astype(np.int16)
+        fs = self.frame_size
+        out = np.empty(n, dtype=np.int16)
+        pos = 0
+        while pos < n:
+            end = min(pos + fs, n)
+            rec = near_i16[pos:end]
+            ref = far_i16[pos:end]
+            if len(rec) < fs:  # zero-pad the trailing partial frame
+                rec = np.concatenate([rec, np.zeros(fs - len(rec), dtype=np.int16)])
+                ref = np.concatenate([ref, np.zeros(fs - len(ref), dtype=np.int16)])
+            cleaned = np.asarray(self._aec.cancel_echo(rec.tolist(), ref.tolist()), dtype=np.int16)
+            out[pos:end] = cleaned[: end - pos]
+            pos = end
+        return out.astype(out_dtype)

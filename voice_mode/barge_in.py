@@ -42,7 +42,7 @@ import numpy as np
 import sounddevice as sd
 
 from voice_mode import audio_player
-from voice_mode.aec import EchoCanceller
+from voice_mode.aec import EchoCanceller, SpeexEchoCanceller, SPEEX_AVAILABLE
 from voice_mode.config import (
     SAMPLE_RATE,
     BARGE_IN_TRIGGER_MS,
@@ -147,7 +147,18 @@ class BargeInListener:
         self._triggered = False
         self._pre_roll_chunks: List[np.ndarray] = []
         self._error: Optional[str] = None
-        self._aec = EchoCanceller(sample_rate=VAD_WORK_RATE, filter_ms=AEC_FILTER_MS, mu=AEC_STEP_SIZE)
+        # founder-os#11658 — prefer the speexdsp AEC (VoIP-grade frequency-domain
+        # adaptive filter WITH a double-talk-aware preprocessor); the hand-rolled
+        # NLMS filter measured only ~3-4dB of real cancellation on hardware.
+        # `VOICEMODE_AEC=nlms` forces the old filter; speex is the default when
+        # the pyaec/speexdsp binding is importable, else we fall back to NLMS.
+        _aec_pref = os.getenv("VOICEMODE_AEC", "speex").strip().lower()
+        if _aec_pref != "nlms" and SPEEX_AVAILABLE:
+            self._aec = SpeexEchoCanceller(sample_rate=VAD_WORK_RATE, filter_ms=AEC_FILTER_MS, mu=AEC_STEP_SIZE)
+            self._aec_kind = "speexdsp"
+        else:
+            self._aec = EchoCanceller(sample_rate=VAD_WORK_RATE, filter_ms=AEC_FILTER_MS, mu=AEC_STEP_SIZE)
+            self._aec_kind = "nlms"
         self._vad = webrtcvad.Vad(self._vad_aggressiveness) if VAD_AVAILABLE else None
         # Evidence trail (see module docstring re: 2026-07-13) -- populated in
         # start()/stop() regardless of whether the trace file is enabled, so
