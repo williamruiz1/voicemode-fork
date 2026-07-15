@@ -659,8 +659,33 @@ async def speech_to_text(
     from voice_mode.conversation_logger import get_conversation_logger
     from voice_mode.core import save_debug_file, get_debug_filename
     from voice_mode.simple_failover import simple_stt_failover
-    from voice_mode.config import STT_BASE_URLS, STT_COMPRESS
+    from voice_mode.config import STT_BASE_URLS, STT_COMPRESS, STT_SILENCE_GATE, STT_SILENCE_RMS_FLOOR
     from voice_mode.provider_discovery import is_local_provider
+
+    # Pre-STT silence gate (founder-os#11657 Part B) — skip near-silent audio so
+    # Whisper never sees a clip quiet enough to hallucinate a closing phrase
+    # ("Thank you for watching"). audio_data is int16 PCM; normalize to [-1, 1]
+    # for a scale-independent whole-clip RMS. Inert/reversible: gated on
+    # STT_SILENCE_GATE (default on) + a floor calibrated well below real speech.
+    if STT_SILENCE_GATE and STT_SILENCE_RMS_FLOOR > 0 and audio_data is not None and len(audio_data) > 0:
+        rms = float(np.sqrt(np.mean((audio_data.astype(np.float64) / 32768.0) ** 2)))
+        if rms < STT_SILENCE_RMS_FLOOR:
+            logger.info(
+                f"STT: silence gate tripped — clip RMS {rms:.5f} < floor "
+                f"{STT_SILENCE_RMS_FLOOR:.5f}; skipping STT call (no_speech) to "
+                f"avoid Whisper silence-hallucination"
+            )
+            return {
+                "error_type": "no_speech",
+                "provider": "silence-gate",
+                "metrics": {
+                    "file_size_bytes": len(audio_data) * 2,
+                    "request_time_ms": 0.0,
+                    "is_local": True,
+                    "rms": rms,
+                    "rms_floor": STT_SILENCE_RMS_FLOOR,
+                },
+            }
 
     # Determine compression based on STT_COMPRESS mode
     # Options: auto (default), always, never

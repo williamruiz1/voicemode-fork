@@ -604,6 +604,26 @@ STT_MODELS = parse_comma_list("VOICEMODE_STT_MODELS", "")
 # Enable streaming transcription for models that support it (gpt-4o-transcribe, gpt-4o-mini-transcribe)
 STT_STREAMING = os.getenv("VOICEMODE_STT_STREAMING", "").lower() in ("1", "true", "yes")
 
+# Pre-STT silence gate (founder-os#11657 Part B). Near-silent clips are the
+# documented trigger for Whisper hallucinations ("Thank you for watching," a bare
+# ".", a YouTube URL) — the standard, upstream fix is to SKIP the STT call for
+# audio below an energy floor rather than try to post-filter hallucinated text
+# (the no_speech_prob guard misses these: hallucinated segments often show low
+# no_speech_prob + high avg_logprob at once). Gate on whole-clip normalized RMS.
+# Default floor 0.005 was calibrated empirically on this Mac against the local
+# whisper server: quiet-room / room-tone measured ~0.0008-0.003 (whisper returns
+# garbage), while the quietest real speech measured ~0.015 (transcribed fine) and
+# normal speech ~0.095. 0.005 sits ~1.7x above room-tone and ~3x below the
+# quietest real speech; because energy is squared, a clip that is even 95% silence
+# plus one brief real utterance still measures ~0.02 (4x the floor), so the gate
+# fires ONLY on essentially all-silence audio and never drops a clip containing
+# real speech. Reversible: set VOICEMODE_STT_SILENCE_GATE=false, or the floor to 0.
+STT_SILENCE_GATE = os.getenv("VOICEMODE_STT_SILENCE_GATE", "true").lower() in ("1", "true", "yes")
+try:
+    STT_SILENCE_RMS_FLOOR = float(os.getenv("VOICEMODE_STT_SILENCE_RMS_FLOOR", "0.005"))
+except ValueError:
+    STT_SILENCE_RMS_FLOOR = 0.005
+
 # STT prompt for vocabulary biasing (helps with specialized terminology)
 # See: https://platform.openai.com/docs/guides/speech-to-text#prompting
 STT_PROMPT = os.getenv("VOICEMODE_STT_PROMPT", "")
