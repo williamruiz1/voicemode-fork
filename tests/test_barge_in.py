@@ -18,6 +18,14 @@ import pytest
 import voice_mode.barge_in as bi
 
 
+@pytest.fixture
+def exit_stack():
+    """Module-level so every test class below can share it (moved out of
+    TestBargeInListenerStateMachine, which originally owned it alone)."""
+    with ExitStack() as stack:
+        yield stack
+
+
 def _make_chunk(value: int = 5000, n: int = bi.CHUNK_SAMPLES_MIC) -> np.ndarray:
     """A synthetic mono int16 mic chunk, shaped like sounddevice's callback
     indata (frames, channels)."""
@@ -110,11 +118,6 @@ class TestBargeInListenerStateMachine:
         listener.start()
         return listener, triggered_calls
 
-    @pytest.fixture
-    def exit_stack(self):
-        with ExitStack() as stack:
-            yield stack
-
     def test_triggers_on_sustained_post_aec_speech_during_playback(self, monkeypatch, exit_stack):
         listener, triggered_calls = self._arm(exit_stack, monkeypatch, tts_speaking=True, vad_says_speech=True)
 
@@ -198,3 +201,140 @@ class TestBargeInListenerStateMachine:
 
         assert result.triggered is False
         assert triggered_calls == []
+
+
+class TestBargeInLifecycleEvents:
+    """The 2026-07-14 evidence-trail addition: a live trial with NO event
+    logged either way is exactly what happened on 2026-07-13 (barge_in.py's
+    logger.* calls only reach stderr; nothing was persisted). These lock in
+    that the four lifecycle events fire at the right moments regardless of
+    whether VOICEMODE_BARGE_IN_TRACE is set."""
+
+    def test_armed_and_disarmed_logged_on_clean_stop(self, monkeypatch):
+        with ExitStack() as stack:
+            armed_calls, disarmed_calls = [], []
+            monkeypatch.setattr(bi, "log_barge_in_armed", lambda vad_aggr: armed_calls.append(vad_aggr))
+            monkeypatch.setattr(bi, "log_barge_in_disarmed",
+                                 lambda triggered, frames, elapsed: disarmed_calls.append((triggered, frames)))
+            monkeypatch.setattr(bi.audio_player, "reset_barge_in_event", lambda: None)
+            mock_sd = stack.enter_context(patch.object(bi, "sd"))
+            mock_sd.InputStream.return_value = MagicMock()
+
+            listener = bi.BargeInListener()
+            listener.start()
+            result = listener.stop()
+
+        assert armed_calls == [listener._vad_aggressiveness]
+        assert disarmed_calls == [(False, 0)]
+        assert result.triggered is False
+
+    def test_unavailable_logged_when_vad_missing(self, monkeypatch):
+        monkeypatch.setattr(bi, "VAD_AVAILABLE", False)
+        calls = []
+        monkeypatch.setattr(bi, "log_barge_in_unavailable", lambda reason: calls.append(reason))
+
+        listener = bi.BargeInListener()
+        listener.start()
+
+        assert calls == ["webrtcvad unavailable"]
+
+    def test_unavailable_logged_when_stream_open_fails(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(bi, "log_barge_in_unavailable", lambda reason: calls.append(reason))
+        with patch.object(bi, "sd") as mock_sd:
+            mock_sd.InputStream.side_effect = RuntimeError("no such device")
+            listener = bi.BargeInListener()
+            listener.start()
+
+        assert len(calls) == 1
+        assert "no such device" in calls[0]
+
+    def test_triggered_logged_on_a_real_trigger(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(bi, "log_barge_in_triggered", lambda speech_run_ms, elapsed: calls.append(speech_run_ms))
+        monkeypatch.setattr(bi.audio_player, "is_tts_speaking", lambda: True)
+        monkeypatch.setattr(bi.audio_player, "get_reference_audio",
+                             lambda n, delay_samples=0: np.zeros(n, dtype=np.float32))
+        monkeypatch.setattr(bi.audio_player, "trigger_barge_in", lambda: None)
+        monkeypatch.setattr(bi.audio_player, "reset_barge_in_event", lambda: None)
+
+        mock_vad = MagicMock()
+        mock_vad.is_speech.return_value = True
+        with patch.object(bi, "webrtcvad") as mock_webrtcvad, patch.object(bi, "sd") as mock_sd:
+            mock_webrtcvad.Vad.return_value = mock_vad
+            mock_sd.InputStream.return_value = MagicMock()
+
+            listener = bi.BargeInListener()
+            listener.start()
+            n_chunks = (bi.BARGE_IN_TRIGGER_MS // bi.CHUNK_MS) + 3
+            for _ in range(n_chunks):
+                listener._audio_queue.put(_make_chunk())
+            listener._thread.join(timeout=3.0)
+            listener.stop()
+
+        assert len(calls) == 1
+        assert calls[0] >= bi.BARGE_IN_TRIGGER_MS
+
+
+class TestEnergyMarginGate:
+    """config.BARGE_IN_ENERGY_MARGIN (default 0 = disabled). These validate
+    the asymmetric echo-floor tracker directly, independent of real acoustic
+    hardware -- see scripts/barge_in_acoustic_test.py for the real-hardware
+    validation this gate was added, tuned, and evaluated against on
+    2026-07-14 (net finding: no single margin value on that hardware avoided
+    BOTH false-positives and false-negatives at once -- see config.py's
+    BARGE_IN_ENERGY_MARGIN docstring)."""
+
+    def test_default_zero_is_a_pure_noop(self, monkeypatch, exit_stack):
+        """Margin=0 (the shipped default) must behave IDENTICALLY to no gate
+        at all -- this is the backward-compatibility guarantee that lets the
+        gate exist in the codebase without changing anyone's behavior."""
+        monkeypatch.setattr(bi, "BARGE_IN_ENERGY_MARGIN", 0)
+        listener, triggered_calls = TestBargeInListenerStateMachine()._arm(
+            exit_stack, monkeypatch, tts_speaking=True, vad_says_speech=True
+        )
+        n_chunks = (bi.BARGE_IN_TRIGGER_MS // bi.CHUNK_MS) + 3
+        for _ in range(n_chunks):
+            listener._audio_queue.put(_make_chunk())
+        listener._thread.join(timeout=3.0)
+        result = listener.stop()
+        assert result.triggered is True  # unchanged from the no-gate state machine test
+
+    def test_flat_unchanging_signal_never_clears_the_margin(self, monkeypatch, exit_stack):
+        """A CONSTANT-amplitude 'echo residual' (VAD says speech every frame,
+        but the level never actually rises above its own recent floor) must
+        NOT sustain a speech run once the gate is enabled -- this is the
+        self-interruption-off-a-flat-echo scenario the gate exists to catch."""
+        monkeypatch.setattr(bi, "BARGE_IN_ENERGY_MARGIN", 2.0)
+        listener, triggered_calls = TestBargeInListenerStateMachine()._arm(
+            exit_stack, monkeypatch, tts_speaking=True, vad_says_speech=True
+        )
+        # Many more chunks than the trigger threshold would need -- if the
+        # gate is broken (e.g. the floor never calibrates), this alone would
+        # trigger well before we stop it.
+        n_chunks = (bi.BARGE_IN_TRIGGER_MS // bi.CHUNK_MS) * 5
+        for _ in range(n_chunks):
+            listener._audio_queue.put(_make_chunk(value=5000))
+        time.sleep(0.5)
+        result = listener.stop()
+        assert result.triggered is False
+        assert triggered_calls == []
+
+    def test_genuine_amplitude_jump_still_triggers(self, monkeypatch, exit_stack):
+        """A real jump well above the calibrated floor must still clear the
+        gate and trigger -- proves the gate isn't just permanently closed."""
+        monkeypatch.setattr(bi, "BARGE_IN_ENERGY_MARGIN", 2.0)
+        listener, triggered_calls = TestBargeInListenerStateMachine()._arm(
+            exit_stack, monkeypatch, tts_speaking=True, vad_says_speech=True
+        )
+        # Calibrate the floor on a low, flat level first...
+        for _ in range(20):
+            listener._audio_queue.put(_make_chunk(value=500))
+        # ...then a sustained, much louder run that should clear a 2.0x margin.
+        n_chunks = (bi.BARGE_IN_TRIGGER_MS // bi.CHUNK_MS) + 5
+        for _ in range(n_chunks):
+            listener._audio_queue.put(_make_chunk(value=20000))
+        listener._thread.join(timeout=3.0)
+        result = listener.stop()
+        assert result.triggered is True
+        assert triggered_calls == [True]

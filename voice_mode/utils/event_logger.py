@@ -78,6 +78,19 @@ class EventLogger:
     CONCH_ACQUIRE = "CONCH_ACQUIRE"        # Successfully acquired conch
     CONCH_RELEASE = "CONCH_RELEASE"        # Released conch
 
+    # Natural Mode / Barge-In Events (Phase 1) -- sparse lifecycle events for
+    # the concurrent listener in voice_mode/barge_in.py. Deliberately NOT
+    # per-frame (that would be ~33 events/sec at CHUNK_MS=30) -- per-frame
+    # decision data goes to the dedicated trace file
+    # (~/.voicemode/logs/barge_in/), gated by VOICEMODE_BARGE_IN_TRACE, so it
+    # doesn't bloat the main event log. These four are enough to answer, after
+    # any live trial, the three load-bearing questions: did the listener even
+    # arm, did it ever trigger, and if not why did it stop.
+    BARGE_IN_ARMED = "BARGE_IN_ARMED"              # Listener started (mic stream + thread up)
+    BARGE_IN_UNAVAILABLE = "BARGE_IN_UNAVAILABLE"  # Couldn't start (no VAD / stream open failed)
+    BARGE_IN_TRIGGERED = "BARGE_IN_TRIGGERED"      # Sustained post-AEC speech detected during playback
+    BARGE_IN_DISARMED = "BARGE_IN_DISARMED"        # Listener stopped (triggered or turn ended)
+
     def __init__(self, log_dir: Optional[Path] = None, enabled: bool = True):
         """
         Initialize the event logger.
@@ -380,4 +393,43 @@ def log_tool_request_end(tool_name: str, success: bool = True) -> None:
         logger.log_event(EventLogger.TOOL_REQUEST_END, {
             "tool_name": tool_name,
             "success": success
+        })
+
+
+def log_barge_in_armed(vad_aggressiveness: int) -> None:
+    """Log that the natural-mode barge-in listener started this turn."""
+    logger = get_event_logger()
+    if logger:
+        logger.log_event(EventLogger.BARGE_IN_ARMED, {
+            "vad_aggressiveness": vad_aggressiveness,
+        })
+
+
+def log_barge_in_unavailable(reason: str) -> None:
+    """Log that the barge-in listener could NOT start this turn (degrades to
+    turn-mode-for-this-utterance -- exactly the signal that would have told
+    us, on 2026-07-13, whether the concurrent InputStream ever opened)."""
+    logger = get_event_logger()
+    if logger:
+        logger.log_event(EventLogger.BARGE_IN_UNAVAILABLE, {"reason": reason})
+
+
+def log_barge_in_triggered(speech_run_ms: int, elapsed_since_armed_s: float) -> None:
+    """Log a genuine barge-in trigger (sustained post-AEC speech during playback)."""
+    logger = get_event_logger()
+    if logger:
+        logger.log_event(EventLogger.BARGE_IN_TRIGGERED, {
+            "speech_run_ms": speech_run_ms,
+            "elapsed_since_armed_s": round(elapsed_since_armed_s, 3),
+        })
+
+
+def log_barge_in_disarmed(triggered: bool, frames_processed: int, elapsed_s: float) -> None:
+    """Log that the barge-in listener stopped (whether or not it triggered)."""
+    logger = get_event_logger()
+    if logger:
+        logger.log_event(EventLogger.BARGE_IN_DISARMED, {
+            "triggered": triggered,
+            "frames_processed": frames_processed,
+            "elapsed_s": round(elapsed_s, 3),
         })

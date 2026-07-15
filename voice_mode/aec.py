@@ -147,3 +147,105 @@ class EchoCanceller:
         self.weights = w
         self._far_history = hist
         return out.astype(near.dtype if near.dtype.kind == "f" else np.float64)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# founder-os#11658 — speexdsp/pyaec echo canceller (drop-in for EchoCanceller).
+#
+# The hand-rolled NLMS EchoCanceller above measured only ~3-4 dB of real
+# cancellation on William's hardware against ~20 dB of echo (voicemode-fork
+# 83a4407). speexdsp is a ~20-year VoIP-grade frequency-domain adaptive echo
+# canceller WITH a built-in double-talk-aware preprocessor — directly addressing
+# the NLMS limitation (real speech partially swallowed at the interruption
+# point). This wraps the `pyaec` speexdsp binding behind the SAME interface as
+# EchoCanceller so it drops into the barge-in listener unchanged.
+#
+# Availability is soft: if pyaec / the native speexdsp lib isn't importable the
+# module flag SPEEX_AVAILABLE is False and callers fall back to the NLMS filter.
+try:
+    import pyaec as _pyaec  # ctypes binding over the bundled speexdsp lib
+    SPEEX_AVAILABLE = True
+except Exception:  # pragma: no cover - import guard
+    _pyaec = None
+    SPEEX_AVAILABLE = False
+
+
+class SpeexEchoCanceller:
+    """speexdsp echo canceller with the EchoCanceller interface.
+
+    Same constructor + `process(near, far)` + `reset()` contract as the NLMS
+    `EchoCanceller`, so it is a literal drop-in. `mu`/`eps` are accepted for
+    signature-compatibility and ignored (speex is not an NLMS filter).
+
+    speex operates on fixed-size int16 frames and keeps adaptation state across
+    calls, so `process` frames the (possibly longer) input into `frame_size`
+    sub-frames; a final partial sub-frame is zero-padded and the output trimmed
+    back to the input length, preserving the same-length contract.
+    """
+
+    def __init__(self, sample_rate: int, filter_ms: int = 200, mu: float = 0.5,
+                 eps: float = 1e-6, frame_size: int = 160):
+        if not SPEEX_AVAILABLE:
+            raise RuntimeError("pyaec/speexdsp not available")
+        self.sample_rate = int(sample_rate)
+        self.frame_size = int(frame_size)
+        # Echo-tail length in samples (speexdsp models this much speaker->mic delay).
+        self.filter_len = max(self.frame_size, int(sample_rate * filter_ms / 1000))
+        self._new_aec = lambda: _pyaec.Aec(self.frame_size, self.filter_len, self.sample_rate, True)
+        self._aec = self._new_aec()
+
+    def reset(self):
+        """Clear learned echo-path state (e.g. after a device/route change)."""
+        self._aec = self._new_aec()
+
+    def process(self, near: np.ndarray, far: np.ndarray) -> np.ndarray:
+        near = np.asarray(near)
+        far = np.asarray(far)
+        n = int(min(len(near), len(far)))
+        if n == 0:
+            return near.astype(near.dtype)
+        out_dtype = near.dtype if near.dtype.kind == "f" else np.float64
+
+        # SCALE CONTRACT (founder-os#11658 — this was a real bug, caught on
+        # hardware): the NLMS `EchoCanceller` this class drops in for works in
+        # NORMALISED FLOAT [-1, 1], and that is what `BargeInListener` passes
+        # (`barge_in.py`: `chunk_flat.astype(np.float64) / 32768.0`). speexdsp
+        # needs int16 PCM. The first cut clipped to +/-32768 and cast straight
+        # to int16 — on float [-1, 1] the clip is a no-op and the cast TRUNCATES
+        # every sample to 0, so speex was handed pure silence and returned pure
+        # silence: rms_clean was 0.000 for all 441 frames of the first real
+        # acoustic run. That reads as "infinite cancellation" (and as "no false
+        # positive") while actually meaning the canceller is DEAD — it would
+        # also swallow the real speech barge-in has to detect.
+        #
+        # The synthetic convergence test missed this because it fed int16-scale
+        # values, where the cast is correct. So: scale float input INTO the
+        # int16 domain here, and scale the result back on the way out, so the
+        # float-in/float-out contract matches NLMS exactly.
+        float_in = near.dtype.kind == "f"
+        if float_in:
+            near_s = np.asarray(near[:n], dtype=np.float64) * 32768.0
+            far_s = np.asarray(far[:n], dtype=np.float64) * 32768.0
+        else:
+            near_s = np.asarray(near[:n], dtype=np.float64)
+            far_s = np.asarray(far[:n], dtype=np.float64)
+        near_i16 = np.clip(near_s, -32768, 32767).astype(np.int16)
+        far_i16 = np.clip(far_s, -32768, 32767).astype(np.int16)
+        fs = self.frame_size
+        out = np.empty(n, dtype=np.int16)
+        pos = 0
+        while pos < n:
+            end = min(pos + fs, n)
+            rec = near_i16[pos:end]
+            ref = far_i16[pos:end]
+            if len(rec) < fs:  # zero-pad the trailing partial frame
+                rec = np.concatenate([rec, np.zeros(fs - len(rec), dtype=np.int16)])
+                ref = np.concatenate([ref, np.zeros(fs - len(ref), dtype=np.int16)])
+            cleaned = np.asarray(self._aec.cancel_echo(rec.tolist(), ref.tolist()), dtype=np.int16)
+            out[pos:end] = cleaned[: end - pos]
+            pos = end
+        # Back to the caller's domain: float in => normalised float out, so the
+        # rms_clean/rms_near ratio the trace computes is dimensionally sane.
+        if float_in:
+            return (out.astype(np.float64) / 32768.0).astype(out_dtype)
+        return out.astype(out_dtype)
