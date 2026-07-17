@@ -52,6 +52,11 @@ from voice_mode.config import (
     VAD_CHUNK_DURATION_MS,
     INITIAL_SILENCE_GRACE_PERIOD,
     DEFAULT_LISTEN_DURATION,
+    TURN_UX_ENABLED,
+    APPEND_WINDOW_MS,
+    STEP_AWAY_MAX_DURATION,
+    LISTEN_PAUSE_FLAG_PATH,
+    RESUMED_FROM_PAUSE_FLAG_PATH,
     TTS_VOICES,
     TTS_MODELS,
     REPEAT_PHRASES,
@@ -80,6 +85,7 @@ from voice_mode.core import (
     play_system_audio
 )
 from voice_mode.audio_player import NonBlockingAudioPlayer
+from voice_mode.turn_ux import TurnUxListenState
 from voice_mode.statistics_tracking import track_voice_interaction
 from voice_mode.utils import (
     get_event_logger,
@@ -985,6 +991,19 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
         recording_duration = 0
         speech_detected = False
         stop_recording = False
+
+        # Turn-taking UX (founder-os#11655) — append-to-turn + step-away pause.
+        # Constructed ONLY when the flag is on, so with it off `turn_ux is None`
+        # and every branch below falls through to the stock behaviour unchanged.
+        turn_ux = None
+        if TURN_UX_ENABLED:
+            turn_ux = TurnUxListenState(
+                append_window_ms=APPEND_WINDOW_MS,
+                step_away_max_duration_s=STEP_AWAY_MAX_DURATION,
+                listen_pause_flag_path=LISTEN_PAUSE_FLAG_PATH,
+                resumed_flag_path=RESUMED_FROM_PAUSE_FLAG_PATH,
+                chunk_duration_ms=VAD_CHUNK_DURATION_MS,
+            )
         
         # Use a queue for thread-safe communication
         import queue
@@ -1036,7 +1055,7 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                 
                 logger.debug("Started continuous audio stream")
                 
-                while recording_duration < max_duration and not stop_recording:
+                while recording_duration < (turn_ux.effective_max_duration(max_duration) if turn_ux else max_duration) and not stop_recording:
                     try:
                         # Get audio chunk from queue with timeout
                         chunk = audio_queue.get(timeout=0.1)
@@ -1082,6 +1101,10 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                                     logger.info(f"[VAD_DEBUG] STATE CHANGE: WAITING_FOR_SPEECH -> SPEECH_ACTIVE at t={recording_duration:.1f}s")
                                 speech_detected = True
                                 silence_duration_ms = 0
+                                # Turn-UX: first speech may be William returning from
+                                # a step-away — clear the pause + arm the recap.
+                                if turn_ux:
+                                    turn_ux.on_speech()
                             # No timeout in this state - just keep waiting
                             # The only exit is speech detection or max_duration
                         else:
@@ -1089,6 +1112,10 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                             if is_speech:
                                 # SPEECH_ACTIVE state - reset silence counter
                                 silence_duration_ms = 0
+                                # Turn-UX: speech cancels any pending append grace,
+                                # and resumes the turn if we were stepped away.
+                                if turn_ux:
+                                    turn_ux.on_speech()
                             else:
                                 # SILENCE_AFTER_SPEECH state - accumulate silence
                                 silence_duration_ms += VAD_CHUNK_DURATION_MS
@@ -1096,11 +1123,26 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                                     logger.info(f"[VAD_DEBUG] Accumulating silence: {silence_duration_ms}/{SILENCE_THRESHOLD_MS}ms, t={recording_duration:.1f}s")
                                 elif silence_duration_ms % 200 == 0:  # Log every 200ms
                                     logger.debug(f"Silence: {silence_duration_ms}ms")
-                                
+
                                 # Check if we should stop due to silence threshold
                                 # Use the larger of MIN_RECORDING_DURATION (global) or min_duration (parameter)
                                 effective_min_duration = max(MIN_RECORDING_DURATION, min_duration)
-                                if recording_duration >= effective_min_duration and silence_duration_ms >= SILENCE_THRESHOLD_MS:
+                                if turn_ux:
+                                    # Turn-UX owns the stop decision: it holds off while
+                                    # stepped away and honours the append-to-turn window
+                                    # once the base threshold is reached.
+                                    should_stop = turn_ux.on_silence(
+                                        recording_s=recording_duration,
+                                        silence_ms=silence_duration_ms,
+                                        effective_min_s=effective_min_duration,
+                                        threshold_ms=SILENCE_THRESHOLD_MS,
+                                    )
+                                else:
+                                    should_stop = (
+                                        recording_duration >= effective_min_duration
+                                        and silence_duration_ms >= SILENCE_THRESHOLD_MS
+                                    )
+                                if should_stop:
                                     logger.info(f"✓ Silence threshold reached after {recording_duration:.1f}s of recording")
                                     if VAD_DEBUG:
                                         logger.info(f"[VAD_DEBUG] STOP: silence_duration={silence_duration_ms}ms >= threshold={SILENCE_THRESHOLD_MS}ms")

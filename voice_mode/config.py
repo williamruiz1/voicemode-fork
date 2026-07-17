@@ -746,6 +746,36 @@ MIN_RECORDING_DURATION = float(os.getenv("VOICEMODE_MIN_RECORDING_DURATION", "0.
 VAD_CHUNK_DURATION_MS = 30  # VAD frame size (must be 10, 20, or 30ms)
 INITIAL_SILENCE_GRACE_PERIOD = float(os.getenv("VOICEMODE_INITIAL_SILENCE_GRACE_PERIOD", "1"))  # No initial silence grace period by default
 
+# --- Turn-taking UX: append-to-turn + step-away pause (founder-os#11655) ------
+# OFF by default. When VOICEMODE_TURN_UX is unset/false, the listen loop behaves
+# byte-for-byte as before (mirrors the natural-mode flag discipline: absent the
+# flag, nothing changes). Two independent behaviours, both gated on this flag:
+#
+#   1. Append-to-turn: after the silence timer fires, keep the SAME recording
+#      open for a short grace window; if William speaks again within it, the new
+#      speech continues the same turn instead of ending it. Fixes "I want to add
+#      something" — the 700ms/1000ms timer no longer cuts off a resumed thought.
+#
+#   2. Step-away pause: a flag file (below) mirrors the existing TTS-side
+#      pause.flag onto the LISTEN side. While it exists, the silence timer is
+#      suspended and the max listen window is extended, so William can step away
+#      without the turn timing out. The moment he speaks again the flag is
+#      auto-cleared and a resume marker is dropped so the agent can recap.
+TURN_UX_ENABLED = os.getenv("VOICEMODE_TURN_UX", "false").lower() in ("true", "1", "yes", "on")
+# Grace window (ms) after the silence timer during which resumed speech appends
+# to the same turn. Only consulted when TURN_UX_ENABLED.
+APPEND_WINDOW_MS = int(os.getenv("VOICEMODE_APPEND_WINDOW_MS", "1200"))
+# Max seconds the listen loop will wait while stepped-away (flag present) before
+# giving up. Only consulted when TURN_UX_ENABLED and the flag is set.
+STEP_AWAY_MAX_DURATION = float(os.getenv("VOICEMODE_STEP_AWAY_MAX_DURATION", "180.0"))
+# Flag file the agent (or the menu-bar widget) creates to pause the LISTEN side.
+# Separate from ~/.voicemode/pause.flag, which pauses the AGENT's TTS.
+LISTEN_PAUSE_FLAG_PATH = str(BASE_DIR / "listen-pause.flag")
+# One-shot marker the listen loop drops when a turn resumes from a step-away, so
+# the agent knows to lead with a one-sentence recap instead of continuing
+# mid-thought (consumed + removed by the convomode skill).
+RESUMED_FROM_PAUSE_FLAG_PATH = str(BASE_DIR / "resumed-from-pause.flag")
+
 # Default listen duration for converse tool
 DEFAULT_LISTEN_DURATION = float(os.getenv("VOICEMODE_DEFAULT_LISTEN_DURATION", "120.0"))  # Default 120s listening time
 

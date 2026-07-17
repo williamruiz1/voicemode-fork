@@ -111,6 +111,23 @@ Supported formats: `pcm`, `opus`, `mp3`, `wav`, `flac`, `aac`
 | `VOICEMODE_MIN_RECORDING_TIME` | Minimum recording (seconds) | `0.5` | `1.0` |
 | `VOICEMODE_MAX_RECORDING_TIME` | Maximum recording (seconds) | `120.0` | `60.0` |
 
+## Turn-taking UX (append-to-turn + step-away pause)
+
+Opt-in turn-loop UX. When `VOICEMODE_TURN_UX` is unset/false the listen loop
+behaves exactly as before — these variables are only consulted when it is on.
+
+| Variable | Description | Default | Example |
+|----------|-------------|---------|---------|
+| `VOICEMODE_TURN_UX` | Master switch for the append-window + step-away pause | `false` | `true` |
+| `VOICEMODE_APPEND_WINDOW_MS` | Grace after the silence timer where resumed speech continues the same turn ("add something") | `1200` | `1500` |
+| `VOICEMODE_STEP_AWAY_MAX_DURATION` | Max seconds the listen loop waits while the step-away flag is set before giving up | `180.0` | `300.0` |
+
+Step-away is driven by a flag file: create `~/.voicemode/listen-pause.flag` to
+suspend the silence timeout (listen keeps waiting); the loop auto-removes it and
+drops `~/.voicemode/resumed-from-pause.flag` the moment speech returns, so the
+agent can recap. This mirrors the existing `~/.voicemode/pause.flag`, which
+pauses the agent's TTS rather than the listen side.
+
 ## File Storage
 
 | Variable | Description | Default | Example |
