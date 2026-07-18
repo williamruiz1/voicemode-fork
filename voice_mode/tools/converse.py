@@ -855,6 +855,74 @@ async def play_audio_feedback(
         # Don't interrupt the main flow if feedback fails
 
 
+def _bluetooth_input_active() -> bool:
+    """True when the default input device is a Bluetooth headset (AirPods etc.).
+
+    On macOS an input-only open does not reliably force a Bluetooth link into
+    HFP (mic-capable) mode — the link stays in A2DP playback and the mic reads
+    pure digital silence (airpods-mic-pinned-playback RCA 2026-06-27:
+    input-only RMS 0.000 DEAD vs full-duplex RMS 0.099 LIVE). Bluetooth inputs
+    therefore get a FULL-DUPLEX open (silent output + live input) for the
+    listen window so the OS negotiates and holds HFP. Wired/built-in inputs
+    keep the plain input-only path. Predicate mirrors core.py's device check.
+    """
+    try:
+        device_name = str(sd.query_devices(kind='input')['name']).lower()
+    except Exception as e:
+        logger.debug(f"Bluetooth input probe failed (assuming non-BT): {e}")
+        return False
+    return 'airpod' in device_name or 'bluetooth' in device_name or 'bt' in device_name
+
+
+def _duplex_device_pair():
+    """(input, output) device pair for a full-duplex open on a BT headset.
+
+    Prefer the output device whose name matches the default input (the same
+    headset — the duplex open must ride the SAME Bluetooth link to pin HFP);
+    fall back to the system default output (None) when no name match exists.
+    """
+    in_dev = sd.default.device[0]
+    try:
+        in_name = sd.query_devices(kind='input')['name']
+        for idx, dev in enumerate(sd.query_devices()):
+            if dev['max_output_channels'] > 0 and dev['name'] == in_name:
+                return (in_dev, idx)
+    except Exception as e:
+        logger.debug(f"Duplex output resolution failed (using default output): {e}")
+    return (in_dev, None)
+
+
+def _record_audio_duplex(samples_to_record: int) -> np.ndarray:
+    """Fixed-length capture over a full-duplex stream whose output is silence.
+
+    Used instead of sd.rec() when the input is a Bluetooth headset — see
+    _bluetooth_input_active. Returns an (n, 1) int16 array like sd.rec would.
+    """
+    import time as _time
+    captured = []
+    remaining = [samples_to_record]
+
+    def _callback(indata, outdata, frames, time, status):
+        if status:
+            logger.warning(f"Duplex stream status: {status}")
+        outdata.fill(0)
+        if remaining[0] > 0:
+            captured.append(indata.copy())
+            remaining[0] -= frames
+
+    device = _duplex_device_pair()
+    logger.info(f"🎧 Bluetooth input — full-duplex capture (F1), device pair {device}")
+    deadline = _time.monotonic() + samples_to_record / SAMPLE_RATE + 2.0
+    with sd.Stream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
+                   device=device, callback=_callback):
+        while remaining[0] > 0 and _time.monotonic() < deadline:
+            sd.sleep(50)
+    if not captured:
+        return np.zeros((0, 1), dtype=np.int16)
+    data = np.concatenate([c.reshape(-1) for c in captured])
+    return data[:samples_to_record].reshape(-1, 1)
+
+
 def record_audio(duration: float) -> np.ndarray:
     """Record audio from microphone"""
     logger.info(f"🎤 Recording audio for {duration}s...")
@@ -877,13 +945,18 @@ def record_audio(duration: float) -> np.ndarray:
         samples_to_record = int(duration * SAMPLE_RATE)
         logger.debug(f"Recording {samples_to_record} samples...")
         
-        recording = sd.rec(
-            samples_to_record,
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype=np.int16
-        )
-        sd.wait()
+        if _bluetooth_input_active():
+            # F1 (founder-os#13215): BT headsets need a full-duplex open to
+            # hold HFP for the listen window; input-only reads dead silence.
+            recording = _record_audio_duplex(samples_to_record)
+        else:
+            recording = sd.rec(
+                samples_to_record,
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype=np.int16
+            )
+            sd.wait()
         
         flattened = recording.flatten()
         logger.info(f"✓ Recorded {len(flattened)} samples")
@@ -1238,13 +1311,36 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
             # Put the audio data in the queue for processing
             audio_queue.put(indata.copy())
         
+        def duplex_audio_callback(indata, outdata, frames, time, status):
+            """Full-duplex wrapper: silent output + the normal input callback.
+
+            F1 (founder-os#13215): when the input is a Bluetooth headset, the
+            listen window must be a two-way stream or macOS tears down HFP and
+            the mic reads dead silence. Output writes silence; input feeds the
+            same queue as the plain path.
+            """
+            outdata.fill(0)
+            audio_callback(indata, frames, time, status)
+
         try:
-            # Create continuous input stream
-            with sd.InputStream(samplerate=SAMPLE_RATE,
-                               channels=CHANNELS,
-                               dtype=np.int16,
-                               callback=audio_callback,
-                               blocksize=chunk_samples):
+            # Create continuous stream (full-duplex on BT input, input-only
+            # otherwise). Construction opens the PortAudio stream, so it stays
+            # inside this try to keep the device-error recovery path intact.
+            if _bluetooth_input_active():
+                logger.info("🎧 Bluetooth input — full-duplex listen stream (F1)")
+                stream_ctx = sd.Stream(samplerate=SAMPLE_RATE,
+                                       channels=CHANNELS,
+                                       dtype=np.int16,
+                                       device=_duplex_device_pair(),
+                                       callback=duplex_audio_callback,
+                                       blocksize=chunk_samples)
+            else:
+                stream_ctx = sd.InputStream(samplerate=SAMPLE_RATE,
+                                            channels=CHANNELS,
+                                            dtype=np.int16,
+                                            callback=audio_callback,
+                                            blocksize=chunk_samples)
+            with stream_ctx:
                 
                 logger.debug("Started continuous audio stream")
 
