@@ -65,6 +65,20 @@ class TestUnifiedServiceTool:
         with patch('voice_mode.tools.service.find_process_by_port', return_value=mock_proc):
             result = await service("kokoro", "start")
             assert "already running" in result
+
+    @pytest.mark.asyncio
+    async def test_start_macos_on_demand_service_kickstarts_loaded_job(self):
+        """Loading an on-demand launchd job is followed by an explicit start."""
+        with patch('voice_mode.tools.service.find_process_by_port', side_effect=[None, MagicMock()]), \
+             patch('platform.system', return_value='Darwin'), \
+             patch('pathlib.Path.exists', return_value=True), \
+             patch('subprocess.run', return_value=MagicMock(returncode=0)) as mock_run, \
+             patch('asyncio.sleep'):
+            result = await service("whisper", "start")
+
+        assert "started" in result
+        assert any(call.args[0][:2] == ["launchctl", "load"] for call in mock_run.call_args_list)
+        assert any(call.args[0][:2] == ["launchctl", "kickstart"] for call in mock_run.call_args_list)
     
     @pytest.mark.asyncio
     async def test_start_whisper_service(self):
@@ -125,6 +139,22 @@ class TestUnifiedServiceTool:
             assert "stopped" in result
             assert "was PID: 12345" in result
             mock_proc.terminate.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_service_never_force_kills_on_timeout(self):
+        """An unresponsive service is surfaced, not force-killed."""
+        import psutil
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.wait.side_effect = psutil.TimeoutExpired(5)
+        with patch('voice_mode.tools.service.find_process_by_port', return_value=mock_proc), \
+             patch('platform.system', return_value='Darwin'), \
+             patch('pathlib.Path.exists', return_value=False):
+            result = await service("kokoro", "stop")
+        assert "refused graceful termination" in result
+        mock_proc.terminate.assert_called_once()
+        mock_proc.kill.assert_not_called()
     
     @pytest.mark.asyncio
     async def test_restart_service(self):
@@ -176,7 +206,7 @@ class TestUnifiedServiceTool:
             result = await service("whisper", "enable")
             assert "✅" in result
             assert "enabled" in result
-            assert "will start automatically at login" in result
+            assert "starts only when explicitly requested" in result
     
     @pytest.mark.asyncio
     async def test_enable_service_linux(self):

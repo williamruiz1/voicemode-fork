@@ -12,9 +12,9 @@
         <string>{START_SCRIPT}</string>
     </array>
     <key>RunAtLoad</key>
-    <true/>
+    <false/>
     <key>KeepAlive</key>
-    <true/>
+    <false/>
     <key>StandardOutPath</key>
     <string>{HOME}/.voicemode/logs/whisper/whisper.out.log</string>
     <key>StandardErrorPath</key>
