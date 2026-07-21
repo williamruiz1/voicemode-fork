@@ -409,6 +409,14 @@ async def start_service(service_name: str) -> str:
                 text=True
             )
             if result.returncode == 0:
+                # The launchd templates are deliberately on-demand
+                # (RunAtLoad=false, KeepAlive=false). Loading registers the job;
+                # kickstart is the explicit lease-owned start action.
+                subprocess.run(
+                    ["launchctl", "kickstart", f"gui/{os.getuid()}/com.voicemode.{file_name}"],
+                    capture_output=True,
+                    text=True,
+                )
                 # Wait for service to start
                 for _ in range(10):
                     if is_service_running():
@@ -637,9 +645,10 @@ async def stop_service(service_name: str) -> str:
         try:
             proc.wait(timeout=5)
         except psutil.TimeoutExpired:
-            # Force kill if needed
-            proc.kill()
-            proc.wait(timeout=5)
+            # Resource hygiene is graceful-only. Preserve the process for local
+            # inspection and let the controller surface term-refused; never
+            # escalate an uncertain service stop to a force kill.
+            return f"⚠️ {service_name.capitalize()} refused graceful termination (PID: {pid})"
         
         return f"✅ {service_name.capitalize()} stopped (was PID: {pid})"
         
@@ -719,7 +728,7 @@ async def enable_service(service_name: str) -> str:
             )
 
             if result.returncode == 0:
-                return f"✅ {service_name.capitalize()} service enabled. It will start automatically at login.\nPlist: {service_path}"
+                return f"✅ {service_name.capitalize()} on-demand service enabled. It starts only when explicitly requested.\nPlist: {service_path}"
             else:
                 error = result.stderr or result.stdout
                 return f"❌ Failed to enable {service_name} service: {error}"

@@ -579,6 +579,23 @@ CONCH_CHECK_INTERVAL = float(os.getenv("VOICEMODE_CONCH_CHECK_INTERVAL", "0.5"))
 # Default 300s (5 min) covers 2 min listen + long TTS. Set to 0 to disable.
 CONCH_LOCK_EXPIRY = float(os.getenv("VOICEMODE_CONCH_LOCK_EXPIRY", "300"))
 
+# Yieldable listen (transient + preemptible audio-focus, vibedispatcher#132):
+# the conch stays EXCLUSIVE during TTS, but while the holder is merely
+# LISTENING (idle, no speech detected) it yields to another agent's request.
+# Set to false to restore the old hold-through-the-whole-turn behavior.
+CONCH_YIELD_ENABLED = os.getenv("VOICEMODE_CONCH_YIELD_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+
+# A conch-wanted request counts only if refreshed within this many seconds
+# (waiters refresh every CONCH_CHECK_INTERVAL, so a crashed waiter's request
+# goes stale quickly and can't force yields forever)
+CONCH_WANTED_FRESH = float(os.getenv("VOICEMODE_CONCH_WANTED_FRESH", "5"))
+
+# When a waiter hits CONCH_TIMEOUT it preempts the lock instead of failing —
+# but never mid-utterance: if the holder is actually playing TTS (speaking
+# flag present), the waiter grants up to this many extra seconds of grace
+# before force-clearing.
+CONCH_PREEMPT_TTS_GRACE = float(os.getenv("VOICEMODE_CONCH_PREEMPT_TTS_GRACE", "30"))
+
 # Auto-focus tmux pane when conch is acquired (for multi-agent setups)
 # When enabled, automatically switches tmux focus to the speaking agent's pane
 AUTO_FOCUS_PANE = env_bool("VOICEMODE_AUTO_FOCUS_PANE", False)
@@ -767,7 +784,187 @@ VAD_AGGRESSIVENESS = int(os.getenv("VOICEMODE_VAD_AGGRESSIVENESS", "3"))  # 0-3,
 SILENCE_THRESHOLD_MS = int(os.getenv("VOICEMODE_SILENCE_THRESHOLD_MS", "1000"))  # Stop after 1000ms (1 second) of silence
 MIN_RECORDING_DURATION = float(os.getenv("VOICEMODE_MIN_RECORDING_DURATION", "0.5"))  # Minimum 0.5s recording
 VAD_CHUNK_DURATION_MS = 30  # VAD frame size (must be 10, 20, or 30ms)
+
+# Energy floor for the VAD (the "driving profile" noise gate). webrtcvad has NO
+# energy threshold of its own — in a noisy environment (road/engine noise) it
+# classifies the noise floor itself as "speech", so the trailing-silence counter
+# never accumulates and the mic hangs until listen_duration_max. Requiring a
+# chunk to ALSO clear an RMS energy floor makes steady low-level noise read as
+# silence (so end-of-turn is detected) while a real spoken voice — which is much
+# louder than road rumble at a close-talking AirPods mic — still passes.
+#   0      = OFF (default; pure-webrtcvad behavior, unchanged for quiet rooms).
+#   ~250-400 = a sensible DRIVING value at the 24kHz int16 close-mic scale.
+# Calibrate with VOICEMODE_VAD_DEBUG=true (the [VAD_DEBUG] lines print per-chunk
+# RMS): pick a floor above the "WAITING" road-noise RMS and below your speech RMS.
+VAD_ENERGY_THRESHOLD = float(os.getenv("VOICEMODE_VAD_ENERGY_THRESHOLD", "0"))  # 0 = disabled (off by default)
 INITIAL_SILENCE_GRACE_PERIOD = float(os.getenv("VOICEMODE_INITIAL_SILENCE_GRACE_PERIOD", "1"))  # No initial silence grace period by default
+
+# ==================== NATURAL MODE / BARGE-IN CONFIGURATION (Phase 1) ====================
+#
+# "Natural mode" lets the mic stay hot WHILE TTS is playing, so speaking over the
+# agent instantly cuts playback mid-word and becomes the next turn -- unlike the
+# default "turn mode" (unchanged, sequential: speak, THEN listen). Toggled via a
+# flag file (mirrors the existing focus-hold / pause-flag pattern already in this
+# codebase), never an env var, because it's a runtime session choice, not a
+# deployment config. See voice_mode/barge_in.py + docs/guides/natural-mode.md.
+#
+# All values below are TUNING KNOBS for the barge-in trigger + the software echo
+# canceller. They ship with conservative defaults and are EXPECTED to need
+# live, on-device retuning (per the natural-voice-mode research doc, Phase 1
+# task list item 4) -- there is no way to validate AEC/VAD thresholds against a
+# real microphone + speaker acoustic path from code alone.
+
+# Flag file whose presence turns natural mode ON for this machine. Absence (the
+# default) is turn mode, byte-for-byte the existing behavior -- natural mode is
+# fully inert unless this file exists, so it can never regress turn mode.
+NATURAL_MODE_FLAG_PATH = os.path.expanduser(
+    os.getenv("VOICEMODE_NATURAL_MODE_FLAG_PATH", "~/.voicemode/natural-mode.flag")
+)
+
+# How many consecutive ms of post-AEC VAD speech, WHILE TTS is audibly playing,
+# before we treat it as a genuine barge-in (not a brief cough/click/AEC residual).
+# webrtcvad frames are VAD_CHUNK_DURATION_MS (30ms) each, so 300ms ~= 10 frames.
+BARGE_IN_TRIGGER_MS = int(os.getenv("VOICEMODE_BARGE_IN_TRIGGER_MS", "300"))
+
+# VAD aggressiveness used by the CONCURRENT barge-in listener specifically (kept
+# separate from the turn-taking VAD_AGGRESSIVENESS above -- barge-in runs on a
+# post-AEC signal that may still carry echo residual, so a stricter default
+# reduces self-triggering while AEC settles). Falls back to VAD_AGGRESSIVENESS
+# when unset.
+_barge_in_vad_env = os.getenv("VOICEMODE_BARGE_IN_VAD_AGGRESSIVENESS")
+BARGE_IN_VAD_AGGRESSIVENESS = int(_barge_in_vad_env) if _barge_in_vad_env is not None else VAD_AGGRESSIVENESS
+
+# Length of the adaptive echo-cancellation filter, in milliseconds of reference
+# audio. This bounds how much acoustic delay (speaker -> room/AirPods -> mic)
+# the canceller can model; longer = handles more delay/reverb but adapts slower
+# and costs more CPU per frame. ~200ms covers a single close-talking Bluetooth
+# device (the common case here -- AirPods serve both directions, a SHORTER and
+# more linear acoustic path than a laptop's speaker-to-mic leak).
+AEC_FILTER_MS = int(os.getenv("VOICEMODE_AEC_FILTER_MS", "200"))
+
+# Static offset (ms) between when a sample is HANDED to the output stream and
+# when its echo actually reaches the mic (Bluetooth codec + OS buffering delay).
+# 0 = assume no fixed offset; the adaptive filter's tap window still absorbs
+# some misalignment, but if echo consistently leaks through, measure the real
+# round-trip delay on-device and set this explicitly. THIS is one of the two
+# values the live-trial task is expected to retune (the other is
+# VOICEMODE_AEC_FILTER_MS / VOICEMODE_BARGE_IN_TRIGGER_MS).
+AEC_REF_DELAY_MS = int(os.getenv("VOICEMODE_AEC_REF_DELAY_MS", "0"))
+
+# NLMS adaptation step size (0 < mu <= 1). Higher converges faster but is more
+# prone to a known NLMS limitation called "double-talk misadjustment": while
+# BOTH the echo and William's real voice are present at once (exactly the
+# barge-in window we're trying to detect), a high mu makes the filter partly
+# try to "explain away" his uncorrelated speech as unmodeled echo, attenuating
+# the very speech we need the VAD to see. A synthetic-signal sweep (see
+# tests/test_aec.py) showed mu=0.5 preserves only ~19% of a real-speech burst's
+# energy during double-talk vs mu=0.15 preserving more, for near-identical echo
+# attenuation -- so we default LOW, biased toward "don't cancel his real voice"
+# over "cancel the echo perfectly". A real double-talk detector (freeze
+# adaptation when both sides are active) is the textbook fix and a reasonable
+# Phase 2 refinement; out of scope here.
+AEC_STEP_SIZE = float(os.getenv("VOICEMODE_AEC_STEP_SIZE", "0.15"))
+
+# Adaptive echo-floor margin gate (added 2026-07-14, after the first real
+# acoustic-hardware trial showed the AEC alone -- across the FULL sweep of the
+# three tunables above -- provides only ~3-4dB of real cancellation on William's
+# MacBook Pro built-in mic/speakers: 96.5% of post-AEC frames during an
+# 11-second TTS-alone clip were misclassified as "speech" by webrtcvad at
+# aggressiveness=3, with a longest continuous false run of 4.35s. No value of
+# AEC_STEP_SIZE (0.15-0.9), AEC_REF_DELAY_MS (0-300ms), or the TTS output
+# buffer's time-resolution (2048 vs 720 samples) changed that. Raising
+# BARGE_IN_TRIGGER_MS only delayed the inevitable self-interruption, never
+# prevented it (see scripts/barge_in_acoustic_test.py sweep results).
+#
+# This is a SUPPLEMENTARY gate, not a replacement for AEC+VAD: it requires the
+# post-AEC signal to be not just VAD-positive but MEASURABLY LOUDER than the
+# recent echo-only residual floor -- a real interruption adds a second,
+# uncorrelated sound source on top of the echo residual, so it should push
+# rms_clean well above whatever level echo-alone settles at, even when the
+# AEC's absolute cancellation is poor. echo_floor is an ASYMMETRIC
+# minimum-statistics tracker of rms_clean (fast down / slow up, updated every
+# frame -- see voice_mode/barge_in.py), so it can calibrate even when TTS is
+# loud from frame 1 and can't be dragged up by a genuine interruption's own
+# energy. BARGE_IN_ENERGY_MARGIN is the multiplier a frame's rms_clean must
+# clear (relative to the floor BEFORE that frame's update) to count toward
+# the speech run. 0 (default) disables the gate entirely -- byte-for-byte the
+# pre-2026-07-14 behavior -- so shipping this constant changes nothing until
+# a value >1.0 is explicitly set.
+#
+# EMPIRICAL RESULT (2026-07-14, full sweep in scripts/barge_in_acoustic_test.py
+# against real MacBook Pro built-in mic/speakers): margin=3.0 eliminated the
+# TTS-alone false positive across 7/7 repeated 11-second trials, but the SAME
+# setting then missed 2 of 3 real double-talk (TTS + a second real speech
+# clip) trials, and the one trial it did register triggered BEFORE the
+# injected interruption even started (i.e. that "hit" was itself a
+# coincidental false positive, not a real detection). Lower margins (1.3-2.5)
+# reduced but did not reliably eliminate the false positive. Conclusion: on
+# this hardware, no single margin value gets both "doesn't self-interrupt"
+# and "detects a real interruption" -- the two failure modes trade off
+# against each other because the underlying post-AEC signal doesn't actually
+# separate echo from real speech by amplitude alone (the root problem is the
+# ~3-4dB of real cancellation, not this gate's tuning). This constant is left
+# in the codebase as a documented, off-by-default, honestly-labeled
+# experimental knob -- NOT a validated fix -- for whoever picks up the AEC
+# quality problem itself (a real native AEC library, or a learned/nonlinear
+# echo suppressor, is the credible next step; see docs/guides/natural-mode.md).
+BARGE_IN_ENERGY_MARGIN = float(os.getenv("VOICEMODE_BARGE_IN_ENERGY_MARGIN", "0"))
+
+# ==================== PAUSE / STEP-AWAY / APPEND-TO-TURN (founder-os#11655) ==========
+#
+# Three graceful-conversation additions to the LISTEN side of convomode. ALL are
+# INERT BY DEFAULT: with none enabled, the record/VAD/turn loop runs byte-for-byte
+# as before (proven by tests/test_pause_stepaway_append.py). Each mirrors the
+# existing flag-file discipline already in this codebase (natural-mode.flag,
+# pause.flag, focus-hold) so the features can be toggled live — the NEXT convomode
+# session picks a change up — without editing MCP env or respawning the server.
+#
+# 1) STEP-AWAY (Gaps 1 & 2 of the dispatch): when the LISTEN loop is idle (no
+#    speech yet) and convomode is PAUSED (the existing ~/.voicemode/pause.flag —
+#    William taps Pause, or the tool sets it when he says "hold on"), the loop
+#    WAITS longer instead of timing out at listen_duration_max, speaks ONE check-in
+#    ("Still there?") after STEP_AWAY_CHECKIN_SECONDS, then ends gracefully (not
+#    silently) at STEP_AWAY_GRACE_SECONDS. This reuses the SAME pause primitive
+#    that already pauses TTS — extended to the listen loop. Enabled by
+#    VOICEMODE_STEP_AWAY_ENABLED=true OR the presence of the flag file below.
+STEP_AWAY_ENV = os.getenv("VOICEMODE_STEP_AWAY_ENABLED", "false").lower() in ("true", "1", "yes", "on")
+STEP_AWAY_FLAG_PATH = os.path.expanduser(
+    os.getenv("VOICEMODE_STEP_AWAY_FLAG_PATH", "~/.voicemode/step-away.enabled")
+)
+# How long (s) the idle listen keeps waiting once paused, before giving up.
+STEP_AWAY_GRACE_SECONDS = float(os.getenv("VOICEMODE_STEP_AWAY_GRACE_SECONDS", "180"))
+# How long (s) of continuous pause before the ONE spoken "Still there?" check-in.
+STEP_AWAY_CHECKIN_SECONDS = float(os.getenv("VOICEMODE_STEP_AWAY_CHECKIN_SECONDS", "45"))
+
+# 2) APPEND-TO-TURN (Gap 3): after the trailing-silence timer fires, keep the mic
+#    open a short EXTRA window; if new speech starts within it ("also—", "and—"),
+#    it is appended to the SAME turn instead of starting a new exchange. Mechanically
+#    this just extends the effective trailing-silence threshold by APPEND_WINDOW_MS.
+#    0 (default) = OFF, byte-for-byte the prior single-shot behavior. A live knob
+#    file ~/.voicemode/append-window-ms (integer contents) overrides the env so it
+#    can be tuned without a respawn.
+APPEND_WINDOW_MS = int(os.getenv("VOICEMODE_APPEND_WINDOW_MS", "0"))
+APPEND_WINDOW_FLAG_PATH = os.path.expanduser(
+    os.getenv("VOICEMODE_APPEND_WINDOW_FLAG_PATH", "~/.voicemode/append-window-ms")
+)
+
+# Spoken-keyword triggers (only consulted when STEP_AWAY is enabled). A completed
+# transcription matching a step-away phrase makes the tool set the pause flag +
+# wait; a resume phrase (or the widget clearing the flag) resumes with a recap.
+# Matched as a WHOLE utterance (near-exact, punctuation/spacing-insensitive) so a
+# passing mention mid-sentence never false-triggers.
+STEP_AWAY_PHRASES = [
+    p.strip().lower() for p in os.getenv(
+        "VOICEMODE_STEP_AWAY_PHRASES",
+        "hold on,one sec,one second,hang on,hold up,give me a sec,give me a second,pause,wait a sec",
+    ).split(",") if p.strip()
+]
+STEP_AWAY_RESUME_PHRASES = [
+    p.strip().lower() for p in os.getenv(
+        "VOICEMODE_STEP_AWAY_RESUME_PHRASES",
+        "okay i'm back,i'm back,im back,ok i'm back,resume,let's continue,lets continue,continue,i'm here,im here",
+    ).split(",") if p.strip()
+]
 
 # Default listen duration for converse tool
 DEFAULT_LISTEN_DURATION = float(os.getenv("VOICEMODE_DEFAULT_LISTEN_DURATION", "120.0"))  # Default 120s listening time

@@ -5,7 +5,7 @@ import logging
 import os
 import time
 import traceback
-from typing import Optional, Literal, Tuple, Dict, Union
+from typing import Callable, Optional, Literal, Tuple, Dict, Union
 from pathlib import Path
 from datetime import datetime
 
@@ -47,6 +47,7 @@ from voice_mode.config import (
     VAD_AGGRESSIVENESS,
     SILENCE_THRESHOLD_MS,
     MIN_RECORDING_DURATION,
+    VAD_ENERGY_THRESHOLD,
     SKIP_TTS,
     TTS_SPEED,
     VAD_CHUNK_DURATION_MS,
@@ -64,8 +65,18 @@ from voice_mode.config import (
     CONCH_ENABLED,
     CONCH_TIMEOUT,
     CONCH_CHECK_INTERVAL,
+    CONCH_YIELD_ENABLED,
+    CONCH_PREEMPT_TTS_GRACE,
     AUTO_FOCUS_PANE,
-    STT_MODEL
+    STT_MODEL,
+    STEP_AWAY_ENV,
+    STEP_AWAY_FLAG_PATH,
+    STEP_AWAY_GRACE_SECONDS,
+    STEP_AWAY_CHECKIN_SECONDS,
+    APPEND_WINDOW_MS,
+    APPEND_WINDOW_FLAG_PATH,
+    STEP_AWAY_PHRASES,
+    STEP_AWAY_RESUME_PHRASES,
 )
 import voice_mode.config
 from voice_mode.provider_discovery import provider_registry
@@ -80,7 +91,8 @@ from voice_mode.core import (
     play_chime_end,
     play_system_audio
 )
-from voice_mode.audio_player import NonBlockingAudioPlayer
+from voice_mode.audio_player import NonBlockingAudioPlayer, SPEAKING_FLAG_PATH, convomode_paused, PAUSE_FLAG_PATH
+from voice_mode import barge_in
 from voice_mode.statistics_tracking import track_voice_interaction
 from voice_mode.utils import (
     get_event_logger,
@@ -1028,25 +1040,196 @@ def record_audio(duration: float) -> np.ndarray:
             sys.stderr = original_stderr
 
 
-def record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None) -> Tuple[np.ndarray, bool]:
+async def _preempt_conch_after_tts_grace(conch: Conch, speaking_flag_path: str = None) -> bool:
+    """Preempt-and-acquire the conch at the waiter's hard timeout — never mid-utterance.
+
+    While the current holder is actually playing TTS (the speaking flag is
+    present), grant up to CONCH_PREEMPT_TTS_GRACE extra seconds — the holder
+    normally releases (or its idle listen yields) in that window. Only after
+    the flag clears or the grace is exhausted does the force-clear happen.
+
+    Returns True if the conch ended up acquired.
+    """
+    flag_path = speaking_flag_path or SPEAKING_FLAG_PATH
+    grace = 0.0
+    while (not conch.try_acquire()
+           and os.path.exists(flag_path)
+           and grace < CONCH_PREEMPT_TTS_GRACE):
+        await asyncio.sleep(CONCH_CHECK_INTERVAL)
+        grace += CONCH_CHECK_INTERVAL
+    if not conch._acquired:
+        conch.preempt_acquire("converse")
+    return conch._acquired
+
+
+# ==================== PAUSE / STEP-AWAY / APPEND HELPERS (founder-os#11655) ==========
+# Small PURE helpers so the record loop's new behavior is unit-testable without a
+# microphone. All resolve to inert values by default (step-away off, append 0).
+
+def step_away_enabled() -> bool:
+    """Runtime check: step-away is ON if the env flag is set OR the flag file
+    exists (mirrors the natural-mode.flag discipline — toggle live, no respawn).
+    Default (no env, no file) = False = fully inert."""
+    try:
+        if STEP_AWAY_ENV:
+            return True
+        return os.path.exists(STEP_AWAY_FLAG_PATH)
+    except Exception:
+        return False
+
+
+def append_window_ms() -> int:
+    """Runtime resolve of the append-to-turn grace (ms). A live knob file
+    (~/.voicemode/append-window-ms with an integer body) overrides the env so it
+    can be tuned without a respawn. Default 0 = OFF = byte-for-byte prior loop."""
+    try:
+        if os.path.exists(APPEND_WINDOW_FLAG_PATH):
+            with open(APPEND_WINDOW_FLAG_PATH) as f:
+                return max(0, int((f.read() or "0").strip() or "0"))
+    except Exception:
+        pass
+    return max(0, APPEND_WINDOW_MS)
+
+
+def _normalize_phrase(text: Optional[str]) -> str:
+    """Lowercase, strip punctuation/extra spaces for whole-utterance matching."""
+    if not text:
+        return ""
+    import re
+    return re.sub(r"[^a-z0-9\s']", " ", text.lower()).strip()
+
+
+def is_step_away_phrase(text: Optional[str]) -> bool:
+    """True if the WHOLE utterance is a step-away phrase ("hold on", "one sec").
+    Whole-utterance (near-exact) so a passing mention mid-sentence never fires.
+    Fail-safe: empty/None → False."""
+    norm = _normalize_phrase(text)
+    if not norm:
+        return False
+    return any(norm == _normalize_phrase(p) for p in STEP_AWAY_PHRASES)
+
+
+def is_resume_phrase(text: Optional[str]) -> bool:
+    """True if the WHOLE utterance is a resume phrase ("I'm back", "resume").
+    Fail-safe: empty/None → False."""
+    norm = _normalize_phrase(text)
+    if not norm:
+        return False
+    return any(norm == _normalize_phrase(p) for p in STEP_AWAY_RESUME_PHRASES)
+
+
+class StepAwayTracker:
+    """Pure state machine for graceful step-away during an IDLE listen (Gaps 1 & 2).
+
+    Inert unless `enabled` AND a pause is observed while still idle. No I/O, no
+    audio — the record loop feeds it (paused, elapsed, speech_detected) each idle
+    iteration and it returns whether a ONE-TIME check-in should be spoken now. It
+    also computes the extended listen deadline (effective_max) so a paused idle
+    listen waits `grace_seconds` instead of timing out at the normal max.
+    """
+
+    def __init__(self, enabled: bool, base_max_duration: float,
+                 grace_seconds: float, checkin_seconds: float):
+        self.enabled = bool(enabled)
+        self.base_max = float(base_max_duration)
+        self.grace = float(grace_seconds)
+        self.checkin = float(checkin_seconds)
+        self.active = False           # currently in a paused idle wait
+        self.start_elapsed = None     # recording elapsed (s) when the pause began
+        self.checkin_done = False     # the ONE check-in already spoken
+        self.stepped_away = False     # a step-away happened at all this listen
+        self.resumed = False          # pause cleared while still idle (he's back)
+
+    def effective_max(self) -> float:
+        """The current listen deadline. Extends to grace only while actively
+        paused-and-idle; otherwise the unchanged base max (inert)."""
+        if self.enabled and self.active and self.start_elapsed is not None:
+            return max(self.base_max, self.start_elapsed + self.grace)
+        return self.base_max
+
+    def observe(self, paused: bool, elapsed: float, speech_detected: bool) -> bool:
+        """Feed one idle-iteration observation. Returns True EXACTLY ONCE when the
+        spoken check-in is due. Once speech is detected this turn, step-away no
+        longer applies (an in-progress utterance always completes)."""
+        if not self.enabled or speech_detected:
+            return False
+        if paused:
+            if not self.active:
+                self.active = True
+                self.start_elapsed = elapsed
+                self.stepped_away = True
+            if (not self.checkin_done) and self.start_elapsed is not None \
+                    and (elapsed - self.start_elapsed) >= self.checkin:
+                self.checkin_done = True
+                return True
+        else:
+            if self.active:
+                # pause cleared while still idle → he's back / took the floor
+                self.resumed = True
+                self.active = False
+        return False
+
+
+def record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, yield_check: Optional[Callable[[], bool]] = None, yield_state: Optional[dict] = None, pre_roll: Optional[np.ndarray] = None, pause_check: Optional[Callable[[], bool]] = None, step_away_state: Optional[dict] = None, checkin_callback: Optional[Callable[[], None]] = None, append_window_override_ms: Optional[int] = None, step_away_enabled_override: Optional[bool] = None) -> Tuple[np.ndarray, bool]:
     """Record audio from microphone with automatic silence detection.
-    
+
     Uses WebRTC VAD to detect when the user stops speaking and automatically
     stops recording after a configurable silence threshold.
-    
+
     Args:
         max_duration: Maximum recording duration in seconds
         disable_silence_detection: If True, disables silence detection and uses fixed duration recording
         min_duration: Minimum recording duration before silence detection can stop (default: 0.0)
         vad_aggressiveness: VAD aggressiveness level (0-3). If None, uses VAD_AGGRESSIVENESS from config
-        
+        yield_check: Optional callable polled during the listen loop. When it
+            returns True while the listen is still IDLE (no speech detected
+            yet), recording ends early so the caller can yield the mic to
+            another agent (vibedispatcher#132). Never fires once speech has
+            been detected — an in-progress utterance always completes.
+        yield_state: Optional dict; when the listen ends because of
+            yield_check, ``yield_state["yielded"]`` is set True. (Out-of-band
+            so the 2-tuple return stays stable for existing callers.)
+        pre_roll: Optional audio already captured BEFORE this call started (natural-mode
+            barge-in: the mic audio that triggered the interruption). When provided, it
+            seeds the recording as already-in-progress speech, so his interruption
+            becomes the start of this turn instead of being discarded and re-prompted.
+        pause_check: Optional callable (founder-os#11655). Polled while the listen is
+            IDLE. When step-away is enabled and this returns True (convomode paused),
+            the idle listen WAITS longer (up to STEP_AWAY_GRACE_SECONDS) instead of
+            timing out at max_duration. Defaults to convomode_paused when step-away is
+            enabled and none is passed. Inert when step-away is off.
+        step_away_state: Optional dict; out-of-band signals set on exit —
+            ``stepped_away`` (a pause happened this listen), ``resumed`` (pause
+            cleared while still idle → he's back), ``checkin_done`` (the ONE check-in
+            was spoken). Keeps the 2-tuple return stable for existing callers.
+        checkin_callback: Optional no-arg callable invoked ONCE, after
+            STEP_AWAY_CHECKIN_SECONDS of continuous idle-pause, to speak the "Still
+            there?" check-in. None (default) = no spoken check-in (patience still
+            extends). Failures are swallowed — a check-in never breaks the listen.
+        append_window_override_ms: Optional ms to extend the trailing-silence
+            threshold (append-to-turn, Gap 3). None → resolved from config/knob file.
+            0 → OFF, byte-for-byte the prior single-shot behavior.
+        step_away_enabled_override: Optional bool to force step-away on/off (tests).
+            None → resolved from env flag / flag file. Default resolves to OFF.
+
     Returns:
         Tuple of (audio_data, speech_detected):
             - audio_data: Numpy array of recorded audio samples
             - speech_detected: Boolean indicating if speech was detected during recording
     """
-    
+
     logger.info(f"record_audio_with_silence_detection called - VAD_AVAILABLE={VAD_AVAILABLE}, DISABLE_SILENCE_DETECTION={DISABLE_SILENCE_DETECTION}, min_duration={min_duration}")
+
+    # --- founder-os#11655: resolve pause/step-away/append config (all inert by default) ---
+    _append_ms = append_window_override_ms if append_window_override_ms is not None else append_window_ms()
+    _step_away_on = step_away_enabled_override if step_away_enabled_override is not None else step_away_enabled()
+    if _step_away_on and pause_check is None:
+        pause_check = convomode_paused  # reuse the existing pause primitive
+    _step_away = StepAwayTracker(_step_away_on, max_duration, STEP_AWAY_GRACE_SECONDS, STEP_AWAY_CHECKIN_SECONDS)
+    if _append_ms > 0:
+        logger.info(f"🎙️ append-to-turn window enabled: +{_append_ms}ms after silence timer")
+    if _step_away_on:
+        logger.info(f"🎙️ step-away enabled: grace {STEP_AWAY_GRACE_SECONDS}s, check-in at {STEP_AWAY_CHECKIN_SECONDS}s")
     
     if not VAD_AVAILABLE:
         logger.warning("webrtcvad not available, falling back to fixed duration recording")
@@ -1078,11 +1261,14 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
         vad_sample_rate = 16000
         vad_chunk_samples = int(vad_sample_rate * VAD_CHUNK_DURATION_MS / 1000)
         
-        # Recording state
-        chunks = []
+        # Recording state -- seed from natural-mode barge-in pre-roll if given,
+        # so his interruption becomes the start of this turn's speech rather
+        # than being thrown away.
+        has_pre_roll = pre_roll is not None and len(pre_roll) > 0
+        chunks = [pre_roll] if has_pre_roll else []
         silence_duration_ms = 0
-        recording_duration = 0
-        speech_detected = False
+        recording_duration = (len(pre_roll) / SAMPLE_RATE) if has_pre_roll else 0
+        speech_detected = has_pre_roll
         stop_recording = False
         
         # Use a queue for thread-safe communication
@@ -1157,8 +1343,63 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
             with stream_ctx:
                 
                 logger.debug("Started continuous audio stream")
-                
-                while recording_duration < max_duration and not stop_recording:
+
+                # Manual turn-end signal (push-to-talk "I'm done"). A reachable-while-
+                # driving surface (Apple Shortcut → SSH → `touch`) drops this file to end
+                # the listen window IMMEDIATELY, no VAD needed. Cleaned up on each entry so
+                # a stale signal can't pre-end the next turn.
+                _turn_end_signal = os.path.expanduser("~/.voicemode/turn-end.signal")
+                try:
+                    if os.path.exists(_turn_end_signal):
+                        os.remove(_turn_end_signal)
+                except Exception:
+                    pass
+
+                while recording_duration < _step_away.effective_max() and not stop_recording:
+                    # Graceful step-away (founder-os#11655): while IDLE and paused,
+                    # extend patience (effective_max above) and speak ONE check-in.
+                    # Fully inert unless step-away is enabled AND convomode is paused.
+                    if pause_check is not None and not speech_detected:
+                        try:
+                            _paused_now = bool(pause_check())
+                        except Exception:
+                            _paused_now = False
+                        if _step_away.observe(_paused_now, recording_duration, speech_detected) and checkin_callback is not None:
+                            logger.info("⏸️ step-away: speaking one 'still there?' check-in")
+                            try:
+                                checkin_callback()
+                            except Exception:
+                                pass
+
+                    # Honor a manual turn-end signal first (push-to-talk). If William
+                    # tapped his "done" Shortcut, end the recording now (only after the
+                    # min duration so a too-fast tap can't return empty audio).
+                    try:
+                        if os.path.exists(_turn_end_signal) and recording_duration >= max(MIN_RECORDING_DURATION, min_duration):
+                            logger.info("✓ Manual turn-end signal received — stopping recording")
+                            try:
+                                os.remove(_turn_end_signal)
+                            except Exception:
+                                pass
+                            stop_recording = True
+                            speech_detected = True  # he spoke and signaled done; transcribe it
+                            break
+                    except Exception:
+                        pass
+
+                    # Yieldable listen (vibedispatcher#132): another agent is asking
+                    # for the mic. Yield ONLY while idle — once speech has been
+                    # detected, the in-progress utterance completes via VAD as usual.
+                    if yield_check is not None and not speech_detected:
+                        try:
+                            if yield_check():
+                                logger.info("✓ Conch requested by another agent — yielding idle listen")
+                                if yield_state is not None:
+                                    yield_state["yielded"] = True
+                                stop_recording = True
+                                break
+                        except Exception:
+                            pass
                     try:
                         # Get audio chunk from queue with timeout
                         chunk = audio_queue.get(timeout=0.1)
@@ -1186,11 +1427,24 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                         # Check if chunk contains speech
                         try:
                             is_speech = vad.is_speech(chunk_bytes, vad_sample_rate)
+                            # ENERGY GATE (driving profile): webrtcvad has no energy
+                            # floor, so steady road/engine noise reads as "speech" and
+                            # the silence counter never accumulates → the mic hangs.
+                            # When an energy threshold is set, a chunk only counts as
+                            # speech if it ALSO clears the RMS floor; below-floor chunks
+                            # (road rumble) are treated as silence so end-of-turn is
+                            # detected. Disabled (==0) → pure-webrtcvad, unchanged.
+                            if is_speech and VAD_ENERGY_THRESHOLD > 0:
+                                chunk_rms = float(np.sqrt(np.mean(chunk.astype(float) ** 2)))
+                                if chunk_rms < VAD_ENERGY_THRESHOLD:
+                                    is_speech = False
+                                    if VAD_DEBUG and int(recording_duration * 1000) % 500 == 0:
+                                        logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: energy-gated (RMS={chunk_rms:.0f} < floor={VAD_ENERGY_THRESHOLD:.0f}) -> silence")
                             if VAD_DEBUG:
                                 # Log VAD decision every 500ms for less spam
                                 if int(recording_duration * 1000) % 500 == 0:
                                     rms = np.sqrt(np.mean(chunk.astype(float)**2))
-                                    logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: speech={is_speech}, RMS={rms:.0f}, state={'WAITING' if not speech_detected else 'ACTIVE'}")
+                                    logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: speech={is_speech}, RMS={rms:.0f}, floor={VAD_ENERGY_THRESHOLD:.0f}, state={'WAITING' if not speech_detected else 'ACTIVE'}")
                         except Exception as vad_e:
                             logger.warning(f"VAD error: {vad_e}, treating as speech")
                             is_speech = True
@@ -1209,7 +1463,12 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                         else:
                             # We have detected speech at some point
                             if is_speech:
-                                # SPEECH_ACTIVE state - reset silence counter
+                                # SPEECH_ACTIVE state - reset silence counter.
+                                # Append-to-turn (founder-os#11655): if speech resumes
+                                # AFTER the normal silence threshold but within the
+                                # extra append window, it continues the SAME turn.
+                                if _append_ms > 0 and silence_duration_ms >= SILENCE_THRESHOLD_MS:
+                                    logger.info(f"➕ append-to-turn: speech resumed within window (was {silence_duration_ms}ms silent) — continuing same turn")
                                 silence_duration_ms = 0
                             else:
                                 # SILENCE_AFTER_SPEECH state - accumulate silence
@@ -1222,10 +1481,14 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                                 # Check if we should stop due to silence threshold
                                 # Use the larger of MIN_RECORDING_DURATION (global) or min_duration (parameter)
                                 effective_min_duration = max(MIN_RECORDING_DURATION, min_duration)
-                                if recording_duration >= effective_min_duration and silence_duration_ms >= SILENCE_THRESHOLD_MS:
+                                # Append-to-turn (founder-os#11655): extend the trailing-
+                                # silence threshold by the append window. _append_ms=0
+                                # (default) → identical to prior behavior.
+                                _silence_stop_threshold = SILENCE_THRESHOLD_MS + _append_ms
+                                if recording_duration >= effective_min_duration and silence_duration_ms >= _silence_stop_threshold:
                                     logger.info(f"✓ Silence threshold reached after {recording_duration:.1f}s of recording")
                                     if VAD_DEBUG:
-                                        logger.info(f"[VAD_DEBUG] STOP: silence_duration={silence_duration_ms}ms >= threshold={SILENCE_THRESHOLD_MS}ms")
+                                        logger.info(f"[VAD_DEBUG] STOP: silence_duration={silence_duration_ms}ms >= threshold={_silence_stop_threshold}ms")
                                         logger.info(f"[VAD_DEBUG] STOP: recording_duration={recording_duration:.1f}s >= min_duration={effective_min_duration}s")
                                     stop_recording = True
                                 elif VAD_DEBUG and recording_duration < effective_min_duration:
@@ -1240,7 +1503,14 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                     except Exception as e:
                         logger.error(f"Error processing audio chunk: {e}")
                         break
-            
+
+            # Publish step-away signals out-of-band (founder-os#11655) so the
+            # async caller can speak a graceful ending / prepend a resume recap.
+            if step_away_state is not None:
+                step_away_state["stepped_away"] = _step_away.stepped_away
+                step_away_state["resumed"] = _step_away.resumed
+                step_away_state["checkin_done"] = _step_away.checkin_done
+
             # Concatenate all chunks
             if chunks:
                 full_recording = np.concatenate(chunks)
@@ -1304,7 +1574,14 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                     
                     # Try recording again with the new device (recursive call in sync context)
                     logger.info("Retrying recording with new audio device...")
-                    return record_audio_with_silence_detection(max_duration, disable_silence_detection, min_duration, vad_aggressiveness)
+                    return record_audio_with_silence_detection(
+                        max_duration, disable_silence_detection, min_duration, vad_aggressiveness,
+                        yield_check=yield_check, yield_state=yield_state, pre_roll=pre_roll,
+                        pause_check=pause_check, step_away_state=step_away_state,
+                        checkin_callback=checkin_callback,
+                        append_window_override_ms=append_window_override_ms,
+                        step_away_enabled_override=step_away_enabled_override,
+                    )
                     
                 except Exception as reinit_error:
                     logger.error(f"Failed to reinitialize audio: {reinit_error}")
@@ -1613,8 +1890,20 @@ consult the MCP resources listed above.
 
                 waited = 0.0
                 while not conch.try_acquire() and waited < CONCH_TIMEOUT:
+                    # Ask a merely-listening holder to hand the mic over
+                    # (vibedispatcher#132). Refreshed every poll so the request
+                    # stays fresh; an idle holder yields within seconds.
+                    if CONCH_YIELD_ENABLED:
+                        Conch.request_yield("converse")
                     await asyncio.sleep(CONCH_CHECK_INTERVAL)
                     waited += CONCH_CHECK_INTERVAL
+
+                if not conch._acquired and CONCH_YIELD_ENABLED:
+                    # Hard timeout: preempt-and-acquire instead of failing — but
+                    # NEVER mid-utterance (see _preempt_conch_after_tts_grace).
+                    await _preempt_conch_after_tts_grace(conch)
+
+                Conch.clear_yield_request()
 
                 if event_logger:
                     event_logger.log_event("CONCH_WAIT_END", {
@@ -1657,6 +1946,7 @@ consult the MCP resources listed above.
             async with audio_operation_lock:
                 # Speak the message
                 tts_start = time.perf_counter()
+                barge_in_result = None  # set below only when natural mode actually armed a listener
                 if should_skip_tts:
                     # Skip TTS entirely for faster response
                     tts_success = True
@@ -1668,6 +1958,16 @@ consult the MCP resources listed above.
                     }
                     tts_config = {'provider': 'no-op', 'voice': 'none'}
                 else:
+                    # Natural mode (Phase 1 barge-in): arm a concurrent mic
+                    # listener for the duration of this TTS playback. Inert
+                    # (never constructed) in turn mode, the default -- this
+                    # branch only fires when the natural-mode flag file is
+                    # present. See voice_mode/barge_in.py for the mechanism.
+                    barge_in_listener = None
+                    if barge_in.natural_mode_enabled():
+                        barge_in_listener = barge_in.BargeInListener()
+                        barge_in_listener.start()
+
                     # Duck DJ volume during TTS playback
                     with DJDucker():
                         tts_success, tts_metrics, tts_config = await text_to_speech_with_failover(
@@ -1680,7 +1980,12 @@ consult the MCP resources listed above.
                             speed=speed,
                             ref_text=resolved_ref_text
                         )
-                
+
+                    if barge_in_listener is not None:
+                        barge_in_result = barge_in_listener.stop()
+                        if barge_in_result.triggered:
+                            logger.info("🗣️ Natural mode: William spoke over the agent — treating it as the next turn")
+
                 # Add TTS sub-metrics
                 if tts_metrics:
                     timings['ttfa'] = tts_metrics.get('ttfa', 0)
@@ -1800,40 +2105,134 @@ consult the MCP resources listed above.
                     logger.info(f"Speak-only result: {result}")
                     return result
 
-                # Brief pause before listening
-                await asyncio.sleep(0.5)
-                
-                # Play "listening" feedback sound
-                await play_audio_feedback(
-                    "listening",
-                    openai_clients,
-                    chime_enabled,
-                    "whisper",
-                    chime_leading_silence=chime_leading_silence,
-                    chime_trailing_silence=chime_trailing_silence
-                )
-                
-                # Record response
-                logger.info(f"🎤 Listening for {listen_duration_max} seconds...")
+                natural_mode_barge_in = barge_in_result is not None and barge_in_result.triggered
+
+                if natural_mode_barge_in:
+                    # He was already mid-utterance when he interrupted -- a
+                    # "listening" chime now would be a confusing non-sequitur
+                    # (and a fresh 0.5s pause would just eat the start of what
+                    # he's saying). Skip both; go straight to recording, seeded
+                    # with the audio the barge-in listener already captured.
+                    logger.info("🎤 Natural mode barge-in — continuing to listen without a chime")
+                else:
+                    # Brief pause before listening
+                    await asyncio.sleep(0.5)
+
+                    # Play "listening" feedback sound
+                    await play_audio_feedback(
+                        "listening",
+                        openai_clients,
+                        chime_enabled,
+                        "whisper",
+                        chime_leading_silence=chime_leading_silence,
+                        chime_trailing_silence=chime_trailing_silence
+                    )
+
+                    # Record response
+                    logger.info(f"🎤 Listening for {listen_duration_max} seconds...")
 
                 # Log recording start
                 if event_logger:
                     event_logger.log_event(event_logger.RECORDING_START)
 
+                # Yieldable listen (vibedispatcher#132): while we hold the conch
+                # and are merely LISTENING (idle), another agent's request ends
+                # the listen early so the mic can be handed over. Only wired when
+                # we actually hold the conch (skip_conch bypass never yields).
+                yield_state = {"yielded": False}
+                listen_yield_check = (
+                    Conch.is_wanted
+                    if (CONCH_ENABLED and CONCH_YIELD_ENABLED and conch._acquired)
+                    else None
+                )
+
+                # Graceful step-away wiring (founder-os#11655). Inert unless step-away
+                # is enabled (env flag or ~/.voicemode/step-away.enabled). The check-in
+                # is spoken from the executor thread via run_coroutine_threadsafe →
+                # play_system_audio (existing pre-recorded/​TTS path). All swallow errors
+                # so a check-in can never break the listen.
+                import functools as _functools
+                step_away_state = {}
+                _sa_on = step_away_enabled()
+                _sa_loop = asyncio.get_event_loop()
+
+                def _stepaway_checkin():
+                    try:
+                        fut = asyncio.run_coroutine_threadsafe(
+                            play_system_audio("still-there", fallback_text="Still there?"),
+                            _sa_loop,
+                        )
+                        fut.result(timeout=20)
+                    except Exception as _e:
+                        logger.debug(f"step-away check-in failed (ignored): {_e}")
+
+                _record_call = _functools.partial(
+                    record_audio_with_silence_detection,
+                    listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness,
+                    listen_yield_check, yield_state,
+                    (barge_in_result.pre_roll if natural_mode_barge_in else None),
+                    step_away_state=step_away_state,
+                    checkin_callback=(_stepaway_checkin if _sa_on else None),
+                )
+
                 record_start = time.perf_counter()
-                logger.debug(f"About to call record_audio_with_silence_detection with duration={listen_duration_max}, disable_silence_detection={disable_silence_detection}, min_duration={listen_duration_min}, vad_aggressiveness={vad_aggressiveness}")
+                logger.debug(f"About to call record_audio_with_silence_detection with duration={listen_duration_max}, disable_silence_detection={disable_silence_detection}, min_duration={listen_duration_min}, vad_aggressiveness={vad_aggressiveness}, natural_mode_barge_in={natural_mode_barge_in}")
                 audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                    None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                    None, _record_call
                 )
                 timings['record'] = time.perf_counter() - record_start
-                
+
                 # Log recording end
                 if event_logger:
                     event_logger.log_event(event_logger.RECORDING_END, {
                         "duration": timings['record'],
                         "samples": len(audio_data)
                     })
-                
+
+                if yield_state["yielded"]:
+                    # Hand the mic over: skip the finished chime (the requester is
+                    # about to speak), release via the finally block, and tell the
+                    # caller this turn ended without a response.
+                    if event_logger:
+                        event_logger.log_event("CONCH_YIELDED", {
+                            "pid": os.getpid(),
+                            "agent": "converse",
+                            "listened_seconds": timings['record'],
+                        })
+                    success = True  # a clean hand-off, not an error
+                    result = ("Yielded the mic — another agent requested the floor while "
+                              "you were idle-listening. No response was captured. Re-call "
+                              "converse (wait_for_conch=true) when you want to continue.")
+                    return result
+
+                # Step-away outcome (founder-os#11655). Inert unless step-away armed.
+                _resume_recap = False
+                if _sa_on and step_away_state.get("stepped_away"):
+                    if not speech_detected:
+                        # He stepped away and never came back within the grace. We
+                        # already spoke ONE check-in during the wait — end GRACEFULLY,
+                        # not silently. Clear the pause flag so the next turn is fresh.
+                        try:
+                            if convomode_paused():
+                                os.remove(PAUSE_FLAG_PATH)
+                        except Exception:
+                            pass
+                        success = True
+                        result = ("Stepped away — you asked me to hold on, I waited and "
+                                  "checked in once, and it's still quiet. Pausing here; "
+                                  "say something (or tap resume) when you're back and I'll "
+                                  "pick up with a quick recap of where we left off.")
+                        return result
+                    else:
+                        # He came back and spoke → resume. Clear the pause flag and flag
+                        # a one-sentence recap (composes with temporal-orientation).
+                        try:
+                            if convomode_paused():
+                                os.remove(PAUSE_FLAG_PATH)
+                        except Exception:
+                            pass
+                        _resume_recap = True
+
                 # Play "finished" feedback sound
                 await play_audio_feedback(
                     "finished",
@@ -1843,7 +2242,7 @@ consult the MCP resources listed above.
                     chime_leading_silence=chime_leading_silence,
                     chime_trailing_silence=chime_trailing_silence
                 )
-                
+
                 # Mark the end of recording - this is when user expects response to start
                 user_done_time = time.perf_counter()
                 logger.info(f"Recording finished at {user_done_time - tts_start:.1f}s from start")
@@ -1934,6 +2333,33 @@ consult the MCP resources listed above.
                         response_text = None
                         stt_provider = "unknown"
 
+                # Spoken step-away / resume keywords (founder-os#11655). Inert unless
+                # step-away is armed. A whole-utterance "hold on" sets the pause flag
+                # so the NEXT listen is a graceful step-away wait; "I'm back"/"resume"
+                # clears it and flags a recap. Matched near-exact so a mid-sentence
+                # mention never false-triggers; failure falls back to normal handling.
+                if _sa_on and response_text:
+                    if is_step_away_phrase(response_text):
+                        logger.info(f"⏸️ step-away phrase heard: '{response_text}' — pausing the listen")
+                        try:
+                            os.makedirs(os.path.dirname(PAUSE_FLAG_PATH), exist_ok=True)
+                            open(PAUSE_FLAG_PATH, "w").close()
+                        except Exception:
+                            pass
+                        success = True
+                        result = ("You said to hold on — I'll wait. The next time you "
+                                  "speak (or tap resume) I'll pick up with a quick recap "
+                                  "of where we left off.")
+                        return result
+                    if is_resume_phrase(response_text):
+                        logger.info(f"▶️ resume phrase heard: '{response_text}'")
+                        try:
+                            if convomode_paused():
+                                os.remove(PAUSE_FLAG_PATH)
+                        except Exception:
+                            pass
+                        _resume_recap = True
+
                 # Check for repeat phrase - if detected, replay the audio and listen again
                 if response_text and should_repeat(response_text):
                     logger.info(f"🔁 Repeat requested: '{response_text}'")
@@ -2005,10 +2431,23 @@ consult the MCP resources listed above.
                         # Record audio
                         record_start = time.perf_counter()
                         audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness, listen_yield_check, yield_state
                         )
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
+
+                        if yield_state["yielded"]:
+                            if event_logger:
+                                event_logger.log_event("CONCH_YIELDED", {
+                                    "pid": os.getpid(),
+                                    "agent": "converse",
+                                    "listened_seconds": record_time,
+                                })
+                            success = True
+                            result = ("Yielded the mic — another agent requested the floor while "
+                                      "you were idle-listening. No response was captured. Re-call "
+                                      "converse (wait_for_conch=true) when you want to continue.")
+                            return result
 
                         # Play "finished" feedback sound
                         await play_audio_feedback(
@@ -2061,10 +2500,23 @@ consult the MCP resources listed above.
                         # Record audio
                         record_start = time.perf_counter()
                         audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness, listen_yield_check, yield_state
                         )
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
+
+                        if yield_state["yielded"]:
+                            if event_logger:
+                                event_logger.log_event("CONCH_YIELDED", {
+                                    "pid": os.getpid(),
+                                    "agent": "converse",
+                                    "listened_seconds": record_time,
+                                })
+                            success = True
+                            result = ("Yielded the mic — another agent requested the floor while "
+                                      "you were idle-listening. No response was captured. Re-call "
+                                      "converse (wait_for_conch=true) when you want to continue.")
+                            return result
 
                         # Play "finished" feedback sound
                         await play_audio_feedback(
@@ -2180,6 +2632,16 @@ consult the MCP resources listed above.
                 all_timing_parts.extend(stt_timing_parts)
             timing_str = ", ".join(all_timing_parts) + f", total {total_time:.1f}s"
             
+            # Resume recap (founder-os#11655): if he came back after a step-away,
+            # prepend a one-sentence-recap instruction so the agent orients William
+            # before responding (composes with temporal-orientation-protocol). Inert
+            # unless a step-away actually happened.
+            if locals().get("_resume_recap") and response_text:
+                response_text = (
+                    "[Resuming after a step-away pause — open your reply with ONE short "
+                    "sentence recapping where we left off, then continue.] " + response_text
+                )
+
             # Track statistics for full conversation interaction
             actual_response = response_text or "[no speech detected]"
             track_voice_interaction(
@@ -2294,6 +2756,10 @@ consult the MCP resources listed above.
         return result
 
     finally:
+        # Drop any yield request we wrote while waiting (own-pid guarded no-op
+        # if we never requested or another waiter's request is newer).
+        Conch.clear_yield_request()
+
         # Release the conch to signal voice conversation has ended
         if CONCH_ENABLED and conch._acquired:
             held_seconds = conch.release()
