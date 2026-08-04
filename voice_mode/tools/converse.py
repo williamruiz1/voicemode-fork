@@ -66,6 +66,7 @@ from voice_mode.config import (
     CONCH_TIMEOUT,
     CONCH_CHECK_INTERVAL,
     CONCH_YIELD_ENABLED,
+    CONCH_YIELD_GRACE_SECONDS,
     CONCH_PREEMPT_TTS_GRACE,
     AUTO_FOCUS_PANE,
     STT_MODEL,
@@ -1183,9 +1184,12 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
         vad_aggressiveness: VAD aggressiveness level (0-3). If None, uses VAD_AGGRESSIVENESS from config
         yield_check: Optional callable polled during the listen loop. When it
             returns True while the listen is still IDLE (no speech detected
-            yet), recording ends early so the caller can yield the mic to
+            yet) AND at least CONCH_YIELD_GRACE_SECONDS have elapsed in this
+            listen, recording ends early so the caller can yield the mic to
             another agent (vibedispatcher#132). Never fires once speech has
-            been detected — an in-progress utterance always completes.
+            been detected — an in-progress utterance always completes. The
+            grace floor exists so a fresh listen can't be preempted before
+            the human has had any chance to start replying.
         yield_state: Optional dict; when the listen ends because of
             yield_check, ``yield_state["yielded"]`` is set True. (Out-of-band
             so the 2-tuple return stays stable for existing callers.)
@@ -1390,10 +1394,23 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                     # Yieldable listen (vibedispatcher#132): another agent is asking
                     # for the mic. Yield ONLY while idle — once speech has been
                     # detected, the in-progress utterance completes via VAD as usual.
-                    if yield_check is not None and not speech_detected:
+                    #
+                    # GRACE PERIOD (founder-os barge-in fix, 2026-08-04): a waiter's
+                    # wait_for_conch poll loop can start requesting the mic BEFORE
+                    # this listen even begins (it was polling during the holder's
+                    # TTS). Without a minimum elapsed-time floor, yield_check() can
+                    # return True on this loop's very first tick (recording_duration
+                    # == 0), so a live human-AI turn gets cut off before the human
+                    # has any chance to start replying to what was just said. This
+                    # is a turn-boundary vs. conversation-boundary bug, not a real
+                    # abandoned-mic case. Require CONCH_YIELD_GRACE_SECONDS of
+                    # actual idle-listening before a yield request is honored.
+                    if (yield_check is not None and not speech_detected
+                            and recording_duration >= CONCH_YIELD_GRACE_SECONDS):
                         try:
                             if yield_check():
-                                logger.info("✓ Conch requested by another agent — yielding idle listen")
+                                logger.info("✓ Conch requested by another agent — yielding idle listen "
+                                            f"(after {recording_duration:.1f}s grace)")
                                 if yield_state is not None:
                                     yield_state["yielded"] = True
                                 stop_recording = True

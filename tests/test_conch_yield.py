@@ -149,6 +149,86 @@ class TestIdleListenYieldDecision:
         assert self._decision(None, speech_detected=False) is False
 
 
+class TestIdleListenYieldGracePeriod:
+    """Regression coverage for the founder-os 2026-08-04 barge-in incident.
+
+    Timeline that produced it (voicemode_events_2026-08-04.jsonl): holder A
+    finishes speaking, opens a fresh idle-listen (RECORDING_START); waiter B
+    had already been polling wait_for_conch (and therefore refreshing
+    conch-wanted) for ~1s *before* A's TTS even ended. A's listen loop honored
+    the pending yield_check() on its very first tick — recording_duration was
+    effectively 0 — so A yielded after 0.178s with zero samples captured and B
+    grabbed the conch and started talking before William could get a word in.
+
+    The fix requires CONCH_YIELD_GRACE_SECONDS of elapsed idle-listening
+    before a yield request is honored, mirroring the guard now wired into
+    record_audio_with_silence_detection in converse.py.
+    """
+
+    @staticmethod
+    def _decision(yield_check, speech_detected, recording_duration, grace_seconds):
+        # Mirrors the guard wired into the recording loop in converse.py.
+        if (yield_check is not None and not speech_detected
+                and recording_duration >= grace_seconds):
+            return bool(yield_check())
+        return False
+
+    def test_pending_request_at_listen_start_does_not_barge_in(self, clean_conch):
+        """The exact incident shape: is_wanted() already True at t=0."""
+        proc = _spawn_live_process()
+        try:
+            _write_wanted(proc.pid, datetime.now())
+            assert self._decision(
+                Conch.is_wanted, speech_detected=False,
+                recording_duration=0.0, grace_seconds=3.0,
+            ) is False
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_request_still_denied_partway_through_grace(self, clean_conch):
+        proc = _spawn_live_process()
+        try:
+            _write_wanted(proc.pid, datetime.now())
+            assert self._decision(
+                Conch.is_wanted, speech_detected=False,
+                recording_duration=1.5, grace_seconds=3.0,
+            ) is False
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_request_honored_once_grace_elapses(self, clean_conch):
+        """A waiter that's still genuinely wanted after the human had a real
+        chance to reply is still honored — this isn't disabling the yield,
+        only delaying it past the turn boundary."""
+        proc = _spawn_live_process()
+        try:
+            _write_wanted(proc.pid, datetime.now())
+            assert self._decision(
+                Conch.is_wanted, speech_detected=False,
+                recording_duration=3.0, grace_seconds=3.0,
+            ) is True
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_zero_grace_restores_old_immediate_yield_behavior(self, clean_conch):
+        """VOICEMODE_CONCH_YIELD_GRACE_SECONDS=0 is documented as an escape
+        hatch back to the pre-fix behavior — must still work for anyone who
+        explicitly opts back in."""
+        proc = _spawn_live_process()
+        try:
+            _write_wanted(proc.pid, datetime.now())
+            assert self._decision(
+                Conch.is_wanted, speech_detected=False,
+                recording_duration=0.0, grace_seconds=0.0,
+            ) is True
+        finally:
+            proc.kill()
+            proc.wait()
+
+
 class TestPreemptAcquire:
     """R2 + R3 — the waiter's hard-timeout preempt path."""
 
