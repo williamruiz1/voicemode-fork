@@ -933,6 +933,18 @@ AEC_STEP_SIZE = float(os.getenv("VOICEMODE_AEC_STEP_SIZE", "0.15"))
 # echo suppressor, is the credible next step; see docs/guides/natural-mode.md).
 BARGE_IN_ENERGY_MARGIN = float(os.getenv("VOICEMODE_BARGE_IN_ENERGY_MARGIN", "0"))
 
+# Speech-probability threshold for the CONCURRENT barge-in listener's Silero
+# VAD decision (voicemode-endpointing-bargein W3). Silero's P(speech) is
+# amplitude-invariant -- unlike webrtcvad's binary is_speech() -- so a plain
+# threshold on the probability already separates real speech from noise/echo
+# residual, which is exactly what BARGE_IN_ENERGY_MARGIN's echo-floor gate
+# above exists to approximate for webrtcvad. barge_in.py uses THIS threshold
+# instead of that gate whenever voice_mode.silero_vad.SILERO_AVAILABLE is
+# True, and falls back to the webrtcvad + energy-margin path entirely when
+# it's False (onnxruntime or the vendored model missing) -- see
+# BargeInListener._watch_loop.
+BARGE_IN_SILERO_THRESHOLD = float(os.getenv("VOICEMODE_BARGE_IN_SILERO_THRESHOLD", "0.5"))
+
 # ==================== PAUSE / STEP-AWAY / APPEND-TO-TURN (founder-os#11655) ==========
 #
 # Three graceful-conversation additions to the LISTEN side of convomode. ALL are

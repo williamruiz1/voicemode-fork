@@ -14,8 +14,12 @@ The mechanism, concretely:
      against the KNOWN reference signal actually being sent to the speaker
      (audio_player.get_reference_audio()), so the mic hearing the agent's
      own voice doesn't false-trigger.
-  3. Run the post-AEC signal through webrtcvad (the SAME VAD library the
-     turn-taking listener already uses).
+  3. Run the post-AEC signal through Silero VAD (voice_mode.silero_vad --
+     amplitude-invariant P(speech), gated on config.BARGE_IN_SILERO_
+     THRESHOLD) when it's available, falling back to webrtcvad (the SAME VAD
+     library the turn-taking listener already uses, plus its
+     BARGE_IN_ENERGY_MARGIN echo-floor gate) when onnxruntime or the
+     vendored model is missing -- see BargeInListener._watch_loop.
   4. On BARGE_IN_TRIGGER_MS of sustained post-AEC speech, halt playback
      within one audio buffer (audio_player.trigger_barge_in() -- reuses the
      EXACT mid-buffer stop mechanism already built for the manual Pause
@@ -51,8 +55,10 @@ from voice_mode.config import (
     AEC_REF_DELAY_MS,
     AEC_STEP_SIZE,
     BARGE_IN_ENERGY_MARGIN,
+    BARGE_IN_SILERO_THRESHOLD,
     NATURAL_MODE_FLAG_PATH,
 )
+from voice_mode.silero_vad import SILERO_AVAILABLE, SileroVAD
 from voice_mode.utils.event_logger import (
     log_barge_in_armed,
     log_barge_in_unavailable,
@@ -160,6 +166,13 @@ class BargeInListener:
             self._aec = EchoCanceller(sample_rate=VAD_WORK_RATE, filter_ms=AEC_FILTER_MS, mu=AEC_STEP_SIZE)
             self._aec_kind = "nlms"
         self._vad = webrtcvad.Vad(self._vad_aggressiveness) if VAD_AVAILABLE else None
+        # Silero VAD (voicemode-endpointing-bargein W3) is the PREFERRED speech
+        # decision whenever it's available -- amplitude-invariant P(speech), no
+        # need for the webrtcvad energy-margin gate below. webrtcvad stays wired
+        # up unconditionally above so the decision falls back to it byte-for-byte
+        # when Silero isn't (onnxruntime or the vendored model missing).
+        self._silero_threshold = BARGE_IN_SILERO_THRESHOLD
+        self._silero: Optional[SileroVAD] = SileroVAD(sample_rate=VAD_WORK_RATE) if SILERO_AVAILABLE else None
         # Evidence trail (see module docstring re: 2026-07-13) -- populated in
         # start()/stop() regardless of whether the trace file is enabled, so
         # BARGE_IN_ARMED/DISARMED events always carry accurate frame counts.
@@ -183,6 +196,11 @@ class BargeInListener:
 
         audio_player.reset_barge_in_event()
         self._stop_event.clear()
+        if self._silero is not None:
+            # Fresh turn -- clear Silero's RNN state + reframing buffer/context
+            # so the earliest frames of THIS arm aren't biased by whatever the
+            # previous turn's audio ended on (see SileroVAD.reset()'s docstring).
+            self._silero.reset()
 
         def _callback(indata, frames, time_info, status):
             if status:
@@ -299,47 +317,66 @@ class BargeInListener:
 
             clean = self._aec.process(near_16k, far_16k)
 
-            clean_int16 = np.clip(clean * 32768.0, -32768, 32767).astype(np.int16)
-            frame_bytes = clean_int16.tobytes()
+            speech_prob: Optional[float] = None
 
-            try:
-                is_speech = self._vad.is_speech(frame_bytes, VAD_WORK_RATE)
-            except Exception as e:
-                logger.debug(f"barge-in VAD error: {e}")
-                is_speech = False
-
-            clean_rms = _rms(clean)
-
-            # Always update the asymmetric echo-floor tracker first (see the
-            # ENERGY_FLOOR_ALPHA_* comment above), THEN decide the gate off
-            # its pre-update value -- floor tracking and gating must not be
-            # entangled, or the floor never calibrates when the very first
-            # frame is already loud (a real, previously-shipped bug: gating
-            # the floor update on speech_run_ms==0 meant a continuously-loud
-            # TTS onset from frame 1 never let speech_run_ms return to 0,
-            # so the floor update condition never fired -- the gate silently
-            # never engaged for that entire turn).
-            if BARGE_IN_ENERGY_MARGIN > 0:
-                floor_before_update = echo_floor if echo_floor_initialized else clean_rms
-                if not echo_floor_initialized:
-                    echo_floor = clean_rms
-                    echo_floor_initialized = True
-                elif clean_rms < echo_floor:
-                    echo_floor = (1 - ENERGY_FLOOR_ALPHA_DOWN) * echo_floor + ENERGY_FLOOR_ALPHA_DOWN * clean_rms
-                else:
-                    echo_floor = (1 - ENERGY_FLOOR_ALPHA_UP) * echo_floor + ENERGY_FLOOR_ALPHA_UP * clean_rms
-
-                gated_speech = is_speech and clean_rms >= floor_before_update * BARGE_IN_ENERGY_MARGIN
-            else:
+            if self._silero is not None:
+                # Preferred path (voicemode-endpointing-bargein W3): Silero's
+                # P(speech) is amplitude-invariant, so a plain threshold on the
+                # probability already separates real speech from noise/echo
+                # residual -- the webrtcvad energy-margin gate below is a
+                # fallback-path detail specific to webrtcvad's binary decision
+                # and is skipped entirely here (see config.BARGE_IN_SILERO_
+                # THRESHOLD's docstring).
+                try:
+                    speech_prob = self._silero.prob(clean)
+                except Exception as e:
+                    logger.debug(f"barge-in Silero VAD error: {e}")
+                    speech_prob = 0.0
+                is_speech = speech_prob >= self._silero_threshold
                 gated_speech = is_speech
+            else:
+                clean_int16 = np.clip(clean * 32768.0, -32768, 32767).astype(np.int16)
+                frame_bytes = clean_int16.tobytes()
+
+                try:
+                    is_speech = self._vad.is_speech(frame_bytes, VAD_WORK_RATE)
+                except Exception as e:
+                    logger.debug(f"barge-in VAD error: {e}")
+                    is_speech = False
+
+                clean_rms = _rms(clean)
+
+                # Always update the asymmetric echo-floor tracker first (see the
+                # ENERGY_FLOOR_ALPHA_* comment above), THEN decide the gate off
+                # its pre-update value -- floor tracking and gating must not be
+                # entangled, or the floor never calibrates when the very first
+                # frame is already loud (a real, previously-shipped bug: gating
+                # the floor update on speech_run_ms==0 meant a continuously-loud
+                # TTS onset from frame 1 never let speech_run_ms return to 0,
+                # so the floor update condition never fired -- the gate silently
+                # never engaged for that entire turn).
+                if BARGE_IN_ENERGY_MARGIN > 0:
+                    floor_before_update = echo_floor if echo_floor_initialized else clean_rms
+                    if not echo_floor_initialized:
+                        echo_floor = clean_rms
+                        echo_floor_initialized = True
+                    elif clean_rms < echo_floor:
+                        echo_floor = (1 - ENERGY_FLOOR_ALPHA_DOWN) * echo_floor + ENERGY_FLOOR_ALPHA_DOWN * clean_rms
+                    else:
+                        echo_floor = (1 - ENERGY_FLOOR_ALPHA_UP) * echo_floor + ENERGY_FLOOR_ALPHA_UP * clean_rms
+
+                    gated_speech = is_speech and clean_rms >= floor_before_update * BARGE_IN_ENERGY_MARGIN
+                else:
+                    gated_speech = is_speech
 
             speech_run_ms = speech_run_ms + CHUNK_MS if gated_speech else 0
 
             if self._trace_fh is not None:
                 self._trace_write(
-                    rms_near=_rms(near_16k), rms_far=_rms(far_16k), rms_clean=clean_rms,
+                    rms_near=_rms(near_16k), rms_far=_rms(far_16k), rms_clean=_rms(clean),
                     is_speech=is_speech, speech_run_ms=speech_run_ms, tts_speaking=True,
-                    echo_floor=echo_floor if BARGE_IN_ENERGY_MARGIN > 0 else None,
+                    echo_floor=echo_floor if (self._silero is None and BARGE_IN_ENERGY_MARGIN > 0) else None,
+                    speech_prob=speech_prob,
                 )
 
             if speech_run_ms >= BARGE_IN_TRIGGER_MS:
@@ -356,7 +393,7 @@ class BargeInListener:
 
     def _trace_write(self, *, rms_near: float, rms_far: float, rms_clean: float,
                       is_speech: bool, speech_run_ms: int, tts_speaking: bool,
-                      echo_floor: Optional[float] = None):
+                      echo_floor: Optional[float] = None, speech_prob: Optional[float] = None):
         """Append one per-frame decision-trace record (VOICEMODE_BARGE_IN_TRACE=1
         only). Never lets a trace-write failure break the barge-in loop."""
         try:
@@ -372,6 +409,8 @@ class BargeInListener:
             }
             if echo_floor is not None:
                 record["echo_floor"] = round(echo_floor, 5)
+            if speech_prob is not None:
+                record["speech_prob"] = round(speech_prob, 5)
             self._trace_fh.write(json.dumps(record) + "\n")
         except Exception:
             pass
