@@ -111,6 +111,41 @@ Supported formats: `pcm`, `opus`, `mp3`, `wav`, `flac`, `aac`
 | `VOICEMODE_MIN_RECORDING_TIME` | Minimum recording (seconds) | `0.5` | `1.0` |
 | `VOICEMODE_MAX_RECORDING_TIME` | Maximum recording (seconds) | `120.0` | `60.0` |
 
+### Endpointing (Silero VAD)
+
+Model-based end-of-turn detection — an opt-in replacement for the
+`webrtcvad` + silence-timer decision above, fixing the mic hanging open on
+steady noise/breath. Requires the `silero` extra (`onnxruntime`) to be
+installed; degrades silently to the `webrtcvad` path above when it isn't.
+See `docs/guides/endpointing-and-bargein.md` for the full mechanism.
+
+| Variable | Description | Default | Example |
+|----------|-------------|---------|---------|
+| `VOICEMODE_ENDPOINTING` | Enable Silero-based endpointing | `false` | `true` |
+| `VOICEMODE_MIN_ENDPOINT_MS` | Consecutive sub-threshold ms before end-of-turn fires | `700` | `500` |
+| `VOICEMODE_SILERO_SPEECH_THRESHOLD` | P(speech) threshold, 0-1 | `0.5` | `0.6` |
+| `VOICEMODE_MIN_SPEECH_MS` | Consecutive above-threshold ms before speech is considered started | `200` | `150` |
+
+### Barge-In / Natural Mode
+
+Lets you interrupt the assistant mid-sentence by talking over it. Enabled
+by a flag file, not an env var (see
+`~/.local/bin/founder-os/convomode-natural-mode.sh`), so it's a runtime
+session choice rather than deployment config. Full tunables table,
+mechanism, and live-trial history: `docs/guides/natural-mode.md` and
+`docs/guides/endpointing-and-bargein.md`.
+
+| Variable | Description | Default | Example |
+|----------|-------------|---------|---------|
+| `VOICEMODE_NATURAL_MODE_FLAG_PATH` | Override the toggle flag's location | `~/.voicemode/natural-mode.flag` | `/tmp/nm.flag` |
+| `VOICEMODE_BARGE_IN_TRIGGER_MS` | Sustained speech ms, while TTS plays, before playback cuts | `300` | `500` |
+| `VOICEMODE_BARGE_IN_SILERO_THRESHOLD` | P(speech) threshold, 0-1, for the barge-in listener's Silero decision | `0.5` | `0.6` |
+| `VOICEMODE_BARGE_IN_VAD_AGGRESSIVENESS` | webrtcvad aggressiveness for the barge-in listener (fallback path only) | same as `VOICEMODE_VAD_AGGRESSIVENESS` | `3` |
+| `VOICEMODE_BARGE_IN_ENERGY_MARGIN` | Echo-floor gate multiplier (fallback path only, used when Silero is unavailable) | `0` (disabled) | `3.0` |
+| `VOICEMODE_AEC_FILTER_MS` | Echo canceller adaptive filter length (ms) | `200` | `300` |
+| `VOICEMODE_AEC_REF_DELAY_MS` | Fixed speaker-to-mic echo delay offset (ms) | `0` | `50` |
+| `VOICEMODE_AEC_STEP_SIZE` | NLMS adaptation rate | `0.15` | `0.3` |
+
 ## File Storage
 
 | Variable | Description | Default | Example |

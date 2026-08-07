@@ -105,6 +105,14 @@ Speech playback rate.
 
 ## Audio & Silence Detection
 
+**Note:** Silero-based endpointing (`VOICEMODE_ENDPOINTING` and related env
+vars) is a deployment-level alternative to the `webrtcvad` silence
+detection this section covers — it's not a per-call parameter, so it's
+documented in full at
+[environment.md](../../../docs/reference/environment.md#endpointing-silero-vad)
+and [endpointing-and-bargein.md](../../../docs/guides/endpointing-and-bargein.md)
+instead of here.
+
 ### disable_silence_detection
 **Type:** boolean (default: false)
 Disable automatic silence detection.

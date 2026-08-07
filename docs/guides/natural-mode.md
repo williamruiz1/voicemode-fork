@@ -170,9 +170,10 @@ itself):
 | `VOICEMODE_AEC_FILTER_MS` | `200` | Adaptive filter length — how much acoustic delay it can model |
 | `VOICEMODE_AEC_REF_DELAY_MS` | `0` | Fixed offset between "sample sent to speaker" and "echo reaches mic" — set this if echo consistently leaks through |
 | `VOICEMODE_AEC_STEP_SIZE` | `0.15` | NLMS adaptation rate — lower = slower to converge but preserves more of your real voice during double-talk |
-| `VOICEMODE_BARGE_IN_ENERGY_MARGIN` | `0` (disabled) | Adaptive echo-floor gate multiplier — added 2026-07-14, tested and found NOT to resolve the false-positive/false-negative trade-off on built-in hardware (see `voice_mode/config.py` docstring). Leave at 0 unless deliberately experimenting. |
+| `VOICEMODE_BARGE_IN_ENERGY_MARGIN` | `0` (disabled) | Adaptive echo-floor gate multiplier — added 2026-07-14, tested and found NOT to resolve the false-positive/false-negative trade-off on built-in hardware (see `voice_mode/config.py` docstring). **Superseded by the Silero swap below when Silero is available** — only consulted on the webrtcvad fallback path. Leave at 0 unless deliberately experimenting. |
 | `VOICEMODE_BARGE_IN_TRACE` | unset (disabled) | Set to `1` to write a per-frame decision trace to `~/.voicemode/logs/barge_in/trace_<date>.jsonl` — the evidence trail added 2026-07-14 so a failed trial is diagnosable instead of a repeat of 2026-07-13's silence |
 | `VOICEMODE_NATURAL_MODE_FLAG_PATH` | `~/.voicemode/natural-mode.flag` | Override the toggle flag's location |
+| `VOICEMODE_BARGE_IN_SILERO_THRESHOLD` | `0.5` | **New (voicemode-endpointing-bargein branch):** P(speech) threshold, 0-1, for the barge-in listener's Silero VAD decision — replaces the `webrtcvad` + `VOICEMODE_BARGE_IN_ENERGY_MARGIN` decision above whenever `voice_mode.silero_vad.SILERO_AVAILABLE` is true (requires the `silero` extra / `onnxruntime` installed). Falls back to the row above automatically when Silero isn't available. See `docs/guides/endpointing-and-bargein.md` for the full mechanism and honesty note on live-trial status. |
 
 ## Known Phase 1 limitations (by design, not bugs)
 
