@@ -18,6 +18,17 @@ import pytest
 import voice_mode.barge_in as bi
 
 
+@pytest.fixture(autouse=True)
+def _force_webrtcvad_path(monkeypatch):
+    """These tests validate the webrtcvad state machine with the VAD decision
+    mocked (see module docstring). Once Silero is an installed runtime option
+    (the `silero` extra), a real SileroVAD would otherwise take over the
+    decision at BargeInListener construction and ignore the mocked webrtcvad,
+    breaking these tests. Pin them to the webrtcvad FALLBACK path here; the
+    Silero path is covered separately by tests/test_bargein_silero.py."""
+    monkeypatch.setattr(bi, "SILERO_AVAILABLE", False)
+
+
 @pytest.fixture
 def exit_stack():
     """Module-level so every test class below can share it (moved out of
