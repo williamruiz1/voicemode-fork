@@ -810,6 +810,29 @@ VAD_CHUNK_DURATION_MS = 30  # VAD frame size (must be 10, 20, or 30ms)
 VAD_ENERGY_THRESHOLD = float(os.getenv("VOICEMODE_VAD_ENERGY_THRESHOLD", "0"))  # 0 = disabled (off by default)
 INITIAL_SILENCE_GRACE_PERIOD = float(os.getenv("VOICEMODE_INITIAL_SILENCE_GRACE_PERIOD", "1"))  # No initial silence grace period by default
 
+# ==================== ENDPOINTING (SILERO VAD) CONFIGURATION ====================
+#
+# Model-based end-of-turn detection (voice_mode/silero_vad.py) as an opt-in
+# replacement for the webrtcvad + silence-timer decision above. ROOT CAUSE
+# this fixes: webrtcvad's binary speech/no-speech has no energy awareness, so
+# steady road/room noise or a trailing breath reads as "speech" and the
+# silence timer above never accumulates -- the mic hangs open. Silero outputs
+# a continuous P(speech) that stays low on noise/breath even at high energy
+# (see silero_vad.py's module docstring), so thresholding the PROBABILITY
+# fixes the false-hang without retiming the silence threshold.
+#
+# OFF by default (D5): unless this is explicitly enabled AND Silero is
+# actually available (onnxruntime + vendored model loaded --
+# voice_mode.silero_vad.SILERO_AVAILABLE), record_audio_with_silence_detection
+# takes the existing webrtcvad path, byte-for-byte unchanged.
+ENDPOINTING_ENABLED = os.getenv("VOICEMODE_ENDPOINTING", "").lower() in ("true", "1", "yes", "on")
+
+# Endpointer thresholds -- see voice_mode/silero_vad.py's Endpointer docstring
+# for what each controls. Defaults match Endpointer's own ctor defaults.
+ENDPOINTING_MIN_ENDPOINT_MS = int(os.getenv("VOICEMODE_MIN_ENDPOINT_MS", "700"))  # consecutive sub-threshold ms before end-of-turn fires
+ENDPOINTING_SPEECH_THRESHOLD = float(os.getenv("VOICEMODE_SILERO_SPEECH_THRESHOLD", "0.5"))  # P(speech) threshold, 0-1
+ENDPOINTING_MIN_SPEECH_MS = int(os.getenv("VOICEMODE_MIN_SPEECH_MS", "200"))  # consecutive above-threshold ms before speech_started latches
+
 # ==================== NATURAL MODE / BARGE-IN CONFIGURATION (Phase 1) ====================
 #
 # "Natural mode" lets the mic stay hot WHILE TTS is playing, so speaking over the
@@ -920,6 +943,18 @@ AEC_STEP_SIZE = float(os.getenv("VOICEMODE_AEC_STEP_SIZE", "0.15"))
 # quality problem itself (a real native AEC library, or a learned/nonlinear
 # echo suppressor, is the credible next step; see docs/guides/natural-mode.md).
 BARGE_IN_ENERGY_MARGIN = float(os.getenv("VOICEMODE_BARGE_IN_ENERGY_MARGIN", "0"))
+
+# Speech-probability threshold for the CONCURRENT barge-in listener's Silero
+# VAD decision (voicemode-endpointing-bargein W3). Silero's P(speech) is
+# amplitude-invariant -- unlike webrtcvad's binary is_speech() -- so a plain
+# threshold on the probability already separates real speech from noise/echo
+# residual, which is exactly what BARGE_IN_ENERGY_MARGIN's echo-floor gate
+# above exists to approximate for webrtcvad. barge_in.py uses THIS threshold
+# instead of that gate whenever voice_mode.silero_vad.SILERO_AVAILABLE is
+# True, and falls back to the webrtcvad + energy-margin path entirely when
+# it's False (onnxruntime or the vendored model missing) -- see
+# BargeInListener._watch_loop.
+BARGE_IN_SILERO_THRESHOLD = float(os.getenv("VOICEMODE_BARGE_IN_SILERO_THRESHOLD", "0.5"))
 
 # ==================== PAUSE / STEP-AWAY / APPEND-TO-TURN (founder-os#11655) ==========
 #
