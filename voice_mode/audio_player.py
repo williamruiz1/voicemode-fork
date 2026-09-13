@@ -94,6 +94,43 @@ def is_tts_speaking() -> bool:
     return _speaking_count > 0
 
 
+def playback_started() -> None:
+    """Raise the "speaking" ref count for a playback path OTHER than
+    NonBlockingAudioPlayer.play() (which already calls _speaking_inc()
+    itself around its own stream). voice_mode/streaming.py's PCM/buffered
+    streaming functions open their OWN sd.OutputStream directly and never
+    touch NonBlockingAudioPlayer -- without this, is_tts_speaking() (and
+    therefore the natural-mode barge-in listener) has no way to know
+    streamed TTS is playing at all. Must be paired 1:1 with
+    playback_finished(), same as _speaking_inc()/_speaking_dec() below."""
+    _speaking_inc()
+
+
+def playback_finished() -> None:
+    """Pairs with playback_started() -- see its docstring."""
+    _speaking_dec()
+
+
+def write_reference_audio(samples: np.ndarray, sample_rate: int) -> None:
+    """Feed audio actually sent to the speaker into the AEC far-end
+    reference ring buffer, from a playback path OTHER than
+    NonBlockingAudioPlayer (which already writes the buffer itself inside
+    its own _audio_callback). The streaming TTS pipeline in
+    voice_mode/streaming.py writes straight to its own sd.OutputStream via
+    stream.write(), so nothing was ever populating this buffer for streamed
+    playback -- get_reference_audio() silently returned all-zeros regardless
+    of what was actually playing. `samples` should be mono or (n, ch)
+    float32 in [-1, 1]; mirrors NonBlockingAudioPlayer.play()'s own
+    _ref_buffer_init() + _ref_buffer_write() pairing exactly. Never raises --
+    reference-buffer bookkeeping must not break playback."""
+    try:
+        _ref_buffer_init(sample_rate)
+        mono = samples if samples.ndim == 1 else samples[:, 0]
+        _ref_buffer_write(mono.astype(np.float32, copy=False))
+    except Exception:
+        pass
+
+
 # --- Natural-mode barge-in (Phase 1) -----------------------------------------
 # Natural mode (voice_mode/barge_in.py) runs a CONCURRENT mic listener while
 # TTS plays. When it detects sustained post-AEC speech during playback, it
