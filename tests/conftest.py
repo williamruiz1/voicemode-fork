@@ -21,6 +21,12 @@ BLOCKED_COMMANDS = {
 }
 
 
+# sounddevice entry points that open the REAL input device. `query_devices` and
+# `default` are deliberately NOT listed -- reading device metadata is harmless
+# and plenty of code does it.
+BLOCKED_AUDIO_CAPTURE = ("InputStream", "rec")
+
+
 def _safe_subprocess_run(original_run):
     """Wrapper that blocks dangerous system commands during tests."""
     def wrapper(*args, **kwargs):
@@ -94,6 +100,57 @@ def block_dangerous_commands(monkeypatch):
 
     monkeypatch.setattr("subprocess.run", _safe_subprocess_run(original_run))
     monkeypatch.setattr("subprocess.Popen", _safe_subprocess_popen(original_popen))
+
+
+@pytest.fixture(autouse=True)
+def block_real_microphone(monkeypatch, request):
+    """Make it structurally impossible for a test to open the real microphone.
+
+    A test whose recording mock targets the wrong function silently falls
+    through to `sounddevice` and HOLDS THE MACHINE'S INPUT DEVICE for the full
+    listen duration -- measured at ~90s for one test on this branch. On a
+    machine running live voice sessions that is a real-world side effect, not a
+    flaky test, so it is blocked structurally rather than by remembering to
+    mock the right name.
+
+    A test that patches `sd.InputStream` / `sd.rec` itself still wins: its
+    patch is applied after this fixture's. This only bites when nothing else
+    intercepted the call.
+
+    Opt out with @pytest.mark.real_microphone if a test genuinely needs a
+    device.
+    """
+    # Record the fixture's own decision so a test can assert on it without
+    # poking sounddevice -- other tests replace that module with a MagicMock,
+    # which makes any attribute-shape assertion order-dependent.
+    request.node.mic_guard_armed = False
+
+    if request.node.get_closest_marker("real_microphone"):
+        yield
+        return
+
+    try:
+        import sounddevice as sd
+    except Exception:
+        # No audio backend available -- nothing to guard.
+        yield
+        return
+
+    def _refuse(*args, **kwargs):
+        raise RuntimeError(
+            "This test tried to open the REAL microphone via sounddevice. "
+            "Mock the recording function the code actually calls -- on this "
+            "branch that is record_audio_with_silence_detection, not just "
+            "record_audio -- or mark the test @pytest.mark.real_microphone if "
+            "it truly needs a device. See tests/conftest.py:block_real_microphone."
+        )
+
+    for name in BLOCKED_AUDIO_CAPTURE:
+        if hasattr(sd, name):
+            monkeypatch.setattr(sd, name, _refuse)
+            request.node.mic_guard_armed = True
+
+    yield
 
 
 @pytest.fixture(autouse=True)

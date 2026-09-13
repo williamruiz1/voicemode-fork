@@ -17,10 +17,14 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
+from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 from voice_mode.conch import Conch
+from voice_mode.config import SAMPLE_RATE, VAD_CHUNK_DURATION_MS
+from voice_mode.tools.converse import record_audio_with_silence_detection
 
 
 @pytest.fixture
@@ -227,6 +231,191 @@ class TestIdleListenYieldGracePeriod:
         finally:
             proc.kill()
             proc.wait()
+
+
+_CHUNK_SAMPLES = int(SAMPLE_RATE * VAD_CHUNK_DURATION_MS / 1000)
+_CHUNK_DURATION_S = VAD_CHUNK_DURATION_MS / 1000
+
+
+def _run_idle_listen(yield_check, supersede_check, grace_seconds, n_chunks=400):
+    """Drive the REAL record_audio_with_silence_detection loop with silence
+    (never speech) and a mocked mic, exactly like
+    tests/test_endpointing_recordloop.py::_run_with_fixture — no real device,
+    no real wall-clock wait (recording_duration is a nominal per-chunk
+    counter, not a wall-clock read, so this runs at test speed).
+
+    Returns (audio, speech_detected, yield_state).
+    """
+    silence_chunk = np.zeros(_CHUNK_SAMPLES, dtype=np.int16).reshape(-1, 1)
+    mock_queue_instance = MagicMock()
+    mock_queue_instance.get.side_effect = [silence_chunk] * n_chunks
+
+    yield_state = {"yielded": False}
+    with patch("voice_mode.tools.converse.sd") as mock_sd, \
+         patch("voice_mode.tools.converse.CONCH_YIELD_GRACE_SECONDS", grace_seconds), \
+         patch("queue.Queue", return_value=mock_queue_instance):
+        mock_sd.InputStream.return_value.__enter__.return_value = MagicMock()
+        mock_sd.InputStream.return_value.__exit__.return_value = False
+        audio, speech_detected = record_audio_with_silence_detection(
+            max_duration=8.0,
+            yield_check=yield_check,
+            yield_state=yield_state,
+            supersede_check=supersede_check,
+        )
+    return audio, speech_detected, yield_state
+
+
+class TestSupersessionBypassesGraceFloor:
+    """W2c merge fix (fold of PR #12 conch-fail-closed into master's grace
+    floor, PR #11 / commit 2916047).
+
+    master added CONCH_YIELD_GRACE_SECONDS: a fresh idle-listen must run for
+    at least that long before honoring a yield REQUEST (Conch.is_wanted),
+    because a waiter's poll loop can start requesting the mic before the
+    holder even starts listening (see TestIdleListenYieldGracePeriod above).
+
+    fix/conch-fail-closed (PR #12) added Conch.is_superseded: a preempter has
+    ALREADY taken the lock in place under a bumped epoch, so the holder no
+    longer holds what it thinks it holds. That is a FACT, not a request — the
+    human is welcome to keep waiting on a request, but a fact about who
+    currently owns the mic can't be deferred without two processes both
+    believing they hold it for the whole deferral.
+
+    A TEXTUAL "take both sides" merge of the two PRs auto-merges cleanly
+    (verified: `git merge origin/fix/conch-fail-closed` into a fresh
+    origin/master worktree produces NO conflict markers in converse.py) but
+    is WRONG: fix/conch-fail-closed's higher-level wiring hunk rebinds the
+    single `yield_check` parameter to `conch.should_yield` (which composes
+    is_superseded() OR is_wanted()), and master's grace-gate hunk in the
+    low-level loop is untouched — so the composed check, supersession
+    included, gets gated behind CONCH_YIELD_GRACE_SECONDS. converse.py now
+    wires supersession as its OWN callable (`supersede_check`, ungated) so
+    this can't happen — see record_audio_with_silence_detection's docstring
+    and the wiring at its `listen_supersede_check` call site.
+
+    These tests run the REAL record loop (see _run_idle_listen) exercising
+    the real production grace-gate code — not a mirror of the conditional.
+    The naive-merge contrast test is proven faithfully because the low-level
+    grace-gated `if (yield_check is not None and not speech_detected and
+    recording_duration >= CONCH_YIELD_GRACE_SECONDS):` block in this worktree
+    is BYTE-IDENTICAL to the one a real `git merge` of origin/fix/conch-
+    fail-closed into origin/master produces (diffed and confirmed at merge
+    time) -- so calling this file's own record_audio_with_silence_detection
+    with the naive wiring (single `yield_check=holder.should_yield`, no
+    `supersede_check`) reproduces the naive merge's runtime behavior exactly,
+    not just its shape.
+    """
+
+    def test_supersession_honored_on_first_tick_correct_merge(self, clean_conch):
+        """Acceptance test 1: a superseded holder stands down at t≈0, well
+        below CONCH_YIELD_GRACE_SECONDS, on the CORRECT (split-check) merge."""
+        holder = Conch(agent_name="holder")
+        assert holder.try_acquire() is True
+        Conch(agent_name="preempter").preempt_acquire("preempter")
+        assert holder.is_superseded() is True, "setup: holder must be superseded"
+
+        audio, speech_detected, yield_state = _run_idle_listen(
+            yield_check=Conch.is_wanted,
+            supersede_check=holder.is_superseded,
+            grace_seconds=0.3,
+        )
+
+        recorded_duration = len(audio) / SAMPLE_RATE
+        assert speech_detected is False
+        assert yield_state["yielded"] is True
+        assert recorded_duration < 0.1, (
+            f"correct merge: superseded holder ran {recorded_duration:.3f}s "
+            f"before yielding -- should have stood down on ~the first tick"
+        )
+
+    def test_naive_merge_would_have_gated_supersession_behind_grace(self, clean_conch):
+        """THE CONTRAST — the single most important test in this suite.
+
+        Same exact scenario (already-superseded holder), decided by the
+        NAIVE both-sides-merge wiring: a single `yield_check` bound to the
+        COMPOSED `conch.should_yield`, no separate supersede_check (that
+        parameter does not exist on the naive merge's converse.py at all).
+        This FAILS to stand down until CONCH_YIELD_GRACE_SECONDS elapses --
+        the double-hold bug PR #12 exists to close. It is run against the
+        real production loop, so if this assertion ever passes at t≈0
+        instead, the correct/naive contrast this test exists to prove has
+        silently stopped holding (e.g. someone re-merged should_yield back
+        into the wiring) and this test's FAILURE is the signal to look at.
+        """
+        holder = Conch(agent_name="holder")
+        assert holder.try_acquire() is True
+        Conch(agent_name="preempter").preempt_acquire("preempter")
+        assert holder.is_superseded() is True, "setup: holder must be superseded"
+
+        grace = 0.3
+        audio, speech_detected, yield_state = _run_idle_listen(
+            yield_check=holder.should_yield,  # the naive merge's single wire
+            supersede_check=None,             # doesn't exist on the naive merge
+            grace_seconds=grace,
+        )
+
+        recorded_duration = len(audio) / SAMPLE_RATE
+        assert speech_detected is False
+        assert yield_state["yielded"] is True, "should still yield eventually"
+        assert recorded_duration >= grace - _CHUNK_DURATION_S, (
+            f"naive merge: superseded holder yielded after only "
+            f"{recorded_duration:.3f}s, before the {grace}s grace floor -- "
+            f"if this fails, the naive-vs-correct contrast no longer holds "
+            f"and the wiring may have regressed to the naive shape"
+        )
+
+    def test_yield_request_still_withheld_until_grace_elapses(self, clean_conch):
+        """Acceptance test 2: master's fix is not weakened. A mere REQUEST
+        (not a supersession -- this holder is never preempted) is still
+        withheld until grace elapses, on the correct merge's own wiring."""
+        holder = Conch(agent_name="holder")
+        assert holder.try_acquire() is True
+        assert holder.is_superseded() is False
+
+        proc = _spawn_live_process()
+        try:
+            _write_wanted(proc.pid, datetime.now())
+            grace = 0.3
+            audio, speech_detected, yield_state = _run_idle_listen(
+                yield_check=Conch.is_wanted,
+                supersede_check=holder.is_superseded,  # always False here
+                grace_seconds=grace,
+            )
+        finally:
+            proc.kill()
+            proc.wait()
+
+        recorded_duration = len(audio) / SAMPLE_RATE
+        assert speech_detected is False
+        assert yield_state["yielded"] is True
+        assert recorded_duration >= grace - _CHUNK_DURATION_S, (
+            f"a mere request yielded after only {recorded_duration:.3f}s, "
+            f"before the {grace}s grace floor -- master's fix was weakened"
+        )
+
+    def test_supersession_survives_conch_yield_disabled(self, clean_conch):
+        """Acceptance test 3: config cannot switch off a fact. Mirrors
+        converse.py's own wiring when VOICEMODE_CONCH_YIELD_ENABLED=false --
+        `listen_yield_check` is never even constructed (passed as None here)
+        -- while `listen_supersede_check` is unaffected by that flag."""
+        holder = Conch(agent_name="holder")
+        assert holder.try_acquire() is True
+        Conch(agent_name="preempter").preempt_acquire("preempter")
+        assert holder.is_superseded() is True
+
+        audio, speech_detected, yield_state = _run_idle_listen(
+            yield_check=None,  # CONCH_YIELD_ENABLED=false: never wired
+            supersede_check=holder.is_superseded,
+            grace_seconds=0.3,
+        )
+
+        recorded_duration = len(audio) / SAMPLE_RATE
+        assert speech_detected is False
+        assert yield_state["yielded"] is True
+        assert recorded_duration < 0.1, (
+            f"supersession did not survive yield being disabled -- ran "
+            f"{recorded_duration:.3f}s before yielding"
+        )
 
 
 class TestPreemptAcquire:

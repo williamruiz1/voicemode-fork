@@ -207,9 +207,17 @@ class TestConverseSTTFailures:
         with patch('voice_mode.simple_failover.simple_tts_failover') as mock_tts:
             mock_tts.return_value = (True, {'duration_ms': 100}, {'provider': 'kokoro'})
 
-            with patch('voice_mode.tools.converse.record_audio') as mock_record:
+            # NOTE: converse() records via record_audio_with_silence_detection,
+            # which returns (samples, speech_detected). Patching only
+            # record_audio leaves the real recorder in the path, and the test
+            # then opens the machine's microphone for the whole listen window.
+            with patch('voice_mode.tools.converse.record_audio') as mock_record, \
+                 patch('voice_mode.tools.converse.record_audio_with_silence_detection') as mock_record_vad:
                 # Return a proper numpy array instead of bytes
                 mock_record.return_value = np.array([0, 100, 200, 100, 0], dtype=np.int16)
+                mock_record_vad.return_value = (
+                    np.array([0, 100, 200, 100, 0], dtype=np.int16), True
+                )
 
                 with patch('voice_mode.simple_failover.simple_stt_failover') as mock_stt:
                     mock_stt.return_value = {
@@ -242,9 +250,15 @@ class TestConverseSTTFailures:
         with patch('voice_mode.simple_failover.simple_tts_failover') as mock_tts:
             mock_tts.return_value = (True, {'duration_ms': 100}, {'provider': 'kokoro'})
 
-            with patch('voice_mode.tools.converse.record_audio') as mock_record:
+            # See the note above: the silence-detecting recorder is the one
+            # converse() actually calls, and it must be mocked too.
+            with patch('voice_mode.tools.converse.record_audio') as mock_record, \
+                 patch('voice_mode.tools.converse.record_audio_with_silence_detection') as mock_record_vad:
                 # Return a proper numpy array instead of bytes
                 mock_record.return_value = np.array([0, 0, 0, 0, 0], dtype=np.int16)
+                mock_record_vad.return_value = (
+                    np.array([0, 0, 0, 0, 0], dtype=np.int16), False
+                )
 
                 with patch('voice_mode.simple_failover.simple_stt_failover') as mock_stt:
                     mock_stt.return_value = {
@@ -286,3 +300,43 @@ class TestConverseMetrics:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestMicrophoneGuard:
+    """The conftest guard that keeps a mis-targeted mock off the real device.
+
+    This file is where that failure actually happened: a test mocked
+    `record_audio` while converse() calls `record_audio_with_silence_detection`,
+    so the real recorder ran and held the machine's input device for the whole
+    listen window (~90s measured). The mock targets are fixed above; this
+    verifies the structural backstop, so the next mis-targeted mock fails fast
+    instead of taking the microphone.
+    """
+
+    def test_opening_an_input_stream_is_refused(self, request):
+        import sounddevice as sd
+        if not request.node.mic_guard_armed:
+            pytest.skip("sounddevice is mocked in this run; nothing to guard")
+        with pytest.raises(RuntimeError, match="REAL microphone"):
+            sd.InputStream(samplerate=16000, channels=1)
+
+    def test_blocking_record_is_refused(self, request):
+        import sounddevice as sd
+        if not request.node.mic_guard_armed:
+            pytest.skip("sounddevice is mocked in this run; nothing to guard")
+        with pytest.raises(RuntimeError, match="REAL microphone"):
+            sd.rec(1600, samplerate=16000, channels=1)
+
+    def test_device_metadata_is_still_readable(self):
+        """Read-only enumeration must NOT be blocked -- lots of code uses it."""
+        import sounddevice as sd
+        sd.query_devices()  # must not raise
+
+    @pytest.mark.real_microphone
+    def test_marker_opts_out_of_the_guard(self, request):
+        """The escape hatch exists and is wired.
+
+        Asserts on the fixture's own decision -- it never opens a device, and
+        never inspects sounddevice, which other tests replace with a MagicMock.
+        """
+        assert request.node.mic_guard_armed is False
