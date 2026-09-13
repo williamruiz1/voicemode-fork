@@ -1,9 +1,11 @@
 """Tests for the Conch lock file mechanism."""
 
 import json
+import logging
 import multiprocessing
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -464,7 +466,12 @@ class TestConchAtomicLocking:
         holder.release()
 
     def test_try_acquire_clears_stale_timestamp_with_live_pid(self):
-        """Existing behavior: live PID + expired timestamp still clears."""
+        """Live PID + expired timestamp: takeover still succeeds.
+
+        The outcome is unchanged, but the mechanism is now an IN-PLACE
+        truncate-and-rewrite under the flock rather than an unlink, so no
+        inode swap occurs. See TestConchFailClosed for the inode assertions.
+        """
         # Write a lock file with our live PID but an ancient timestamp.
         Conch.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
         data = {
@@ -569,3 +576,221 @@ class TestConchAtomicLocking:
 
         # Clean up
         agent_a.release()
+
+
+class TestConchFailClosed:
+    """Fail-closed invariants: an enforcement verdict never comes from a
+    swallowed exception, and stale clearance never unlinks a live holder.
+
+    Both bug classes below let two processes hold a real, simultaneous
+    "exclusive" lock -- the mechanism behind unchecked double-speak.
+    """
+
+    # ---- Constraint 1: an unreadable lock file means HELD, not free ----
+
+    def test_unreadable_lock_refuses_acquire_when_no_flock_held(self, caplog):
+        """A corrupt lock file must NOT read as "microphone free".
+
+        The dangerous shape: a holder that took the lock through the
+        documented context-manager/acquire() API holds NO flock, so the flock
+        in try_acquire() cannot protect it. Before the fix, the corrupt-read
+        exception was swallowed into "no conversation active" and the
+        contender acquired a second lock while the first holder was live.
+        """
+        holder = Conch(agent_name="holder")
+        holder.acquire()  # documented context-manager path -- no flock taken
+        assert Conch.LOCK_FILE.exists()
+
+        # Corrupt the record in place (same inode).
+        Conch.LOCK_FILE.write_text('{"pid": 1234, "agen')
+
+        contender = Conch(agent_name="contender")
+        with caplog.at_level(logging.WARNING, logger="voicemode.conch"):
+            acquired = contender.try_acquire()
+
+        assert acquired is False, (
+            "try_acquire() granted the conch off an unreadable lock file -- "
+            "a swallowed parse error became a 'microphone is free' verdict"
+        )
+        assert any(
+            "unreadable" in record.getMessage().lower()
+            for record in caplog.records
+        ), (
+            "the unreadable-lock condition was silently absorbed; it must be "
+            f"logged. Records seen: {[r.getMessage() for r in caplog.records]}"
+        )
+
+        holder.release()
+
+    def test_unreadable_lock_is_logged_even_when_flock_also_refuses(self, caplog):
+        """The flock refusal must not mask the unreadable-lock condition.
+
+        When the holder DID take an flock, the contender was already refused
+        -- but silently, with no record that the lock file had been corrupted.
+        A refusal whose reason is invisible cannot be operated on.
+        """
+        holder = Conch(agent_name="holder")
+        assert holder.try_acquire() is True
+        Conch.LOCK_FILE.write_text("not json at all")
+
+        contender = Conch(agent_name="contender")
+        with caplog.at_level(logging.WARNING, logger="voicemode.conch"):
+            assert contender.try_acquire() is False
+        assert any(
+            "unreadable" in record.getMessage().lower()
+            for record in caplog.records
+        ), "unreadable lock file was never logged"
+
+        holder.release()
+
+    def test_absent_lock_file_still_reads_as_free(self, clean_conch):
+        """Fail-closed must not over-reach: NO lock file is genuinely free.
+
+        Guards against collapsing "file absent" into "file unreadable" --
+        that would deadlock every first acquisition.
+        """
+        assert not Conch.LOCK_FILE.exists()
+        assert Conch.read_lock_state()[0] == Conch.STATE_FREE
+        assert Conch.is_held() is False
+
+        conch = Conch(agent_name="first")
+        assert conch.try_acquire() is True
+        conch.release()
+
+    def test_read_lock_state_reports_unreadable_for_corrupt_file(self):
+        """The authoritative accessor names the condition instead of hiding it."""
+        Conch.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        Conch.LOCK_FILE.write_text("{broken")
+
+        state, data = Conch.read_lock_state()
+        assert state == Conch.STATE_UNREADABLE
+        assert data is None
+        assert Conch.is_held() is True, (
+            "an unreadable lock must resolve to HELD for enforcement"
+        )
+
+        # The non-authoritative status reader keeps its documented contract.
+        assert Conch.is_active() is False
+
+    # ---- Constraint 2: stale clearance must not unlink a live holder ----
+
+    def test_stale_timestamp_with_live_holder_refused_and_inode_stable(self):
+        """A live holder past the stale threshold must NOT lose its inode.
+
+        Before the fix, _check_and_clear_stale_lock() unlinked on timestamp
+        expiry even with the holder alive. The holder kept a valid flock on
+        the orphaned inode while the contender took a valid flock on a brand
+        new one: two live processes, two real locks, both entitled to speak.
+
+        The inode number is the discriminator -- if it changed, the swap
+        happened regardless of what the return value says.
+        """
+        holder = Conch(agent_name="holder")
+        assert holder.try_acquire() is True
+        inode_before = os.stat(Conch.LOCK_FILE).st_ino
+
+        # Backdate the holder's record IN PLACE: same inode, flock intact.
+        # (write_text truncates and rewrites; flock is advisory and survives.)
+        Conch.LOCK_FILE.write_text(json.dumps({
+            "pid": os.getpid(),          # holder is alive -- it is us
+            "agent": "holder",
+            "acquired": "2000-01-01T00:00:00",  # way past any expiry
+            "expires": None,
+        }))
+        assert os.stat(Conch.LOCK_FILE).st_ino == inode_before, (
+            "test setup changed the inode; the assertion below would be void"
+        )
+
+        contender = Conch(agent_name="contender")
+        acquired = contender.try_acquire()
+        inode_after = os.stat(Conch.LOCK_FILE).st_ino
+
+        assert inode_after == inode_before, (
+            f"stale clearance unlinked a LIVE holder's lock: inode "
+            f"{inode_before} -> {inode_after}. The holder still flocks the "
+            f"old inode; the contender now flocks a new one -- two live "
+            f"holders, both 'exclusive'."
+        )
+        assert acquired is False, (
+            "contender acquired the conch while a live holder still flocked it"
+        )
+
+        record = json.loads(Conch.LOCK_FILE.read_text())
+        assert record["agent"] == "holder", (
+            "the live holder's record was overwritten by a refused contender"
+        )
+
+        holder.release()
+
+    def test_stale_timestamp_takeover_happens_in_place_not_by_unlink(self):
+        """A stale record with NO live flock is taken over on the same inode.
+
+        This is the legitimate takeover case (holder gone or never flocked).
+        It must still succeed -- and must do so by truncate-and-rewrite under
+        the held descriptor, not by creating a new inode.
+        """
+        Conch.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        Conch.LOCK_FILE.write_text(json.dumps({
+            "pid": os.getpid(),                  # alive, but holds no flock
+            "agent": "stuck_agent",
+            "acquired": "2000-01-01T00:00:00",
+            "expires": None,
+        }))
+        inode_before = os.stat(Conch.LOCK_FILE).st_ino
+
+        new_conch = Conch(agent_name="new_agent")
+        assert new_conch.try_acquire() is True
+        assert os.stat(Conch.LOCK_FILE).st_ino == inode_before, (
+            "takeover created a new inode instead of rewriting in place"
+        )
+        assert json.loads(Conch.LOCK_FILE.read_text())["agent"] == "new_agent"
+
+        new_conch.release()
+
+    def test_dead_holder_unlink_path_still_works(self):
+        """Unlink stays permitted against a CONFIRMED-dead PID.
+
+        Regression guard: the constraint-2 fix must not disable the
+        dead-holder recovery path, which is the only reason the unlink exists.
+        """
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        os.waitpid(pid, 0)
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+
+        Conch.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        Conch.LOCK_FILE.write_text(json.dumps({
+            "pid": pid,
+            "agent": "dead_agent",
+            "acquired": datetime.now().isoformat(),
+            "expires": None,
+        }))
+
+        state, data = Conch.read_lock_state()
+        assert state == Conch.STATE_FREE, "a confirmed-dead holder is free"
+        assert data is not None and data["agent"] == "dead_agent"
+
+        new_conch = Conch(agent_name="new_agent")
+        assert new_conch.try_acquire() is True
+        assert json.loads(Conch.LOCK_FILE.read_text())["agent"] == "new_agent"
+        new_conch.release()
+
+    def test_preempt_acquire_recovers_from_permanently_corrupt_lock(self):
+        """The documented escape hatch out of a fail-closed corrupt lock.
+
+        Because an unreadable lock now refuses acquisition forever, the
+        deliberate preempt path must still be able to clear it -- otherwise
+        one bad write wedges the microphone permanently.
+        """
+        Conch.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        Conch.LOCK_FILE.write_text("}{ garbage")
+
+        blocked = Conch(agent_name="blocked")
+        assert blocked.try_acquire() is False
+
+        rescuer = Conch(agent_name="rescuer")
+        assert rescuer.preempt_acquire("rescuer") is True
+        assert json.loads(Conch.LOCK_FILE.read_text())["agent"] == "rescuer"
+        rescuer.release()

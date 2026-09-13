@@ -20,16 +20,41 @@ Usage:
         conch.release()
 
     # Check if converse is active (for external scripts)
+    # NON-AUTHORITATIVE: answers False on any read error.
     if Conch.is_active():
         print("Someone is in a voice conversation")
+
+    # Authoritative, FAIL-CLOSED check -- use this when the answer GATES an
+    # action. An unreadable lock file reads as held, never as free.
+    if Conch.is_held():
+        print("Do not take the microphone")
 """
 
 import fcntl
 import json
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
+
+logger = logging.getLogger("voicemode.conch")
+
+
+def _log_conch_event(name: str, payload: dict) -> None:
+    """Best-effort observability event.
+
+    Safe no-op if the event logger is unset or the import fails (avoids
+    circular-import / startup-order issues). Never raises.
+    """
+    try:
+        from voice_mode.utils.event_logger import get_event_logger
+        event_logger = get_event_logger()
+        if event_logger:
+            event_logger.log_event(name, payload)
+    except Exception:
+        pass
+
 
 # Import config for lock expiry - deferred to avoid circular import
 def _get_lock_expiry() -> float:
@@ -62,6 +87,12 @@ class Conch:
     """
 
     LOCK_FILE = Path.home() / ".voicemode" / "conch"
+
+    # Authoritative lock states returned by read_lock_state(). Anything other
+    # than STATE_FREE means "treat the microphone as taken."
+    STATE_FREE = "free"
+    STATE_HELD = "held"
+    STATE_UNREADABLE = "unreadable"
 
     def __init__(self, agent_name: Optional[str] = None):
         """Initialize Conch with optional agent name.
@@ -118,7 +149,30 @@ class Conch:
         agent = agent_name or self.agent_name or "unknown"
         self.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-        # First check: is there a stale lock we can forcibly clear?
+        # First check (FAIL CLOSED): a lock file that EXISTS but cannot be
+        # read or parsed is not evidence that the microphone is free. Refuse,
+        # and say so -- never let a swallowed exception hand out a second
+        # "exclusive" lock. An ABSENT lock file is a different thing and is
+        # still genuinely free.
+        #
+        # Recovery from a permanently-corrupt lock file is the deliberate
+        # preempt_acquire() path (the waiter's hard timeout), not a silent
+        # grab here.
+        state, _ = self.read_lock_state()
+        if state == self.STATE_UNREADABLE:
+            logger.warning(
+                "Conch lock file %s exists but is unreadable/unparseable; "
+                "refusing to acquire (fail closed). Use the preempt path to "
+                "clear it.", self.LOCK_FILE
+            )
+            _log_conch_event("CONCH_UNREADABLE_LOCK", {
+                "pid": os.getpid(),
+                "agent": agent,
+                "lock_file": str(self.LOCK_FILE),
+            })
+            return False
+
+        # Second check: is there a stale lock we can forcibly clear?
         self._check_and_clear_stale_lock()
 
         try:
@@ -164,12 +218,16 @@ class Conch:
            expiry is disabled (CONCH_LOCK_EXPIRY <= 0) -- a dead holder is
            unambiguously stale.
         2. Timestamp-based expiry: if the lock is older than
-           CONCH_LOCK_EXPIRY seconds, forcibly remove it. This handles the
-           case where the holder is alive but stuck.
+           CONCH_LOCK_EXPIRY seconds, note it and let try_acquire() take the
+           lock over IN PLACE. This handles the case where the holder is
+           alive but stuck -- WITHOUT unlinking (see below).
 
-        Note: This deletes the file, creating a new inode. A stuck process
-        still holds its flock on the old inode, but we can now create a fresh
-        lock file.
+        Unlink is permitted ONLY against a confirmed-dead PID (path 1).
+        Unlinking a lock whose holder may still be alive creates a NEW INODE:
+        the holder keeps a valid flock on the orphaned inode while the next
+        caller takes a valid flock on the fresh one, so two live processes
+        each hold a real "exclusive" lock and both are entitled to speak.
+        That inode swap was the mechanism behind double-speak on long turns.
         """
         if not self.LOCK_FILE.exists():
             return
@@ -213,7 +271,21 @@ class Conch:
                 # fall through to timestamp check.
                 pass
 
-        # Timestamp-based stale clearance.
+        # Timestamp-based staleness.
+        #
+        # We deliberately do NOT unlink here. Control only reaches this point
+        # when the recorded holder was NOT confirmed dead above -- it is alive,
+        # unsignalable, or unknown. Unlinking in that state swaps the inode out
+        # from under a possibly-live flock holder and produces two
+        # simultaneously-valid locks (see this method's docstring).
+        #
+        # Instead, takeover happens IN PLACE: try_acquire() opens this SAME
+        # inode and attempts flock(LOCK_EX | LOCK_NB). If the holder is truly
+        # gone -- or never took an flock -- we win the lock and rewrite the
+        # holder record under the held descriptor, same inode. If a live holder
+        # still holds the flock we are refused, which is the correct answer.
+        # Deliberately breaking a live holder's flock remains possible, but only
+        # through the explicit preempt_acquire() path.
         lock_expiry = _get_lock_expiry()
         if lock_expiry <= 0:
             return  # Stale lock detection disabled
@@ -229,11 +301,18 @@ class Conch:
 
         age_seconds = (datetime.now() - acquired_time).total_seconds()
         if age_seconds > lock_expiry:
-            # Lock is stale - forcibly remove it
-            try:
-                self.LOCK_FILE.unlink()
-            except OSError:
-                pass
+            logger.debug(
+                "Conch lock held by pid %s (agent %s) is %.1fs old (expiry "
+                "%.1fs); attempting in-place takeover, not unlinking.",
+                pid, data.get("agent", "unknown"), age_seconds, lock_expiry,
+            )
+            _log_conch_event("CONCH_STALE_TIMESTAMP_LIVE_HOLDER", {
+                "pid": os.getpid(),
+                "stale_pid": pid,
+                "stale_agent": data.get("agent", "unknown"),
+                "age_seconds": age_seconds,
+                "lock_expiry": lock_expiry,
+            })
 
     def release(self) -> float:
         """Release the lock and return seconds held.
@@ -272,8 +351,93 @@ class Conch:
         return held_seconds
 
     @classmethod
+    def read_lock_state(cls) -> Tuple[str, Optional[dict]]:
+        """Authoritative, FAIL-CLOSED read of the lock file.
+
+        This is the accessor that enforcement decisions must use. Unlike
+        is_active() / get_holder() -- non-authoritative status readers that
+        answer False/None on any error -- this method never lets a swallowed
+        exception become a "the microphone is free" verdict.
+
+        Returns (state, data):
+          STATE_FREE       The lock file does not exist (data None), or its
+                           recorded holder PID is CONFIRMED dead (data is the
+                           parsed record, so callers can log who it was).
+          STATE_HELD       A readable record whose holder is alive, or alive
+                           but unsignalable. data is the record.
+          STATE_UNREADABLE The file EXISTS but could not be statted, read or
+                           parsed, or carries no usable holder PID. Resolves
+                           to held for enforcement purposes: an unreadable
+                           lock is never evidence that nobody is speaking.
+
+        Note the deliberate distinction: an ABSENT lock file is FREE; a
+        PRESENT-but-unreadable one is not. Collapsing those two cases is the
+        fail-open bug this method exists to prevent.
+
+        Note also the deliberate divergence from is_active(): a holder whose
+        timestamp has expired but whose process is still ALIVE reads HELD
+        here. is_active() calls that inactive; for an enforcement verdict,
+        "alive but slow" is still a live microphone holder.
+        """
+        try:
+            if not cls.LOCK_FILE.exists():
+                return cls.STATE_FREE, None
+        except OSError:
+            # Cannot even stat the path -- refuse to call it free.
+            return cls.STATE_UNREADABLE, None
+
+        try:
+            raw = cls.LOCK_FILE.read_text()
+        except (OSError, ValueError):
+            return cls.STATE_UNREADABLE, None
+
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return cls.STATE_UNREADABLE, None
+
+        if not isinstance(data, dict):
+            return cls.STATE_UNREADABLE, None
+
+        pid = data.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            # No usable holder PID: liveness is undeterminable, so the lock
+            # cannot be SHOWN to be free. (pid <= 0 is also rejected because
+            # os.kill would address a process group, not a process.)
+            return cls.STATE_UNREADABLE, None
+
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            # Confirmed dead holder -- genuinely free.
+            return cls.STATE_FREE, data
+        except PermissionError:
+            # Process exists but is owned by another user -- alive.
+            return cls.STATE_HELD, data
+        except OSError:
+            # Liveness undeterminable -- fail closed.
+            return cls.STATE_UNREADABLE, data
+
+        return cls.STATE_HELD, data
+
+    @classmethod
+    def is_held(cls) -> bool:
+        """Authoritative, fail-closed answer to "is the microphone taken?"
+
+        True unless the lock file is genuinely absent or its holder is
+        confirmed dead. Use this -- not is_active() -- anywhere the answer
+        gates an action rather than merely reporting status.
+        """
+        return cls.read_lock_state()[0] != cls.STATE_FREE
+
+    @classmethod
     def is_active(cls) -> bool:
         """Check if a voice conversation is currently active.
+
+        NON-AUTHORITATIVE status reader: answers False on any read error and
+        treats a stale timestamp as inactive. Do NOT gate an enforcement
+        decision on this -- use is_held() / read_lock_state(), which fail
+        closed instead.
 
         A conversation is considered active if:
         1. The lock file exists
@@ -315,6 +479,10 @@ class Conch:
     @classmethod
     def get_holder(cls) -> Optional[dict]:
         """Get information about the current lock holder.
+
+        NON-AUTHORITATIVE status reader (for display and logging): returns
+        None on any read error, so "None" must never be read as "nobody holds
+        the conch." Use read_lock_state() when the answer gates an action.
 
         Returns:
             Dict with lock info if active, None otherwise
