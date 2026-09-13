@@ -590,6 +590,17 @@ CONCH_YIELD_ENABLED = os.getenv("VOICEMODE_CONCH_YIELD_ENABLED", "true").lower()
 # goes stale quickly and can't force yields forever)
 CONCH_WANTED_FRESH = float(os.getenv("VOICEMODE_CONCH_WANTED_FRESH", "5"))
 
+# Minimum seconds a fresh idle-listen must run before it can be yielded to a
+# waiter (founder-os barge-in fix, 2026-08-04). Without this, a waiter that
+# started polling wait_for_conch BEFORE the holder's TTS even finished wins
+# the mic on the holder's very first listen-loop tick (t=0s) -- so the human
+# gets zero time to start replying to what the holder just said, and the
+# waiter audibly barges over a conversation that was still live. This is a
+# turn-boundary vs. conversation-boundary bug: "just started listening" is
+# not the same as "genuinely idle/abandoned." Set to 0 to restore the old
+# zero-grace behavior.
+CONCH_YIELD_GRACE_SECONDS = float(os.getenv("VOICEMODE_CONCH_YIELD_GRACE_SECONDS", "3"))
+
 # When a waiter hits CONCH_TIMEOUT it preempts the lock instead of failing —
 # but never mid-utterance: if the holder is actually playing TTS (speaking
 # flag present), the waiter grants up to this many extra seconds of grace
