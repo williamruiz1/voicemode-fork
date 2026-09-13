@@ -28,6 +28,7 @@ from .config import (
     logger
 )
 from .utils import get_event_logger, update_latest_symlinks
+from . import audio_player
 
 
 
@@ -250,20 +251,21 @@ async def stream_pcm_audio(
     stream = None
     first_chunk_time = None
     save_buffer = io.BytesIO() if save_audio else None
-    
+    speaking_marked = False
+
     try:
         # Setup sounddevice stream for PCM playback
         # PCM parameters: 16-bit, mono, 24kHz (standard for TTS)
         audio_started = False
         audio_start_time = None
-        
+
         def audio_callback(outdata, frames, time_info, status):
             """Callback to track when audio actually starts playing."""
             nonlocal audio_started, audio_start_time
             if not audio_started and frames > 0:
                 audio_started = True
                 audio_start_time = time.perf_counter()
-        
+
         stream = sd.OutputStream(
             samplerate=SAMPLE_RATE,  # Standard TTS sample rate (24kHz)
             channels=1,
@@ -271,7 +273,18 @@ async def stream_pcm_audio(
             # Note: Can't use callback and write() together
         )
         stream.start()
-        
+        # This stream bypasses NonBlockingAudioPlayer entirely, so nothing
+        # else raises the "TTS is speaking" flag or feeds the AEC reference
+        # buffer for it -- without this, voice_mode.audio_player.is_tts_speaking()
+        # stays False for the ENTIRE duration of streamed (the default) TTS
+        # playback, and the natural-mode barge-in listener never even attempts
+        # to evaluate mic audio as speech (see voice_mode/barge_in.py's
+        # "tts_speaking" gate). Set the flag ONLY after stream.start()
+        # succeeds, and track that it was set so the matching decrement in
+        # `finally` below fires exactly once.
+        audio_player.playback_started()
+        speaking_marked = True
+
         # Log TTS playback start when we start the stream
         event_logger = get_event_logger()
         if event_logger:
@@ -308,7 +321,18 @@ async def stream_pcm_audio(
                     
                     # Play the chunk immediately
                     stream.write(audio_array)
-                    
+
+                    # Mirror what was actually sent to the speaker into the
+                    # AEC far-end reference buffer (see audio_player.write_
+                    # reference_audio's docstring) -- this is the KNOWN echo
+                    # source signal the natural-mode barge-in listener's echo
+                    # canceller needs. Without this call, get_reference_audio()
+                    # always returns silence for streamed playback, regardless
+                    # of what's actually coming out of the speaker.
+                    audio_player.write_reference_audio(
+                        audio_array.astype(np.float32) / 32768.0, SAMPLE_RATE
+                    )
+
                     # Save chunk if enabled
                     if save_buffer:
                         save_buffer.write(chunk)
@@ -393,8 +417,10 @@ async def stream_pcm_audio(
     except Exception as e:
         logger.error(f"PCM streaming failed: {e}")
         return False, metrics
-        
+
     finally:
+        if speaking_marked:
+            audio_player.playback_finished()
         if stream:
             stream.close()
 
@@ -475,7 +501,8 @@ async def stream_with_buffering(
     save_buffer = io.BytesIO() if save_audio else None
     audio_started = False
     stream = None
-    
+    speaking_marked = False
+
     try:
         # Setup sounddevice stream
         stream = sd.OutputStream(
@@ -484,7 +511,12 @@ async def stream_with_buffering(
             dtype='float32'
         )
         stream.start()
-        
+        # See the matching comment in stream_pcm_audio() above -- this stream
+        # bypasses NonBlockingAudioPlayer too, so nothing else raises the
+        # "TTS is speaking" flag for it.
+        audio_player.playback_started()
+        speaking_marked = True
+
         # Don't add stream parameter - Kokoro defaults to true, OpenAI doesn't support it
         
         # Use the streaming response API for true HTTP streaming
@@ -541,6 +573,7 @@ async def stream_with_buffering(
 
                             # Play audio
                             stream.write(samples)
+                            audio_player.write_reference_audio(samples, sample_rate)
                             metrics.chunks_played += len(samples) // 1024
 
                             # Reset buffer for next batch
@@ -583,6 +616,7 @@ async def stream_with_buffering(
                     metrics.ttfa = time.perf_counter() - start_time
 
                 stream.write(samples)
+                audio_player.write_reference_audio(samples, sample_rate)
                 metrics.chunks_played += len(samples) // 1024
 
                 # Belt-and-braces drain in addition to the silence padding above.
@@ -618,8 +652,10 @@ async def stream_with_buffering(
     except Exception as e:
         logger.error(f"Buffered streaming failed: {e}")
         return False, metrics
-        
+
     finally:
+        if speaking_marked:
+            audio_player.playback_finished()
         if stream:
             stream.stop()
             stream.close()
