@@ -1,6 +1,7 @@
 """Conversation tools for interactive voice interactions."""
 
 import asyncio
+import functools
 import logging
 import os
 import time
@@ -2295,12 +2296,36 @@ consult the MCP resources listed above.
                     else None
                 )
 
+                # Every listen-again call site in this function MUST route
+                # through here rather than calling record_audio_with_silence_
+                # detection directly. This is the one place yield_check and
+                # supersede_check are bundled together, so a call site can
+                # forward the yield half (subject to the grace floor) without
+                # anyone having to remember the supersede half (never gated,
+                # see the comment above) — the exact split that let a fix land
+                # on the primary listen and silently miss the two listen-again
+                # paths below (repeat/wait), which is precisely where a stale
+                # holder mattered most. Extra keyword args (pre_roll,
+                # step_away_state, checkin_callback, ...) are forwarded as-is
+                # for the primary listen's richer wiring.
+                def _listen_call(**overrides):
+                    kwargs = dict(
+                        yield_check=listen_yield_check,
+                        yield_state=yield_state,
+                        supersede_check=listen_supersede_check,
+                    )
+                    kwargs.update(overrides)
+                    return functools.partial(
+                        record_audio_with_silence_detection,
+                        listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness,
+                        **kwargs,
+                    )
+
                 # Graceful step-away wiring (founder-os#11655). Inert unless step-away
                 # is enabled (env flag or ~/.voicemode/step-away.enabled). The check-in
                 # is spoken from the executor thread via run_coroutine_threadsafe →
                 # play_system_audio (existing pre-recorded/​TTS path). All swallow errors
                 # so a check-in can never break the listen.
-                import functools as _functools
                 step_away_state = {}
                 _sa_on = step_away_enabled()
                 _sa_loop = asyncio.get_event_loop()
@@ -2315,14 +2340,10 @@ consult the MCP resources listed above.
                     except Exception as _e:
                         logger.debug(f"step-away check-in failed (ignored): {_e}")
 
-                _record_call = _functools.partial(
-                    record_audio_with_silence_detection,
-                    listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness,
-                    listen_yield_check, yield_state,
-                    (barge_in_result.pre_roll if natural_mode_barge_in else None),
+                _record_call = _listen_call(
+                    pre_roll=(barge_in_result.pre_roll if natural_mode_barge_in else None),
                     step_away_state=step_away_state,
                     checkin_callback=(_stepaway_checkin if _sa_on else None),
-                    supersede_check=listen_supersede_check,
                 )
 
                 record_start = time.perf_counter()
@@ -2581,7 +2602,7 @@ consult the MCP resources listed above.
                         # Record audio
                         record_start = time.perf_counter()
                         audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness, listen_yield_check, yield_state
+                            None, _listen_call()
                         )
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
@@ -2650,7 +2671,7 @@ consult the MCP resources listed above.
                         # Record audio
                         record_start = time.perf_counter()
                         audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness, listen_yield_check, yield_state
+                            None, _listen_call()
                         )
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
