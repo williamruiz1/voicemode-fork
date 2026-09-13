@@ -1181,7 +1181,7 @@ class StepAwayTracker:
         return False
 
 
-def record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, yield_check: Optional[Callable[[], bool]] = None, yield_state: Optional[dict] = None, pre_roll: Optional[np.ndarray] = None, pause_check: Optional[Callable[[], bool]] = None, step_away_state: Optional[dict] = None, checkin_callback: Optional[Callable[[], None]] = None, append_window_override_ms: Optional[int] = None, step_away_enabled_override: Optional[bool] = None) -> Tuple[np.ndarray, bool]:
+def record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, yield_check: Optional[Callable[[], bool]] = None, yield_state: Optional[dict] = None, pre_roll: Optional[np.ndarray] = None, pause_check: Optional[Callable[[], bool]] = None, step_away_state: Optional[dict] = None, checkin_callback: Optional[Callable[[], None]] = None, append_window_override_ms: Optional[int] = None, step_away_enabled_override: Optional[bool] = None, supersede_check: Optional[Callable[[], bool]] = None) -> Tuple[np.ndarray, bool]:
     """Record audio from microphone with automatic silence detection.
 
     Uses WebRTC VAD to detect when the user stops speaking and automatically
@@ -1201,8 +1201,22 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
             grace floor exists so a fresh listen can't be preempted before
             the human has had any chance to start replying.
         yield_state: Optional dict; when the listen ends because of
-            yield_check, ``yield_state["yielded"]`` is set True. (Out-of-band
-            so the 2-tuple return stays stable for existing callers.)
+            yield_check or supersede_check, ``yield_state["yielded"]`` is set
+            True. (Out-of-band so the 2-tuple return stays stable for
+            existing callers.)
+        supersede_check: Optional callable polled during the listen loop,
+            same IDLE-only gating as yield_check (never fires once speech has
+            been detected) but WITHOUT the grace floor. Distinct from
+            yield_check because the two signals aren't equivalent: yield_check
+            answers "is someone politely asking for the mic?" (a request,
+            fine to make wait out the grace period); supersede_check answers
+            "has the mic already been taken from us in place?" (a fact — the
+            conch's epoch has already moved on, so by the time this fires two
+            processes may already believe they hold it). Gating a fact behind
+            a multi-second grace floor would leave that double-hold standing
+            for the whole floor, which is the exact bug conch fail-closed
+            (PR #12) exists to remove. Checked first and unconditionally
+            (no grace, no config gate) every idle tick.
         pre_roll: Optional audio already captured BEFORE this call started (natural-mode
             barge-in: the mic audio that triggered the interruption). When provided, it
             seeds the recording as already-in-progress speech, so his interruption
@@ -1441,6 +1455,29 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                     except Exception:
                         pass
 
+                    # In-place supersession (conch fail-closed, PR #12): checked
+                    # FIRST and UNCONDITIONALLY (no grace floor, no config gate).
+                    # This is not a request that can be politely kept waiting —
+                    # a preempter has already taken the lock in place under a
+                    # bumped epoch, so we no longer hold what we think we hold.
+                    # Gating this behind CONCH_YIELD_GRACE_SECONDS (like the
+                    # request-path check below) would leave two processes both
+                    # believing they hold the mic for the whole grace window —
+                    # exactly the double-hold bug PR #12 exists to close. Still
+                    # IDLE-only: once speech has been detected the in-progress
+                    # utterance completes via VAD as usual (same as yield_check).
+                    if supersede_check is not None and not speech_detected:
+                        try:
+                            if supersede_check():
+                                logger.info("✓ Conch superseded in place — yielding idle listen immediately "
+                                            "(no grace floor: this is a fact, not a request)")
+                                if yield_state is not None:
+                                    yield_state["yielded"] = True
+                                stop_recording = True
+                                break
+                        except Exception:
+                            pass
+
                     # Yieldable listen (vibedispatcher#132): another agent is asking
                     # for the mic. Yield ONLY while idle — once speech has been
                     # detected, the in-progress utterance completes via VAD as usual.
@@ -1454,7 +1491,9 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                     # has any chance to start replying to what was just said. This
                     # is a turn-boundary vs. conversation-boundary bug, not a real
                     # abandoned-mic case. Require CONCH_YIELD_GRACE_SECONDS of
-                    # actual idle-listening before a yield request is honored.
+                    # actual idle-listening before a yield request is honored. This
+                    # grace applies ONLY to a request (yield_check) — supersession
+                    # (supersede_check, above) is a fact and always bypasses it.
                     if (yield_check is not None and not speech_detected
                             and recording_duration >= CONCH_YIELD_GRACE_SECONDS):
                         try:
@@ -1677,6 +1716,7 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                         checkin_callback=checkin_callback,
                         append_window_override_ms=append_window_override_ms,
                         step_away_enabled_override=step_away_enabled_override,
+                        supersede_check=supersede_check,
                     )
                     
                 except Exception as reinit_error:
@@ -2231,14 +2271,27 @@ consult the MCP resources listed above.
                 if event_logger:
                     event_logger.log_event(event_logger.RECORDING_START)
 
-                # Yieldable listen (vibedispatcher#132): while we hold the conch
-                # and are merely LISTENING (idle), another agent's request ends
-                # the listen early so the mic can be handed over. Only wired when
-                # we actually hold the conch (skip_conch bypass never yields).
+                # Yieldable listen (vibedispatcher#132) + in-place supersession:
+                # while we hold the conch and are merely LISTENING (idle), we end
+                # the listen early either because another agent ASKED for the mic
+                # (Conch.is_wanted, config-gated — a request, subject to the grace
+                # floor down in record_audio_with_silence_detection) or because a
+                # preempter has already TAKEN it from us in place (Conch.is_superseded,
+                # always honoured, bypasses the grace floor). These are two DIFFERENT
+                # callables, not Conch.should_yield's composed bool, because the grace
+                # floor must apply to the request half only — see the supersede_check
+                # docstring on record_audio_with_silence_detection for why gating a
+                # fact behind grace would reopen the double-hold bug PR #12 fixed.
+                # Only wired when we actually hold the conch (skip_conch never yields).
                 yield_state = {"yielded": False}
                 listen_yield_check = (
                     Conch.is_wanted
                     if (CONCH_ENABLED and CONCH_YIELD_ENABLED and conch._acquired)
+                    else None
+                )
+                listen_supersede_check = (
+                    conch.is_superseded
+                    if (CONCH_ENABLED and conch._acquired)
                     else None
                 )
 
@@ -2269,6 +2322,7 @@ consult the MCP resources listed above.
                     (barge_in_result.pre_roll if natural_mode_barge_in else None),
                     step_away_state=step_away_state,
                     checkin_callback=(_stepaway_checkin if _sa_on else None),
+                    supersede_check=listen_supersede_check,
                 )
 
                 record_start = time.perf_counter()
