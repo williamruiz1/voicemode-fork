@@ -31,6 +31,16 @@ Thank you for your interest in contributing to VoiceMode. This guide will help y
    uv tool install -e .
    ```
 
+   > **If this install backs a long-running/shared voice server** (not a
+   > disposable local checkout), do not run a bare `uv tool install ...
+   > --force` later to pick up a change — it re-resolves every dependency,
+   > pinned or not, from scratch (`[tool.uv] constraint-dependencies` and
+   > `uv.lock` are both ignored on this path — verified, not assumed; see
+   > `docs/dev/live-environment-pinning.md`). Use
+   > `scripts/install-live-tool-env.sh` instead, which pins via the
+   > committed `constraints-live.txt`, and treat any already-running
+   > server as stale-until-reconnected afterward.
+
 3. **Set up environment variables**
 
    ```bash
