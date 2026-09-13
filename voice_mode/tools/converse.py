@@ -24,6 +24,12 @@ except ImportError as e:
     webrtcvad = None
     VAD_AVAILABLE = False
 
+# Silero VAD-based endpointing (voice_mode/silero_vad.py) -- an opt-in
+# replacement for the webrtcvad decision above (config.ENDPOINTING_ENABLED).
+# Frozen interface; SILERO_AVAILABLE degrades gracefully to False (no import
+# error) when onnxruntime or the vendored model aren't present.
+from voice_mode.silero_vad import SILERO_AVAILABLE, Endpointer
+
 from voice_mode.server import mcp
 from voice_mode.conch import Conch
 from voice_mode.conversation_logger import get_conversation_logger
@@ -52,6 +58,10 @@ from voice_mode.config import (
     TTS_SPEED,
     VAD_CHUNK_DURATION_MS,
     INITIAL_SILENCE_GRACE_PERIOD,
+    ENDPOINTING_ENABLED,
+    ENDPOINTING_MIN_ENDPOINT_MS,
+    ENDPOINTING_SPEECH_THRESHOLD,
+    ENDPOINTING_MIN_SPEECH_MS,
     DEFAULT_LISTEN_DURATION,
     TTS_VOICES,
     TTS_MODELS,
@@ -1254,17 +1264,45 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
         # Initialize VAD with provided aggressiveness or default
         effective_vad_aggressiveness = vad_aggressiveness if vad_aggressiveness is not None else VAD_AGGRESSIVENESS
         vad = webrtcvad.Vad(effective_vad_aggressiveness)
-        
+
         # Calculate chunk size (must be 10, 20, or 30ms worth of samples)
         chunk_samples = int(SAMPLE_RATE * VAD_CHUNK_DURATION_MS / 1000)
         chunk_duration_s = VAD_CHUNK_DURATION_MS / 1000
-        
+
         # WebRTC VAD only supports 8000, 16000, or 32000 Hz
         # We'll tell VAD we're using 16kHz even though we're recording at 24kHz
         # This requires adjusting our chunk size to match what VAD expects
         vad_sample_rate = 16000
         vad_chunk_samples = int(vad_sample_rate * VAD_CHUNK_DURATION_MS / 1000)
-        
+
+        # Endpointing (Silero VAD, D5): OFF unless BOTH explicitly enabled via
+        # VOICEMODE_ENDPOINTING AND Silero is actually available (onnxruntime +
+        # vendored model loaded). When either is false, `use_endpointing` is
+        # False and every branch below this point is the pre-existing
+        # webrtcvad + silence-timer path, byte-for-byte unchanged.
+        use_endpointing = ENDPOINTING_ENABLED and SILERO_AVAILABLE
+        endpointer = None
+        if use_endpointing:
+            # append-to-turn (founder-os#11655) folds into the endpoint
+            # threshold itself: Endpointer.update() resets its trailing-silence
+            # counter on any above-threshold frame regardless of why the
+            # window is longer, so extending min_endpoint_ms by _append_ms
+            # reproduces the webrtcvad path's `_silence_stop_threshold =
+            # SILENCE_THRESHOLD_MS + _append_ms` + resume-cancels-the-timer
+            # behavior exactly. _append_ms == 0 (default) -> unchanged.
+            endpointer = Endpointer(
+                sample_rate=vad_sample_rate,
+                speech_threshold=ENDPOINTING_SPEECH_THRESHOLD,
+                min_endpoint_ms=ENDPOINTING_MIN_ENDPOINT_MS + _append_ms,
+                min_speech_ms=ENDPOINTING_MIN_SPEECH_MS,
+            )
+            endpointer.reset()
+            logger.info(
+                f"🎙️ endpointing enabled (Silero): speech_threshold={ENDPOINTING_SPEECH_THRESHOLD}, "
+                f"min_endpoint_ms={ENDPOINTING_MIN_ENDPOINT_MS}(+{_append_ms} append)={ENDPOINTING_MIN_ENDPOINT_MS + _append_ms}, "
+                f"min_speech_ms={ENDPOINTING_MIN_SPEECH_MS}"
+            )
+
         # Recording state -- seed from natural-mode barge-in pre-roll if given,
         # so his interruption becomes the start of this turn's speech rather
         # than being thrown away.
@@ -1274,6 +1312,18 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
         recording_duration = (len(pre_roll) / SAMPLE_RATE) if has_pre_roll else 0
         speech_detected = has_pre_roll
         stop_recording = False
+
+        if use_endpointing and has_pre_roll:
+            # Feed the pre-roll's own audio through the endpointer (resampled
+            # to its 16kHz working rate, same as every other chunk) so its
+            # internal speech_started/timing state reflects the interruption
+            # that already happened, rather than starting cold.
+            from scipy import signal as _pre_roll_signal
+            _pre_roll_flat = np.asarray(pre_roll).flatten()
+            _resampled_len = int(len(_pre_roll_flat) * vad_sample_rate / SAMPLE_RATE)
+            if _resampled_len > 0:
+                _pre_roll_16k = _pre_roll_signal.resample(_pre_roll_flat, _resampled_len)
+                endpointer.update(_pre_roll_16k)
         
         # Use a queue for thread-safe communication
         import queue
@@ -1441,77 +1491,106 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                         vad_chunk = vad_chunk[:vad_chunk_samples].astype(np.int16)
                         chunk_bytes = vad_chunk.tobytes()
                         
-                        # Check if chunk contains speech
-                        try:
-                            is_speech = vad.is_speech(chunk_bytes, vad_sample_rate)
-                            # ENERGY GATE (driving profile): webrtcvad has no energy
-                            # floor, so steady road/engine noise reads as "speech" and
-                            # the silence counter never accumulates → the mic hangs.
-                            # When an energy threshold is set, a chunk only counts as
-                            # speech if it ALSO clears the RMS floor; below-floor chunks
-                            # (road rumble) are treated as silence so end-of-turn is
-                            # detected. Disabled (==0) → pure-webrtcvad, unchanged.
-                            if is_speech and VAD_ENERGY_THRESHOLD > 0:
-                                chunk_rms = float(np.sqrt(np.mean(chunk.astype(float) ** 2)))
-                                if chunk_rms < VAD_ENERGY_THRESHOLD:
-                                    is_speech = False
-                                    if VAD_DEBUG and int(recording_duration * 1000) % 500 == 0:
-                                        logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: energy-gated (RMS={chunk_rms:.0f} < floor={VAD_ENERGY_THRESHOLD:.0f}) -> silence")
-                            if VAD_DEBUG:
-                                # Log VAD decision every 500ms for less spam
-                                if int(recording_duration * 1000) % 500 == 0:
-                                    rms = np.sqrt(np.mean(chunk.astype(float)**2))
-                                    logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: speech={is_speech}, RMS={rms:.0f}, floor={VAD_ENERGY_THRESHOLD:.0f}, state={'WAITING' if not speech_detected else 'ACTIVE'}")
-                        except Exception as vad_e:
-                            logger.warning(f"VAD error: {vad_e}, treating as speech")
-                            is_speech = True
-                        
-                        # State machine for speech detection
-                        if not speech_detected:
-                            # WAITING_FOR_SPEECH state
-                            if is_speech:
+                        if use_endpointing:
+                            # --- Endpointing (Silero VAD) decision path (D5: only
+                            # reached when ENDPOINTING_ENABLED and SILERO_AVAILABLE
+                            # are both true) -- replaces the webrtcvad is_speech +
+                            # manual silence_duration_ms timer below with the
+                            # Endpointer state machine, fed the SAME 16kHz-resampled
+                            # frame (vad_chunk) the webrtcvad path computed above.
+                            endpoint_state = endpointer.update(vad_chunk)
+                            if not speech_detected and endpoint_state.speech_started:
                                 logger.info("🎤 Speech detected, starting active recording")
                                 if VAD_DEBUG:
                                     logger.info(f"[VAD_DEBUG] STATE CHANGE: WAITING_FOR_SPEECH -> SPEECH_ACTIVE at t={recording_duration:.1f}s")
                                 speech_detected = True
-                                silence_duration_ms = 0
-                            # No timeout in this state - just keep waiting
-                            # The only exit is speech detection or max_duration
-                        else:
-                            # We have detected speech at some point
-                            if is_speech:
-                                # SPEECH_ACTIVE state - reset silence counter.
-                                # Append-to-turn (founder-os#11655): if speech resumes
-                                # AFTER the normal silence threshold but within the
-                                # extra append window, it continues the SAME turn.
-                                if _append_ms > 0 and silence_duration_ms >= SILENCE_THRESHOLD_MS:
-                                    logger.info(f"➕ append-to-turn: speech resumed within window (was {silence_duration_ms}ms silent) — continuing same turn")
-                                silence_duration_ms = 0
-                            else:
-                                # SILENCE_AFTER_SPEECH state - accumulate silence
-                                silence_duration_ms += VAD_CHUNK_DURATION_MS
-                                if VAD_DEBUG and silence_duration_ms % 100 == 0:  # More frequent logging in debug mode
-                                    logger.info(f"[VAD_DEBUG] Accumulating silence: {silence_duration_ms}/{SILENCE_THRESHOLD_MS}ms, t={recording_duration:.1f}s")
-                                elif silence_duration_ms % 200 == 0:  # Log every 200ms
-                                    logger.debug(f"Silence: {silence_duration_ms}ms")
-                                
-                                # Check if we should stop due to silence threshold
-                                # Use the larger of MIN_RECORDING_DURATION (global) or min_duration (parameter)
+                            if VAD_DEBUG and int(recording_duration * 1000) % 500 == 0:
+                                logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: speech_prob={endpoint_state.speech_prob:.3f}, "
+                                            f"speech_started={endpoint_state.speech_started}, endpointed={endpoint_state.endpointed}")
+
+                            if endpoint_state.endpointed:
+                                # Use the larger of MIN_RECORDING_DURATION (global) or
+                                # min_duration (parameter) -- same floor as the
+                                # webrtcvad path, so a too-early endpoint can't return
+                                # a clipped recording.
                                 effective_min_duration = max(MIN_RECORDING_DURATION, min_duration)
-                                # Append-to-turn (founder-os#11655): extend the trailing-
-                                # silence threshold by the append window. _append_ms=0
-                                # (default) → identical to prior behavior.
-                                _silence_stop_threshold = SILENCE_THRESHOLD_MS + _append_ms
-                                if recording_duration >= effective_min_duration and silence_duration_ms >= _silence_stop_threshold:
-                                    logger.info(f"✓ Silence threshold reached after {recording_duration:.1f}s of recording")
-                                    if VAD_DEBUG:
-                                        logger.info(f"[VAD_DEBUG] STOP: silence_duration={silence_duration_ms}ms >= threshold={_silence_stop_threshold}ms")
-                                        logger.info(f"[VAD_DEBUG] STOP: recording_duration={recording_duration:.1f}s >= min_duration={effective_min_duration}s")
+                                if recording_duration >= effective_min_duration:
+                                    logger.info(f"✓ Endpoint detected after {recording_duration:.1f}s of recording (Silero)")
                                     stop_recording = True
-                                elif VAD_DEBUG and recording_duration < effective_min_duration:
-                                    if int(recording_duration * 1000) % 500 == 0:  # Log every 500ms
-                                        logger.info(f"[VAD_DEBUG] Min duration not met: {recording_duration:.1f}s < {effective_min_duration}s")
-                        
+                                elif VAD_DEBUG and int(recording_duration * 1000) % 500 == 0:
+                                    logger.info(f"[VAD_DEBUG] Min duration not met: {recording_duration:.1f}s < {effective_min_duration}s")
+                        else:
+                            # Check if chunk contains speech
+                            try:
+                                is_speech = vad.is_speech(chunk_bytes, vad_sample_rate)
+                                # ENERGY GATE (driving profile): webrtcvad has no energy
+                                # floor, so steady road/engine noise reads as "speech" and
+                                # the silence counter never accumulates → the mic hangs.
+                                # When an energy threshold is set, a chunk only counts as
+                                # speech if it ALSO clears the RMS floor; below-floor chunks
+                                # (road rumble) are treated as silence so end-of-turn is
+                                # detected. Disabled (==0) → pure-webrtcvad, unchanged.
+                                if is_speech and VAD_ENERGY_THRESHOLD > 0:
+                                    chunk_rms = float(np.sqrt(np.mean(chunk.astype(float) ** 2)))
+                                    if chunk_rms < VAD_ENERGY_THRESHOLD:
+                                        is_speech = False
+                                        if VAD_DEBUG and int(recording_duration * 1000) % 500 == 0:
+                                            logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: energy-gated (RMS={chunk_rms:.0f} < floor={VAD_ENERGY_THRESHOLD:.0f}) -> silence")
+                                if VAD_DEBUG:
+                                    # Log VAD decision every 500ms for less spam
+                                    if int(recording_duration * 1000) % 500 == 0:
+                                        rms = np.sqrt(np.mean(chunk.astype(float)**2))
+                                        logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: speech={is_speech}, RMS={rms:.0f}, floor={VAD_ENERGY_THRESHOLD:.0f}, state={'WAITING' if not speech_detected else 'ACTIVE'}")
+                            except Exception as vad_e:
+                                logger.warning(f"VAD error: {vad_e}, treating as speech")
+                                is_speech = True
+
+                            # State machine for speech detection
+                            if not speech_detected:
+                                # WAITING_FOR_SPEECH state
+                                if is_speech:
+                                    logger.info("🎤 Speech detected, starting active recording")
+                                    if VAD_DEBUG:
+                                        logger.info(f"[VAD_DEBUG] STATE CHANGE: WAITING_FOR_SPEECH -> SPEECH_ACTIVE at t={recording_duration:.1f}s")
+                                    speech_detected = True
+                                    silence_duration_ms = 0
+                                # No timeout in this state - just keep waiting
+                                # The only exit is speech detection or max_duration
+                            else:
+                                # We have detected speech at some point
+                                if is_speech:
+                                    # SPEECH_ACTIVE state - reset silence counter.
+                                    # Append-to-turn (founder-os#11655): if speech resumes
+                                    # AFTER the normal silence threshold but within the
+                                    # extra append window, it continues the SAME turn.
+                                    if _append_ms > 0 and silence_duration_ms >= SILENCE_THRESHOLD_MS:
+                                        logger.info(f"➕ append-to-turn: speech resumed within window (was {silence_duration_ms}ms silent) — continuing same turn")
+                                    silence_duration_ms = 0
+                                else:
+                                    # SILENCE_AFTER_SPEECH state - accumulate silence
+                                    silence_duration_ms += VAD_CHUNK_DURATION_MS
+                                    if VAD_DEBUG and silence_duration_ms % 100 == 0:  # More frequent logging in debug mode
+                                        logger.info(f"[VAD_DEBUG] Accumulating silence: {silence_duration_ms}/{SILENCE_THRESHOLD_MS}ms, t={recording_duration:.1f}s")
+                                    elif silence_duration_ms % 200 == 0:  # Log every 200ms
+                                        logger.debug(f"Silence: {silence_duration_ms}ms")
+
+                                    # Check if we should stop due to silence threshold
+                                    # Use the larger of MIN_RECORDING_DURATION (global) or min_duration (parameter)
+                                    effective_min_duration = max(MIN_RECORDING_DURATION, min_duration)
+                                    # Append-to-turn (founder-os#11655): extend the trailing-
+                                    # silence threshold by the append window. _append_ms=0
+                                    # (default) → identical to prior behavior.
+                                    _silence_stop_threshold = SILENCE_THRESHOLD_MS + _append_ms
+                                    if recording_duration >= effective_min_duration and silence_duration_ms >= _silence_stop_threshold:
+                                        logger.info(f"✓ Silence threshold reached after {recording_duration:.1f}s of recording")
+                                        if VAD_DEBUG:
+                                            logger.info(f"[VAD_DEBUG] STOP: silence_duration={silence_duration_ms}ms >= threshold={_silence_stop_threshold}ms")
+                                            logger.info(f"[VAD_DEBUG] STOP: recording_duration={recording_duration:.1f}s >= min_duration={effective_min_duration}s")
+                                        stop_recording = True
+                                    elif VAD_DEBUG and recording_duration < effective_min_duration:
+                                        if int(recording_duration * 1000) % 500 == 0:  # Log every 500ms
+                                            logger.info(f"[VAD_DEBUG] Min duration not met: {recording_duration:.1f}s < {effective_min_duration}s")
+
                         recording_duration += chunk_duration_s
                             
                     except queue.Empty:
