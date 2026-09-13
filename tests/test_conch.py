@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from voice_mode.conch import Conch
+from voice_mode.conch import Conch, ConchUnavailable
 
 
 @pytest.fixture
@@ -591,17 +591,18 @@ class TestConchFailClosed:
     def test_unreadable_lock_refuses_acquire_when_no_flock_held(self, caplog):
         """A corrupt lock file must NOT read as "microphone free".
 
-        The dangerous shape: a holder that took the lock through the
-        documented context-manager/acquire() API holds NO flock, so the flock
-        in try_acquire() cannot protect it. Before the fix, the corrupt-read
-        exception was swallowed into "no conversation active" and the
-        contender acquired a second lock while the first holder was live.
+        The dangerous shape: a lock record whose holder holds NO flock, so the
+        flock in try_acquire() cannot protect it -- a record left by a legacy
+        writer, or by the flock-less arm of preempt_acquire(). Before the fix,
+        the corrupt-read exception was swallowed into "no conversation active"
+        and the contender acquired while a live holder was recorded.
         """
-        holder = Conch(agent_name="holder")
-        holder.acquire()  # documented context-manager path -- no flock taken
-        assert Conch.LOCK_FILE.exists()
-
-        # Corrupt the record in place (same inode).
+        Conch.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # A live, flock-less holder record, then corrupted in place.
+        Conch.LOCK_FILE.write_text(json.dumps({
+            "pid": os.getpid(), "agent": "holder",
+            "acquired": datetime.now().isoformat(), "expires": None,
+        }))
         Conch.LOCK_FILE.write_text('{"pid": 1234, "agen')
 
         contender = Conch(agent_name="contender")
@@ -619,8 +620,6 @@ class TestConchFailClosed:
             "the unreadable-lock condition was silently absorbed; it must be "
             f"logged. Records seen: {[r.getMessage() for r in caplog.records]}"
         )
-
-        holder.release()
 
     def test_unreadable_lock_is_logged_even_when_flock_also_refuses(self, caplog):
         """The flock refusal must not mask the unreadable-lock condition.
@@ -794,3 +793,215 @@ class TestConchFailClosed:
         assert rescuer.preempt_acquire("rescuer") is True
         assert json.loads(Conch.LOCK_FILE.read_text())["agent"] == "rescuer"
         rescuer.release()
+
+class TestConchSupersession:
+    """Preemption must REVOKE the conch, never ORPHAN the old holder.
+
+    `flock` cannot be revoked from outside its holder, so preempt_acquire()
+    used to unlink the lock file instead -- leaving the superseded holder
+    flocking a deleted inode where it could never learn it had lost. Two live
+    processes, both entitled to speak. The monotonic epoch replaces that: the
+    record is rewritten in place, and the old holder can SEE it changed.
+    """
+
+    def test_preempt_does_not_unlink_and_bumps_the_epoch(self):
+        """The inode must survive preemption, and the epoch must advance."""
+        holder = Conch(agent_name="holder")
+        assert holder.try_acquire() is True
+        inode_before = os.stat(Conch.LOCK_FILE).st_ino
+        first_epoch = json.loads(Conch.LOCK_FILE.read_text())[Conch.EPOCH_KEY]
+        assert first_epoch == 1
+
+        preempter = Conch(agent_name="preempter")
+        assert preempter.preempt_acquire("preempter") is True
+
+        inode_after = os.stat(Conch.LOCK_FILE).st_ino
+        assert inode_after == inode_before, (
+            f"preempt_acquire() unlinked the lock: inode {inode_before} -> "
+            f"{inode_after}. The superseded holder keeps its flock on the old "
+            f"inode and can never learn it lost -- two live holders."
+        )
+        record = json.loads(Conch.LOCK_FILE.read_text())
+        assert record["agent"] == "preempter"
+        assert record["pid"] == os.getpid()
+        assert record[Conch.EPOCH_KEY] == first_epoch + 1, (
+            "preemption must advance the epoch, or supersession is undetectable"
+        )
+
+    def test_superseded_holder_detects_it_and_stands_down(self):
+        """The holder-side half: the old holder must SEE that it lost."""
+        holder = Conch(agent_name="holder")
+        assert holder.try_acquire() is True
+        assert holder.is_superseded() is False, "holder is not superseded yet"
+        assert holder.should_yield() is False
+
+        preempter = Conch(agent_name="preempter")
+        assert preempter.preempt_acquire("preempter") is True
+
+        assert holder.is_superseded() is True, (
+            "the superseded holder cannot tell it lost the conch -- it will "
+            "keep speaking alongside the preempter"
+        )
+        assert holder.should_yield() is True, (
+            "should_yield() must report supersession so the listen loop ends"
+        )
+
+    def test_should_yield_is_a_valid_zero_arg_callable_for_the_listen_loop(self):
+        """Contract check for converse.py's `listen_yield_check`.
+
+        The record loop polls a bound zero-arg callable and breaks on True.
+        """
+        holder = Conch(agent_name="holder")
+        assert holder.try_acquire() is True
+        check = holder.should_yield  # exactly what converse.py passes
+        assert check() is False
+
+        Conch(agent_name="preempter").preempt_acquire("preempter")
+        assert check() is True
+
+    def test_converse_wires_should_yield_into_the_listen_loop(self):
+        """Wiring guard: the holder-side check must stay connected.
+
+        Both halves of this fix are useless alone -- an epoch nobody reads
+        changes nothing. This pins the one expression in converse.py that
+        connects them, so a future refactor cannot silently unwire it.
+        """
+        import voice_mode.tools.converse as conv
+        source = Path(conv.__file__).read_text()
+        assert "listen_yield_check" in source
+        assert "conch.should_yield" in source, (
+            "converse.py no longer passes conch.should_yield as the listen "
+            "yield check -- a superseded holder will not stand down"
+        )
+
+    def test_superseded_holder_release_keeps_the_new_holders_record(self):
+        """A superseded holder's release() must not delete the new record.
+
+        Same damage class as a non-holder release: the preempter is left with
+        no lock file while believing it holds the conch.
+        """
+        holder = Conch(agent_name="holder")
+        assert holder.try_acquire() is True
+        preempter = Conch(agent_name="preempter")
+        assert preempter.preempt_acquire("preempter") is True
+
+        holder.release()  # stands down
+
+        assert Conch.LOCK_FILE.exists(), (
+            "the superseded holder deleted the preempter's lock file"
+        )
+        assert json.loads(Conch.LOCK_FILE.read_text())["agent"] == "preempter"
+
+    def test_unsuperseded_holder_release_still_removes_the_lock(self):
+        """Guard the other direction: a real holder must still clean up."""
+        holder = Conch(agent_name="holder")
+        assert holder.try_acquire() is True
+        holder.release()
+        assert not Conch.LOCK_FILE.exists()
+
+    def test_supersession_is_honoured_even_when_yield_is_disabled(self):
+        """is_superseded is a FACT; is_wanted is a REQUEST.
+
+        VOICEMODE_CONCH_YIELD_ENABLED=false opts out of polite hand-over. It
+        must not opt out of standing down from a conch we no longer hold.
+        """
+        holder = Conch(agent_name="holder")
+        assert holder.try_acquire() is True
+
+        with patch("voice_mode.conch._get_yield_enabled", return_value=False):
+            # A mere request is ignored when yielding is off...
+            Conch.WANTED_FILE.parent.mkdir(parents=True, exist_ok=True)
+            Conch.WANTED_FILE.write_text(json.dumps({
+                "pid": 1, "agent": "asker",
+                "requested": datetime.now().isoformat(),
+            }))
+            assert holder.should_yield() is False
+
+            # ...but an actual supersession is not.
+            Conch(agent_name="preempter").preempt_acquire("preempter")
+            assert holder.should_yield() is True
+
+    def test_preempt_recovers_a_corrupt_lock_without_unlinking(self):
+        """The safe recovery path out of a fail-closed corrupt lock.
+
+        try_acquire() now refuses an unreadable lock forever, so preemption is
+        the escape hatch -- and it must be the SAFE one: same inode, epoch
+        restarted at 1 because the old record's epoch is unreadable.
+        """
+        Conch.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        Conch.LOCK_FILE.write_text("}{ garbage")
+        inode_before = os.stat(Conch.LOCK_FILE).st_ino
+
+        blocked = Conch(agent_name="blocked")
+        assert blocked.try_acquire() is False
+
+        rescuer = Conch(agent_name="rescuer")
+        assert rescuer.preempt_acquire("rescuer") is True
+        assert os.stat(Conch.LOCK_FILE).st_ino == inode_before, (
+            "corrupt-lock recovery unlinked instead of rewriting in place"
+        )
+        record = json.loads(Conch.LOCK_FILE.read_text())
+        assert record["agent"] == "rescuer"
+        assert record[Conch.EPOCH_KEY] == 1
+        rescuer.release()
+
+    def test_epoch_is_monotonic_across_successive_in_place_takeovers(self):
+        """Each takeover of the same inode advances the generation counter."""
+        import fcntl as _fcntl
+        seen = []
+        for agent in ("a", "b", "c"):
+            c = Conch(agent_name=agent)
+            assert c.preempt_acquire(agent) is True
+            seen.append(json.loads(Conch.LOCK_FILE.read_text())[Conch.EPOCH_KEY])
+            # Drop our flock but LEAVE the record, so the next takeover reads it.
+            c._acquired = False
+            if c._fd is not None:
+                _fcntl.flock(c._fd, _fcntl.LOCK_UN)
+                os.close(c._fd)
+                c._fd = None
+        assert seen == [1, 2, 3], f"epoch not monotonic: {seen}"
+
+    def test_is_superseded_is_false_for_a_process_that_never_held_it(self):
+        """No claim, nothing to lose -- must not report supersession."""
+        never = Conch(agent_name="never")
+        assert never.is_superseded() is False
+        assert never.should_yield() is False
+
+
+class TestConchAcquireIsAtomic:
+    """acquire() / `with Conch(...)` must not stomp the current holder."""
+
+    def test_acquire_returns_false_when_another_process_holds_it(self):
+        """acquire() used to be a bare write_text() that always returned True."""
+        holder = Conch(agent_name="holder")
+        assert holder.try_acquire() is True
+
+        contender = Conch(agent_name="contender")
+        assert contender.acquire() is False, (
+            "acquire() overwrote a live holder's lock and reported success"
+        )
+        assert json.loads(Conch.LOCK_FILE.read_text())["agent"] == "holder"
+        holder.release()
+
+    def test_context_manager_refuses_to_enter_without_the_lock(self):
+        """`with Conch(...)` must raise rather than run the body unlocked."""
+        holder = Conch(agent_name="holder")
+        assert holder.try_acquire() is True
+
+        body_ran = False
+        with pytest.raises(ConchUnavailable):
+            with Conch(agent_name="intruder"):
+                body_ran = True
+
+        assert body_ran is False, (
+            "the context-manager body ran while another agent held the conch"
+        )
+        assert json.loads(Conch.LOCK_FILE.read_text())["agent"] == "holder"
+        holder.release()
+
+    def test_acquire_takes_a_real_flock(self):
+        """After acquire(), a second atomic attempt must be refused."""
+        holder = Conch(agent_name="holder")
+        assert holder.acquire() is True
+        assert Conch(agent_name="other").try_acquire() is False
+        holder.release()

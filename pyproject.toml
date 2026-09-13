@@ -195,6 +195,7 @@ markers = [
     "integration: Integration tests (may interact with services)",
     "slow: Tests that take > 1s",
     "manual: Manual tests requiring human interaction",
+    "real_microphone: Test genuinely needs the real input device (opts out of the conftest microphone guard)",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

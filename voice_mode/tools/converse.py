@@ -2214,14 +2214,19 @@ consult the MCP resources listed above.
                 if event_logger:
                     event_logger.log_event(event_logger.RECORDING_START)
 
-                # Yieldable listen (vibedispatcher#132): while we hold the conch
-                # and are merely LISTENING (idle), another agent's request ends
-                # the listen early so the mic can be handed over. Only wired when
-                # we actually hold the conch (skip_conch bypass never yields).
+                # Yieldable listen (vibedispatcher#132) + in-place supersession:
+                # while we hold the conch and are merely LISTENING (idle), we end
+                # the listen early either because another agent ASKED for the mic
+                # (Conch.is_wanted, config-gated) or because a preempter has
+                # already TAKEN it from us in place (Conch.is_superseded, always
+                # honoured). Conch.should_yield composes both; it self-gates on
+                # CONCH_YIELD_ENABLED for the request half, so the supersession
+                # check still runs when polite hand-over is switched off.
+                # Only wired when we actually hold the conch (skip_conch never yields).
                 yield_state = {"yielded": False}
                 listen_yield_check = (
-                    Conch.is_wanted
-                    if (CONCH_ENABLED and CONCH_YIELD_ENABLED and conch._acquired)
+                    conch.should_yield
+                    if (CONCH_ENABLED and conch._acquired)
                     else None
                 )
 
