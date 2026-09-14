@@ -1130,6 +1130,45 @@ def is_resume_phrase(text: Optional[str]) -> bool:
     return any(norm == _normalize_phrase(p) for p in STEP_AWAY_RESUME_PHRASES)
 
 
+def _format_truncation_note(tts_metrics: dict) -> Optional[str]:
+    """Render the W3c barge-in truncation-context block for the converse
+    tool result -- the one place the calling agent actually reads (see
+    voice_mode/streaming.py / voice_mode/truncation.py for how these
+    numbers were derived). Returns None when `tts_metrics` doesn't describe
+    a truncated turn, so callers can unconditionally prepend the result.
+
+    William's rule (see the convomode skill for the full statement):
+    everything reported here as "delivered" counts as heard, and is
+    probably what he's responding to; the "undelivered" remainder is
+    neither spoken nor assumed heard — the agent decides whether to fold
+    it into the next reply or bring it back later.
+    """
+    if not tts_metrics or not tts_metrics.get('truncated'):
+        return None
+
+    delivered = tts_metrics.get('delivered_text') or ""
+    undelivered = tts_metrics.get('undelivered_text') or ""
+    fraction = tts_metrics.get('delivered_fraction')
+    confidence = tts_metrics.get('truncation_confidence') or "unknown"
+    basis = tts_metrics.get('truncation_basis') or ""
+
+    pct = f"{fraction * 100:.0f}%" if isinstance(fraction, (int, float)) else "an unknown fraction"
+
+    lines = [
+        f"[TTS INTERRUPTED — William talked over you. Estimated ~{pct} of your reply "
+        f"was delivered before playback cut off (confidence: {confidence} — a "
+        f"sentence-boundary estimate, not a word-level position; see basis below).",
+        f"  Delivered (counts as heard — he's probably responding to this): "
+        f"\"{delivered}\"" if delivered else "  Delivered: (nothing — cut before any full sentence was heard)",
+        f"  NOT delivered (do not assume he heard this): \"{undelivered}\"" if undelivered
+        else "  Not delivered: (nothing — the estimate says the whole message got out)",
+        f"  Basis: {basis}" if basis else None,
+        "  Your call: fold the undelivered remainder into your next reply, or bring it "
+        "back later — whichever fits what the interruption was about.]",
+    ]
+    return "\n".join(line for line in lines if line)
+
+
 class StepAwayTracker:
     """Pure state machine for graceful step-away during an IDLE listen (Gaps 1 & 2).
 
@@ -2239,6 +2278,14 @@ consult the MCP resources listed above.
                         result = "✓ Message spoken successfully"
                     else:
                         result = f"✓ Message spoken successfully{timing_info}"
+
+                    # W3c: speak-only calls can still be barge-in'd (the
+                    # natural-mode listener is armed independent of
+                    # wait_for_response) — surface it here too.
+                    truncation_note = _format_truncation_note(tts_metrics)
+                    if truncation_note:
+                        result = f"{truncation_note}\n{result}"
+
                     logger.info(f"Speak-only result: {result}")
                     return result
 
@@ -2872,6 +2919,17 @@ consult the MCP resources listed above.
                 else:
                     result = f"No speech detected | Timing: {timing_str}"
                 success = True  # Not an error, just no speech
+
+            # W3c: surface barge-in truncation context (if any) ahead of the
+            # voice response itself -- this is metadata about what WE said,
+            # independent of whether his reply was captured, so it applies
+            # to every branch above. See _format_truncation_note's docstring
+            # + voice_mode/truncation.py for the precision this can and
+            # can't claim.
+            truncation_note = _format_truncation_note(tts_metrics if 'tts_metrics' in locals() else None)
+            if truncation_note:
+                result = f"{truncation_note}\n{result}"
+
             return result
                 
         except Exception as e:
