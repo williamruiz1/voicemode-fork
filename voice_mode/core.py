@@ -313,7 +313,22 @@ async def text_to_speech(
                 # Pass through audio path if it exists
                 if stream_metrics.audio_path:
                     metrics['audio_path'] = stream_metrics.audio_path
-                
+
+                # Barge-in truncation context (W3c) -- pass through untouched
+                # so the caller (voice_mode/tools/converse.py) can decide how
+                # to use it. See voice_mode/truncation.py for what these
+                # numbers do and don't mean -- everything but
+                # elapsed_audio_seconds is an ESTIMATE, never exact.
+                if stream_metrics.truncated:
+                    metrics['truncated'] = True
+                    metrics['delivered_text'] = stream_metrics.delivered_text
+                    metrics['undelivered_text'] = stream_metrics.undelivered_text
+                    metrics['delivered_fraction'] = stream_metrics.delivered_fraction
+                    metrics['elapsed_audio_seconds'] = stream_metrics.elapsed_audio_seconds
+                    metrics['estimated_total_seconds'] = stream_metrics.estimated_total_seconds
+                    metrics['truncation_confidence'] = stream_metrics.truncation_confidence
+                    metrics['truncation_basis'] = stream_metrics.truncation_basis
+
                 logger.info(f"✓ TTS streamed successfully - TTFA: {metrics['ttfa']:.3f}s")
                 
                 # Save debug files if needed (we'd need to capture the full audio)
