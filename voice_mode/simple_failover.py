@@ -350,6 +350,113 @@ async def simple_stt_failover(
                 successful_metrics = metrics
 
         except Exception as e:
+            # [voice-stt-rca 2026-09-11] In-band self-heal-and-retry: a local
+            # whisper.cpp endpoint that times out mid-conversation gets the
+            # SAME kickstart the background watcher would eventually apply
+            # (whisper-stt-self-heal.sh --recover-now, shared cooldown state
+            # with that watcher — the two paths can never double-kick), but
+            # applied the instant the failure is observed instead of waiting
+            # up to ~15min for that watcher's next tick (the gap that let
+            # this exact class of failure reach William live, 2026-09-11
+            # ~20:14 EDT). Bounded to exactly ONE extra attempt per call to
+            # this function; any failure here falls straight through to the
+            # existing error handling below, unchanged.
+            if is_local_provider(base_url) and not locals().get("_voicemode_recovery_attempted"):
+                _voicemode_recovery_attempted = True
+                error_text_lower = str(e).lower()
+                if ("timed out" in error_text_lower or "timeout" in error_text_lower
+                        or "connect" in error_text_lower):
+                    try:
+                        import asyncio as _asyncio
+                        import os as _os
+                        recover_script = _os.path.expanduser(
+                            "~/.local/bin/founder-os/whisper-stt-self-heal.sh"
+                        )
+                        if _os.path.exists(recover_script):
+                            logger.warning(
+                                "STT: local endpoint timed out — attempting in-band "
+                                "self-heal (whisper-stt-self-heal.sh --recover-now) "
+                                "before giving up on this turn"
+                            )
+                            proc = await _asyncio.create_subprocess_exec(
+                                recover_script, "--recover-now",
+                                stdout=_asyncio.subprocess.PIPE,
+                                stderr=_asyncio.subprocess.PIPE,
+                            )
+                            try:
+                                await _asyncio.wait_for(proc.wait(), timeout=100.0)
+                            except _asyncio.TimeoutError:
+                                proc.kill()
+                                await proc.wait()
+                            if proc.returncode == 0:
+                                logger.warning(
+                                    "STT: self-heal reported recovered — retrying this "
+                                    "request once on the same endpoint"
+                                )
+                                try:
+                                    audio_file.seek(start_pos)
+                                    retry_client = AsyncOpenAI(
+                                        api_key=(OPENAI_API_KEY or "dummy-key-for-local"),
+                                        base_url=base_url,
+                                        timeout=60.0,
+                                        max_retries=0,
+                                    )
+                                    retry_kwargs = {
+                                        "model": resolved_model,
+                                        "file": audio_file,
+                                        "response_format": "text",
+                                        "language": "auto",
+                                    }
+                                    if STT_PROMPT:
+                                        retry_kwargs["prompt"] = STT_PROMPT
+                                    retry_start = time.perf_counter()
+                                    retry_transcription = await retry_client.audio.transcriptions.create(**retry_kwargs)
+                                    retry_time_ms = (time.perf_counter() - retry_start) * 1000
+                                    retry_text = (
+                                        retry_transcription.strip()
+                                        if isinstance(retry_transcription, str)
+                                        else retry_transcription.text.strip()
+                                    )
+                                    if retry_text:
+                                        logger.info(
+                                            f"✓ STT succeeded on in-band-recovered retry "
+                                            f"({retry_time_ms:.0f}ms)"
+                                        )
+                                        return {
+                                            "text": retry_text,
+                                            "provider": detect_provider_type(base_url),
+                                            "endpoint": base_url,
+                                            "metrics": {
+                                                "file_size_bytes": file_size_bytes,
+                                                "request_time_ms": round(retry_time_ms, 1),
+                                                "is_local": True,
+                                                "recovered_inband": True,
+                                            },
+                                        }
+                                    # Retry connected but got empty text — treat like the
+                                    # existing "successful but empty" path below.
+                                    successful_but_empty = True
+                                    successful_provider = detect_provider_type(base_url)
+                                    successful_metrics = {
+                                        "file_size_bytes": file_size_bytes,
+                                        "request_time_ms": round(retry_time_ms, 1),
+                                        "is_local": True,
+                                        "recovered_inband": True,
+                                    }
+                                    continue
+                                except Exception as retry_exc:
+                                    logger.error(
+                                        f"STT: in-band-recovered retry also failed: {retry_exc}"
+                                    )
+                                    e = retry_exc
+                            else:
+                                logger.error(
+                                    f"STT: self-heal could not recover in-band "
+                                    f"(exit={proc.returncode}) — surfacing original timeout"
+                                )
+                    except Exception as heal_exc:
+                        logger.error(f"STT: in-band self-heal attempt itself errored: {heal_exc}")
+
             error_str = str(e)
             provider_type = detect_provider_type(base_url)
 
