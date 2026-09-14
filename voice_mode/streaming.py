@@ -25,10 +25,12 @@ from .config import (
     STREAM_MAX_BUFFER,
     SAMPLE_RATE,
     TTS_TRAILING_SILENCE,
+    BARGE_IN_TRIGGER_MS,
     logger
 )
 from .utils import get_event_logger, update_latest_symlinks
 from . import audio_player
+from .truncation import estimate_truncation
 
 
 
@@ -52,6 +54,22 @@ class StreamMetrics:
     chunks_received: int = 0
     chunks_played: int = 0
     audio_path: Optional[str] = None  # Path to saved audio file
+
+    # --- Barge-in truncation context (W3c) ---------------------------------
+    # Populated ONLY when playback was actually halted mid-message by
+    # audio_player.barge_in_triggered() (see stream_pcm_audio below).
+    # elapsed_audio_seconds is EXACT (derived from bytes actually written to
+    # the output stream); everything else here is an ESTIMATE -- see
+    # voice_mode/truncation.py's module docstring for why a better-than-
+    # sentence-boundary split isn't available.
+    truncated: bool = False
+    delivered_text: Optional[str] = None
+    undelivered_text: Optional[str] = None
+    delivered_fraction: Optional[float] = None       # 0.0-1.0, ESTIMATED
+    elapsed_audio_seconds: Optional[float] = None    # EXACT: audio actually written before the cut
+    estimated_total_seconds: Optional[float] = None  # ESTIMATED: full-message speaking time
+    truncation_confidence: Optional[str] = None      # e.g. "sentence-boundary-estimate"
+    truncation_basis: Optional[str] = None           # human-readable one-liner: how the split was derived
 
 
 class AudioStreamPlayer:
@@ -300,9 +318,29 @@ async def stream_pcm_audio(
         ) as response:
             chunk_count = 0
             bytes_received = 0
-            
+
             # Stream chunks as they arrive
             async for chunk in response.iter_bytes(chunk_size=STREAM_CHUNK_SIZE):
+                # Barge-in check (W3c): audio_player.trigger_barge_in() was
+                # never wired to anything that actually stops THIS loop --
+                # only NonBlockingAudioPlayer's callback (a different
+                # playback path) checked the flag. Without this check,
+                # streamed PCM playback (the default) plays every message to
+                # completion regardless of barge-in, so there was never
+                # anything to truncate. Checked once per received network
+                # chunk (not per audio callback), so the stop can lag the
+                # true trigger instant by up to ~one chunk's worth of audio
+                # (STREAM_CHUNK_SIZE bytes, ~85ms at the default 24kHz/16-bit
+                # mono) plus whatever's already buffered in PortAudio ahead
+                # of the speaker -- bytes_received below only counts what
+                # was actually handed to stream.write() before this fires.
+                if audio_player.barge_in_triggered():
+                    logger.info(
+                        f"🛑 Barge-in: halting streamed TTS after {bytes_received} bytes "
+                        f"({chunk_count} chunks) written to the output stream"
+                    )
+                    metrics.truncated = True
+                    break
                 if chunk:
                     # Track first chunk received
                     if first_chunk_time is None:
@@ -345,9 +383,60 @@ async def stream_pcm_audio(
                     if debug and chunk_count % 10 == 0:
                         logger.debug(f"Streamed {chunk_count} chunks, {bytes_received} bytes")
         
-        # Wait for playback to finish
-        stream.stop()
-        
+        if metrics.truncated:
+            # Immediate cut, matching NonBlockingAudioPlayer's mid-buffer
+            # stop (audio_player.py's _audio_callback) -- abort() drops
+            # whatever's still sitting in PortAudio's ring buffer instead of
+            # letting it drain (stream.stop()'s normal behaviour), so
+            # bytes_received stays the closest available measure of what
+            # was actually audible.
+            try:
+                stream.abort()
+            except Exception as e:
+                logger.debug(f"stream.abort() failed, falling back to stop(): {e}")
+                stream.stop()
+
+            # elapsed_audio_seconds is EXACT (16-bit mono PCM at SAMPLE_RATE
+            # -- 2 bytes/sample). The barge-in listener only fires after
+            # BARGE_IN_TRIGGER_MS of sustained speech (voice_mode/
+            # barge_in.py), so he was already talking for at least that long
+            # before trigger_barge_in() was ever called -- subtracting it
+            # gives a better (still approximate) bound on how much of the
+            # audio he actually heard without talking over it, rather than
+            # compounding that known lag into the "delivered" estimate.
+            elapsed_audio_seconds = bytes_received / (SAMPLE_RATE * 2)
+            interruption_lead_seconds = BARGE_IN_TRIGGER_MS / 1000.0
+            effective_seconds = max(0.0, elapsed_audio_seconds - interruption_lead_seconds)
+            metrics.elapsed_audio_seconds = round(elapsed_audio_seconds, 3)
+
+            try:
+                estimate = estimate_truncation(text, effective_seconds)
+                metrics.delivered_text = estimate.delivered_text
+                metrics.undelivered_text = estimate.undelivered_text
+                metrics.delivered_fraction = estimate.delivered_fraction
+                metrics.estimated_total_seconds = estimate.estimated_total_seconds
+                metrics.truncation_confidence = estimate.confidence
+                metrics.truncation_basis = (
+                    f"{estimate.basis} (measured {elapsed_audio_seconds:.2f}s of audio "
+                    f"actually written to the output stream; {interruption_lead_seconds:.2f}s "
+                    f"subtracted for the barge-in detector's own {BARGE_IN_TRIGGER_MS}ms "
+                    f"speech-run threshold, since he was already talking that long before "
+                    f"the trigger fired)"
+                )
+            except Exception as e:
+                # Never let the text-alignment estimate break the truncation
+                # report -- the exact audio-time numbers above still stand
+                # on their own even if this fails.
+                logger.error(f"truncation-context text estimate failed: {e}")
+                metrics.truncation_confidence = "audio-time-only"
+                metrics.truncation_basis = (
+                    f"{elapsed_audio_seconds:.2f}s of audio reached the output stream before "
+                    f"the cut; could not map this back onto the message text ({e})"
+                )
+        else:
+            # Wait for playback to finish
+            stream.stop()
+
         end_time = time.perf_counter()
 
         # Log TTS playback end with metrics

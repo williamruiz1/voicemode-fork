@@ -1101,6 +1101,20 @@ STREAM_MAX_BUFFER = float(os.getenv("VOICEMODE_STREAM_MAX_BUFFER", "2.0"))  # Ma
 # This is silence — it adds no perceived delay to the user.
 TTS_TRAILING_SILENCE = float(os.getenv("VOICEMODE_TTS_TRAILING_SILENCE", "0.5"))
 
+# Barge-in truncation-context estimate (W3c, voice_mode/truncation.py). When
+# barge-in cuts streamed TTS playback mid-message, the streaming layer knows
+# EXACTLY how much audio it wrote to the output device before it stopped --
+# but not how long the FULL, uninterrupted message would have taken, since
+# streaming TTS never reports a total duration up front, and neither Kokoro
+# nor OpenAI's streaming endpoints return word-level timestamps to align
+# against. The only way to turn "N seconds of audio played" into "roughly
+# this much of the text was heard" is to assume a speaking rate. 150 words/
+# min (~2.5 words/sec) is a commonly-cited average conversational speech
+# rate (the same order of magnitude used in closed-captioning timing
+# guidance); override this if a given voice/speed setting runs consistently
+# faster or slower than that in practice.
+TTS_ESTIMATED_WPM = int(os.getenv("VOICEMODE_TTS_ESTIMATED_WPM", "150"))
+
 # ==================== EVENT LOGGING CONFIGURATION ====================
 
 # Event logging configuration
