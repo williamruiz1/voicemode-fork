@@ -259,6 +259,15 @@ class TestResetWiredInStart:
 
     def test_start_resets_the_aec(self, monkeypatch):
         from unittest.mock import patch
+        import pytest
+
+        # The per-turn AEC reset is SCOPED to the aec3 engine (integration nit
+        # 2026-09-15: NLMS/speex keep their beneficial cross-turn convergence).
+        # So this assertion only applies where AEC3 is available/selected; on a
+        # box without pywebrtc-audio the engine is nlms and reset is (correctly)
+        # not called -- skip rather than fail.
+        if not getattr(bi, "AEC3_AVAILABLE", False):
+            pytest.skip("AEC3 not installed; per-turn reset is aec3-scoped")
 
         monkeypatch.setattr(bi, "SILERO_AVAILABLE", False)
         listener = bi.BargeInListener()

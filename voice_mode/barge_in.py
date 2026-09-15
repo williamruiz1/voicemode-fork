@@ -233,7 +233,14 @@ class BargeInListener:
         # (review finding F5b: it otherwise persists across turns, biasing the
         # new turn's cancellation on whatever echo path the previous turn
         # converged to) same as Silero's RNN state just below.
-        self._aec.reset()
+        # SCOPED TO aec3 ONLY (integration review nit, 2026-09-15): AEC3 carries a
+        # delay-estimator + nonlinear model that genuinely wants a per-turn reset.
+        # NLMS/speex are LINEAR filters whose cross-turn convergence on a stable
+        # mic/speaker path is BENEFICIAL to keep -- resetting them each turn would
+        # re-converge from zero and WORSEN turn-onset cancellation. So the live
+        # NLMS fallback path stays byte-for-byte its prior behavior.
+        if self._aec_kind == "aec3":
+            self._aec.reset()
         if self._silero is not None:
             # Fresh turn -- clear Silero's RNN state + reframing buffer/context
             # so the earliest frames of THIS arm aren't biased by whatever the
