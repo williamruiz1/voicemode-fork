@@ -275,6 +275,45 @@ def _select_stt_model_for_endpoint(endpoint_info: EndpointInfo, requested_model:
     return STT_MODEL
 
 
+def _select_tts_model_for_endpoint(endpoint_info: EndpointInfo, requested_model: Optional[str] = None) -> str:
+    """Select the TTS model name to send to an endpoint.
+
+    Mirrors _select_stt_model_for_endpoint's resolution order so a single
+    VOICEMODE_TTS_MODELS list can send a different model to each endpoint
+    (e.g. mlx-community/Kokoro-82M-4bit to the mlx-audio endpoint, kokoro's
+    own default to the kokoro fallback) instead of one model name being
+    forced onto every endpoint (VM-1100 sibling for TTS).
+
+    Resolution order:
+      1. positional TTS_MODELS entry matching this endpoint's index in TTS_BASE_URLS
+         (highest priority — allows a distinct model per endpoint)
+      2. caller-passed requested_model
+      3. provider_type == "openai" -> "tts-1" (legacy default)
+      4. global fallback: "tts-1"
+
+    NOTE: the fallback is the plain "tts-1" literal, never TTS_MODELS[0].
+    TTS_MODELS is being read *positionally* above (branch 1) — treating
+    TTS_MODELS[0] as an additional "global default" for OTHER endpoints
+    would leak endpoint 0's model onto every endpoint with no positional
+    entry of its own (e.g. TTS_MODELS=[mlx-model] intended only for the
+    mlx endpoint would also become the kokoro fallback's model).
+    """
+    # Positional per-endpoint config wins — allows a distinct model per endpoint
+    if endpoint_info.base_url in TTS_BASE_URLS:
+        idx = TTS_BASE_URLS.index(endpoint_info.base_url)
+        if idx < len(TTS_MODELS) and TTS_MODELS[idx]:
+            return TTS_MODELS[idx]
+
+    if requested_model is not None:
+        return requested_model
+
+    # Legacy default: OpenAI's plain TTS endpoint defaults to tts-1
+    if endpoint_info.provider_type == "openai":
+        return "tts-1"
+
+    return "tts-1"
+
+
 # Compatibility functions for existing code
 
 async def is_provider_available(provider_id: str, timeout: float = 2.0) -> bool:

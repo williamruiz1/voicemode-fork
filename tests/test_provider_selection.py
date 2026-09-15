@@ -9,6 +9,7 @@ from voice_mode.providers import (
     get_tts_client_and_voice,
     _select_model_for_endpoint,
     _select_stt_model_for_endpoint,
+    _select_tts_model_for_endpoint,
 )
 
 
@@ -339,3 +340,134 @@ class TestSttModelSelection:
         ):
             cpp = self._make_endpoint("http://127.0.0.1:2022/v1", "whisper")
             assert _select_stt_model_for_endpoint(cpp) == "global-default"
+
+
+class TestTtsModelSelectionPerEndpoint:
+    """Tests for _select_tts_model_for_endpoint resolver branches (mirrors
+    TestSttModelSelection above -- the TTS sibling of the STT per-endpoint
+    resolver, added for mlx-audio-first + kokoro-fallback TTS routing)."""
+
+    def _make_endpoint(self, base_url: str, provider_type: str) -> EndpointInfo:
+        return EndpointInfo(
+            base_url=base_url,
+            models=[],
+            voices=[],
+            provider_type=provider_type,
+            last_check="",
+            last_error=None,
+        )
+
+    def test_positional_wins_over_openai_default(self):
+        """Positional TTS_MODELS entry beats the openai-default "tts-1"
+        guard AND any caller-passed model. When no positional entry exists,
+        openai falls back to "tts-1"."""
+        endpoint = self._make_endpoint("https://api.openai.com/v1", "openai")
+        with patch(
+            "voice_mode.providers.TTS_BASE_URLS",
+            ["https://api.openai.com/v1"],
+        ), patch(
+            "voice_mode.providers.TTS_MODELS",
+            ["gpt-4o-mini-tts"],
+        ):
+            assert _select_tts_model_for_endpoint(endpoint) == "gpt-4o-mini-tts"
+            assert (
+                _select_tts_model_for_endpoint(endpoint, "caller-passed")
+                == "gpt-4o-mini-tts"
+            )
+        with patch(
+            "voice_mode.providers.TTS_BASE_URLS",
+            ["https://api.openai.com/v1"],
+        ), patch("voice_mode.providers.TTS_MODELS", []):
+            assert _select_tts_model_for_endpoint(endpoint) == "tts-1"
+
+    def test_positional_wins_over_caller_passed(self):
+        """Positional TTS_MODELS entry beats a caller-passed requested_model
+        for ALL provider types. When no positional entry is present,
+        caller-passed is honored."""
+        for provider_type in ("kokoro", "mlx-audio", "openai-compatible", "unknown-provider"):
+            endpoint = self._make_endpoint("http://127.0.0.1:8880/v1", provider_type)
+            with patch(
+                "voice_mode.providers.TTS_BASE_URLS",
+                ["http://127.0.0.1:8880/v1"],
+            ), patch("voice_mode.providers.TTS_MODELS", ["positional-model"]):
+                assert (
+                    _select_tts_model_for_endpoint(endpoint, "caller-model")
+                    == "positional-model"
+                ), f"positional should beat caller-passed for provider_type={provider_type}"
+            with patch(
+                "voice_mode.providers.TTS_BASE_URLS",
+                ["http://127.0.0.1:8880/v1"],
+            ), patch("voice_mode.providers.TTS_MODELS", []):
+                assert (
+                    _select_tts_model_for_endpoint(endpoint, "caller-model")
+                    == "caller-model"
+                ), f"caller-passed should win when no positional for provider_type={provider_type}"
+
+    def test_mlx_first_kokoro_fallback_routing(self):
+        """The motivating case: TTS_BASE_URLS=[mlx, kokoro] with a single-entry
+        TTS_MODELS pointed at the mlx model. The mlx endpoint (index 0) must
+        get the mlx model; the kokoro endpoint (index 1, no positional entry)
+        must NOT get the mlx model -- it falls through to the global default,
+        never the wrong endpoint's model."""
+        urls = ["http://127.0.0.1:8890/v1", "http://127.0.0.1:8880/v1"]
+        models = ["mlx-community/Kokoro-82M-4bit"]
+        with patch("voice_mode.providers.TTS_BASE_URLS", urls), patch(
+            "voice_mode.providers.TTS_MODELS", models
+        ):
+            mlx = self._make_endpoint(urls[0], "mlx-audio")
+            kokoro = self._make_endpoint(urls[1], "kokoro")
+            assert (
+                _select_tts_model_for_endpoint(mlx)
+                == "mlx-community/Kokoro-82M-4bit"
+            )
+            resolved_kokoro = _select_tts_model_for_endpoint(kokoro)
+            assert resolved_kokoro != "mlx-community/Kokoro-82M-4bit"
+            assert resolved_kokoro == "tts-1"
+
+    def test_global_tts_model_fallback_when_no_positional(self):
+        """Fallback to TTS_MODELS[0] (or "tts-1" if TTS_MODELS is empty) when
+        caller-passed is None and no positional TTS_MODELS entry applies
+        (URL not in TTS_BASE_URLS, index out of range, or positional entry
+        empty)."""
+        with patch(
+            "voice_mode.providers.TTS_BASE_URLS",
+            ["http://127.0.0.1:8880/v1"],
+        ), patch("voice_mode.providers.TTS_MODELS", ["tts-1", "tts-1-hd"]):
+            # URL not in TTS_BASE_URLS
+            unknown = self._make_endpoint("http://10.0.0.5:9999/v1", "unknown-provider")
+            assert _select_tts_model_for_endpoint(unknown) == "tts-1"
+            # URL in TTS_BASE_URLS but index out of range (only 1 URL, 2 models)
+            kokoro = self._make_endpoint("http://127.0.0.1:8880/v1", "kokoro")
+            assert _select_tts_model_for_endpoint(kokoro) == "tts-1"
+
+        # Positional entry exists but is empty -> falls back to global
+        with patch(
+            "voice_mode.providers.TTS_BASE_URLS",
+            ["http://127.0.0.1:8880/v1"],
+        ), patch("voice_mode.providers.TTS_MODELS", [""]):
+            kokoro = self._make_endpoint("http://127.0.0.1:8880/v1", "kokoro")
+            assert _select_tts_model_for_endpoint(kokoro) == "tts-1"
+
+        # TTS_MODELS completely empty -> hardcoded "tts-1" fallback
+        with patch(
+            "voice_mode.providers.TTS_BASE_URLS",
+            ["http://127.0.0.1:8880/v1"],
+        ), patch("voice_mode.providers.TTS_MODELS", []):
+            kokoro = self._make_endpoint("http://127.0.0.1:8880/v1", "kokoro")
+            assert _select_tts_model_for_endpoint(kokoro) == "tts-1"
+
+    def test_single_endpoint_no_regression_matches_caller_default(self):
+        """Single-endpoint config: whatever the caller resolves as its
+        default model (model or TTS_MODELS[0], per
+        text_to_speech_with_failover) is exactly what the positional branch
+        returns too, so single-kokoro users see no behavior change."""
+        with patch(
+            "voice_mode.providers.TTS_BASE_URLS",
+            ["http://127.0.0.1:8880/v1"],
+        ), patch("voice_mode.providers.TTS_MODELS", ["tts-1", "tts-1-hd", "gpt-4o-mini-tts"]):
+            kokoro = self._make_endpoint("http://127.0.0.1:8880/v1", "kokoro")
+            caller_default_model = "tts-1"  # model or TTS_MODELS[0]
+            assert (
+                _select_tts_model_for_endpoint(kokoro, caller_default_model)
+                == caller_default_model
+            )

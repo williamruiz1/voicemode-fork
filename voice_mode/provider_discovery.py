@@ -64,8 +64,12 @@ def _default_stt_models(base_url: str) -> List[str]:
     # Display-only seed. mlx-audio rejects "whisper-1" (it expects a full HF
     # repo id), so advertise its websocket default instead. Wire payloads are
     # unaffected -- VM-1100 owns the per-endpoint resolver.
+    # NOTE: "mlx-community/whisper-large-v3-turbo" ships no processor in its
+    # HF repo and 500s at transcribe time -- "-asr-fp16" is mlx-audio's own
+    # variant that bundles one. Discovered while wiring per-endpoint TTS
+    # routing; in-scope fix (execution-protocol.md discovered-defect clause).
     if detect_provider_type(base_url) == "mlx-audio":
-        return ["mlx-community/whisper-large-v3-turbo"]
+        return ["mlx-community/whisper-large-v3-turbo-asr-fp16"]
     return ["whisper-1"]
 
 

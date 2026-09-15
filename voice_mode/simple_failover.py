@@ -13,7 +13,7 @@ from .provider_discovery import is_local_provider
 
 from .config import TTS_BASE_URLS, STT_BASE_URLS, OPENAI_API_KEY, STT_PROMPT, WHISPER_LANGUAGE, STT_STREAMING
 from .provider_discovery import detect_provider_type, EndpointInfo
-from .providers import _select_stt_model_for_endpoint
+from .providers import _select_stt_model_for_endpoint, _select_tts_model_for_endpoint
 
 logger = logging.getLogger("voicemode")
 
@@ -78,8 +78,21 @@ async def simple_tts_failover(
         provider_type = detect_provider_type(base_url)
         api_key = OPENAI_API_KEY if provider_type == "openai" else (OPENAI_API_KEY or "dummy-key-for-local")
 
-        # Select appropriate voice and model for this provider
-        selected_model = model
+        # Select appropriate voice and model for this provider.
+        # Resolve the per-endpoint TTS model first (positional TTS_MODELS
+        # entry for this endpoint -> caller-passed model -> openai legacy
+        # default -> global fallback), so a single VOICEMODE_TTS_MODELS
+        # config can route a different model to each endpoint instead of
+        # one model name being forced onto every endpoint (mirrors STT's
+        # _select_stt_model_for_endpoint below). The clone-profile override
+        # still wins over this when present.
+        endpoint_info = EndpointInfo(
+            base_url=base_url,
+            models=[],
+            voices=[],
+            provider_type=provider_type,
+        )
+        selected_model = _select_tts_model_for_endpoint(endpoint_info, model)
         if clone_profile:
             # Clone voice: use profile's model and pass voice name through
             # (mlx-audio server accepts any voice string)
