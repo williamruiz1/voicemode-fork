@@ -253,7 +253,10 @@ class Endpointer:
         self,
         sample_rate: int = 16000,
         speech_threshold: float = 0.5,
-        min_endpoint_ms: int = 700,
+        # 500ms matches OpenAI Realtime API's server-VAD silence_duration_ms
+        # default (see config.py's ENDPOINTING_MIN_ENDPOINT_MS comment for the
+        # citation + why it's safe with a continuous-probability VAD).
+        min_endpoint_ms: int = 500,
         min_speech_ms: int = 200,
     ):
         self.sample_rate = sample_rate
