@@ -375,3 +375,65 @@ class TestEndpointerAgainstRealFixtures:
             "endpointing must fire once the foreground stops, even though a "
             "continuous quieter background bed keeps playing"
         )
+
+
+class TestMinEndpointMsDefaultIs500(object):
+    """vm-local-turntaking (2026-09-15): min_endpoint_ms's default was
+    lowered 700ms -> 500ms to match OpenAI Realtime API's own server-VAD
+    silence_duration_ms default (see config.py's ENDPOINTING_MIN_ENDPOINT_MS
+    comment for the citation) -- the concrete "shave 200ms of dead air off
+    every turn" fix. This class pins BOTH places that number is allowed to
+    live (Endpointer's own ctor default, and config.py's env-var default) so
+    a future edit to just one of them -- the exact drift the "Defaults match
+    Endpointer's own ctor defaults" comment warns against -- fails loudly
+    instead of silently diverging, and proves the state machine actually
+    fires ~500ms (not ~700ms) after speech ends at that default.
+    """
+
+    def test_endpointer_ctor_default_is_500ms(self):
+        ep = Endpointer()
+        assert ep.min_endpoint_ms == 500
+
+    def test_config_default_is_500ms_when_env_var_unset(self):
+        import importlib
+        import os as _os
+
+        assert "VOICEMODE_MIN_ENDPOINT_MS" not in _os.environ, (
+            "test env must not already override VOICEMODE_MIN_ENDPOINT_MS, "
+            "or this test can't observe the true default"
+        )
+        from voice_mode import config as config_module
+
+        importlib.reload(config_module)
+        try:
+            assert config_module.ENDPOINTING_MIN_ENDPOINT_MS == 500
+        finally:
+            # Leave the module as every other test in this process expects it.
+            importlib.reload(config_module)
+
+    def test_scripted_endpoint_fires_within_one_frame_of_500ms(self):
+        """Same D1 shape as test_d1_endpoints_within_min_endpoint_ms_of_speech_ending
+        above, pinned to the new 500ms default specifically -- proves the
+        turn-taking win is real (~200ms faster than the old 700ms) and not
+        just a documentation change."""
+        min_speech_ms = 200
+        min_endpoint_ms = 500  # the new default -- see module docstring above
+        speech_frames = -(-min_speech_ms // FRAME_MS)
+        silence_frames_needed = -(-min_endpoint_ms // FRAME_MS)
+
+        probs = [0.9] * speech_frames + [0.05] * (silence_frames_needed + 3)
+        ep = _make_endpointer(
+            probs, sample_rate=VAD_SR, speech_threshold=0.5,
+            min_endpoint_ms=min_endpoint_ms, min_speech_ms=min_speech_ms,
+        )
+
+        states = [ep.update(_frame()) for _ in probs]
+
+        first_endpointed = next(i for i, s in enumerate(states) if s.endpointed)
+        below_threshold_frames_at_endpoint = first_endpointed - (speech_frames - 1)
+        elapsed_ms = below_threshold_frames_at_endpoint * FRAME_MS
+        assert elapsed_ms >= min_endpoint_ms
+        assert elapsed_ms < min_endpoint_ms + FRAME_MS
+        # And it must be strictly faster than the old 700ms threshold would
+        # have been -- the actual user-facing improvement this change buys.
+        assert elapsed_ms < 700

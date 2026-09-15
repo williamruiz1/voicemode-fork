@@ -829,7 +829,19 @@ ENDPOINTING_ENABLED = os.getenv("VOICEMODE_ENDPOINTING", "").lower() in ("true",
 
 # Endpointer thresholds -- see voice_mode/silero_vad.py's Endpointer docstring
 # for what each controls. Defaults match Endpointer's own ctor defaults.
-ENDPOINTING_MIN_ENDPOINT_MS = int(os.getenv("VOICEMODE_MIN_ENDPOINT_MS", "700"))  # consecutive sub-threshold ms before end-of-turn fires
+#
+# 700ms -> 500ms (vm-local-turntaking, 2026-09-15): 500ms is OpenAI's own
+# Realtime API server-VAD default for silence_duration_ms -- the literal
+# "ChatGPT voice" turn-taking feel this change is chasing (confirmed via
+# WebSearch of developers.openai.com/api/docs/guides/realtime-vad this
+# session: "defaults to 500ms... shorter values [make] the model respond
+# more quickly, but may jump in on short pauses"). Safe to match here because
+# Silero already thresholds a continuous P(speech) rather than webrtcvad's
+# noise-prone binary decision (see the module comment above), so tightening
+# the trailing-silence window doesn't reintroduce the false-hang/false-cut
+# problem this endpointer was built to fix -- it only removes 200ms of dead
+# air per turn that OpenAI's own product has shown is safe to remove.
+ENDPOINTING_MIN_ENDPOINT_MS = int(os.getenv("VOICEMODE_MIN_ENDPOINT_MS", "500"))  # consecutive sub-threshold ms before end-of-turn fires
 ENDPOINTING_SPEECH_THRESHOLD = float(os.getenv("VOICEMODE_SILERO_SPEECH_THRESHOLD", "0.5"))  # P(speech) threshold, 0-1
 ENDPOINTING_MIN_SPEECH_MS = int(os.getenv("VOICEMODE_MIN_SPEECH_MS", "200"))  # consecutive above-threshold ms before speech_started latches
 
