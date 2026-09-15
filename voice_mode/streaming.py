@@ -30,6 +30,7 @@ from .config import (
 )
 from .utils import get_event_logger, update_latest_symlinks
 from . import audio_player
+from . import barge_in
 from .truncation import estimate_truncation
 
 
@@ -334,7 +335,12 @@ async def stream_pcm_audio(
                 # mono) plus whatever's already buffered in PortAudio ahead
                 # of the speaker -- bytes_received below only counts what
                 # was actually handed to stream.write() before this fires.
-                if audio_player.barge_in_triggered():
+                # Defense-in-depth (B1): even with the flag reset unconditionally
+                # at the top of every speak() call (voice_mode/tools/converse.py),
+                # also refuse to honor a stale/leaked trigger when natural mode
+                # isn't currently armed -- a barge-in can only be genuine while
+                # the concurrent mic listener that raises it is actually running.
+                if audio_player.barge_in_triggered() and barge_in.natural_mode_enabled():
                     logger.info(
                         f"🛑 Barge-in: halting streamed TTS after {bytes_received} bytes "
                         f"({chunk_count} chunks) written to the output stream"

@@ -318,22 +318,54 @@ class BargeInListener:
             clean = self._aec.process(near_16k, far_16k)
 
             speech_prob: Optional[float] = None
+            clean_rms = _rms(clean)
+
+            # Always update the asymmetric echo-floor tracker first (see the
+            # ENERGY_FLOOR_ALPHA_* comment above), THEN decide any energy gate
+            # off its pre-update value -- floor tracking and gating must not be
+            # entangled, or the floor never calibrates when the very first
+            # frame is already loud (a real, previously-shipped bug: gating
+            # the floor update on speech_run_ms==0 meant a continuously-loud
+            # TTS onset from frame 1 never let speech_run_ms return to 0,
+            # so the floor update condition never fired -- the gate silently
+            # never engaged for that entire turn). This tracker is now SHARED
+            # across both VAD paths below (B2 fix): Silero's amplitude-
+            # invariant P(speech) still scores a low-amplitude but spectrally
+            # speech-shaped echo residual near 1.0, so it needs the exact
+            # same energy-margin floor webrtcvad has always relied on.
+            floor_before_update = echo_floor if echo_floor_initialized else clean_rms
+            if BARGE_IN_ENERGY_MARGIN > 0:
+                if not echo_floor_initialized:
+                    echo_floor = clean_rms
+                    echo_floor_initialized = True
+                elif clean_rms < echo_floor:
+                    echo_floor = (1 - ENERGY_FLOOR_ALPHA_DOWN) * echo_floor + ENERGY_FLOOR_ALPHA_DOWN * clean_rms
+                else:
+                    echo_floor = (1 - ENERGY_FLOOR_ALPHA_UP) * echo_floor + ENERGY_FLOOR_ALPHA_UP * clean_rms
 
             if self._silero is not None:
                 # Preferred path (voicemode-endpointing-bargein W3): Silero's
                 # P(speech) is amplitude-invariant, so a plain threshold on the
-                # probability already separates real speech from noise/echo
-                # residual -- the webrtcvad energy-margin gate below is a
-                # fallback-path detail specific to webrtcvad's binary decision
-                # and is skipped entirely here (see config.BARGE_IN_SILERO_
-                # THRESHOLD's docstring).
+                # probability already separates real speech from background
+                # noise in a genuinely quiet room -- but a low-amplitude ECHO
+                # RESIDUAL that is still spectrally speech-shaped (imperfect
+                # AEC cancellation of the agent's own TTS onset, or background
+                # video/media) still scores P(speech) near 1.0 regardless of
+                # amplitude, producing false barge-ins. When
+                # BARGE_IN_ENERGY_MARGIN > 0 (B2 fix), this path is now gated
+                # by the SAME echo-floor energy-margin check webrtcvad has
+                # always used, computed above; with the default margin of 0
+                # this is a no-op and behavior is unchanged (see
+                # config.BARGE_IN_SILERO_THRESHOLD's docstring).
                 try:
                     speech_prob = self._silero.prob(clean)
                 except Exception as e:
                     logger.debug(f"barge-in Silero VAD error: {e}")
                     speech_prob = 0.0
                 is_speech = speech_prob >= self._silero_threshold
-                gated_speech = is_speech
+                gated_speech = is_speech and (
+                    BARGE_IN_ENERGY_MARGIN <= 0 or clean_rms >= floor_before_update * BARGE_IN_ENERGY_MARGIN
+                )
             else:
                 clean_int16 = np.clip(clean * 32768.0, -32768, 32767).astype(np.int16)
                 frame_bytes = clean_int16.tobytes()
@@ -344,30 +376,9 @@ class BargeInListener:
                     logger.debug(f"barge-in VAD error: {e}")
                     is_speech = False
 
-                clean_rms = _rms(clean)
-
-                # Always update the asymmetric echo-floor tracker first (see the
-                # ENERGY_FLOOR_ALPHA_* comment above), THEN decide the gate off
-                # its pre-update value -- floor tracking and gating must not be
-                # entangled, or the floor never calibrates when the very first
-                # frame is already loud (a real, previously-shipped bug: gating
-                # the floor update on speech_run_ms==0 meant a continuously-loud
-                # TTS onset from frame 1 never let speech_run_ms return to 0,
-                # so the floor update condition never fired -- the gate silently
-                # never engaged for that entire turn).
-                if BARGE_IN_ENERGY_MARGIN > 0:
-                    floor_before_update = echo_floor if echo_floor_initialized else clean_rms
-                    if not echo_floor_initialized:
-                        echo_floor = clean_rms
-                        echo_floor_initialized = True
-                    elif clean_rms < echo_floor:
-                        echo_floor = (1 - ENERGY_FLOOR_ALPHA_DOWN) * echo_floor + ENERGY_FLOOR_ALPHA_DOWN * clean_rms
-                    else:
-                        echo_floor = (1 - ENERGY_FLOOR_ALPHA_UP) * echo_floor + ENERGY_FLOOR_ALPHA_UP * clean_rms
-
-                    gated_speech = is_speech and clean_rms >= floor_before_update * BARGE_IN_ENERGY_MARGIN
-                else:
-                    gated_speech = is_speech
+                gated_speech = is_speech and (
+                    BARGE_IN_ENERGY_MARGIN <= 0 or clean_rms >= floor_before_update * BARGE_IN_ENERGY_MARGIN
+                )
 
             speech_run_ms = speech_run_ms + CHUNK_MS if gated_speech else 0
 
@@ -375,7 +386,7 @@ class BargeInListener:
                 self._trace_write(
                     rms_near=_rms(near_16k), rms_far=_rms(far_16k), rms_clean=_rms(clean),
                     is_speech=is_speech, speech_run_ms=speech_run_ms, tts_speaking=True,
-                    echo_floor=echo_floor if (self._silero is None and BARGE_IN_ENERGY_MARGIN > 0) else None,
+                    echo_floor=echo_floor if BARGE_IN_ENERGY_MARGIN > 0 else None,
                     speech_prob=speech_prob,
                 )
 
