@@ -61,6 +61,17 @@ def _arm(stack, monkeypatch, *, energy_margin: float, probs):
     post-AEC `clean` tracks raw mic amplitude), and a scripted Silero
     probability sequence -- one value per fed frame."""
     triggered_calls = []
+    # vm-aec3-phase1: this test's documented design intent is "the AEC's
+    # far-end reference is mocked to all-zeros ... which makes the AEC's
+    # echo prediction a no-op, so each frame's post-AEC clean signal tracks
+    # the raw mic amplitude directly" (module docstring) -- true for
+    # NLMS/speex, NOT for AEC3, which also suppresses a non-modulated
+    # constant-value "speech" chunk as stationary noise even with a silent
+    # far-end reference (real speech is never DC, so this doesn't happen
+    # acoustically -- it's a synthetic-fixture mismatch, not an AEC3 bug;
+    # see tests/test_aec3_engine.py for AEC3's own coverage). Pin to the
+    # engine this wiring test was validated against.
+    monkeypatch.setattr(bi, "AEC3_AVAILABLE", False)
     monkeypatch.setattr(bi, "BARGE_IN_ENERGY_MARGIN", energy_margin)
     monkeypatch.setattr(bi.audio_player, "is_tts_speaking", lambda: True)
     monkeypatch.setattr(

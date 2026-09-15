@@ -46,7 +46,13 @@ import numpy as np
 import sounddevice as sd
 
 from voice_mode import audio_player
-from voice_mode.aec import EchoCanceller, SpeexEchoCanceller, SPEEX_AVAILABLE
+from voice_mode.aec import (
+    EchoCanceller,
+    SpeexEchoCanceller,
+    SPEEX_AVAILABLE,
+    AEC3EchoCanceller,
+    AEC3_AVAILABLE,
+)
 from voice_mode.config import (
     SAMPLE_RATE,
     BARGE_IN_TRIGGER_MS,
@@ -153,13 +159,40 @@ class BargeInListener:
         self._triggered = False
         self._pre_roll_chunks: List[np.ndarray] = []
         self._error: Optional[str] = None
-        # founder-os#11658 — prefer the speexdsp AEC (VoIP-grade frequency-domain
-        # adaptive filter WITH a double-talk-aware preprocessor); the hand-rolled
-        # NLMS filter measured only ~3-4dB of real cancellation on hardware.
-        # `VOICEMODE_AEC=nlms` forces the old filter; speex is the default when
-        # the pyaec/speexdsp binding is importable, else we fall back to NLMS.
-        _aec_pref = os.getenv("VOICEMODE_AEC", "speex").strip().lower()
-        if _aec_pref != "nlms" and SPEEX_AVAILABLE:
+        # AEC3 Phase 1 (voicemode-endpointing-bargein) — WebRTC AEC3 (see
+        # aec.py's AEC3 module comment for the full rationale + the real
+        # pywebrtc-audio API) is now the PREFERRED engine: ~25-45dB rated vs.
+        # speexdsp's VoIP-grade cancellation and the hand-rolled NLMS
+        # filter's measured ~3-4dB on hardware. Preference order:
+        # `VOICEMODE_AEC=aec3` (or unset, the default) -> AEC3 if
+        # AEC3_AVAILABLE, else speexdsp if SPEEX_AVAILABLE, else NLMS.
+        # `VOICEMODE_AEC=nlms` / `VOICEMODE_AEC=speex` still force those
+        # specific engines (falling back to NLMS if `speex` is forced but
+        # unavailable) — founder-os#11658's original override behavior is
+        # unchanged, AEC3 just slots in ahead of speex as the new default.
+        _aec_pref = os.getenv("VOICEMODE_AEC", "aec3").strip().lower()
+        if _aec_pref == "nlms":
+            self._aec = EchoCanceller(sample_rate=VAD_WORK_RATE, filter_ms=AEC_FILTER_MS, mu=AEC_STEP_SIZE)
+            self._aec_kind = "nlms"
+        elif _aec_pref == "speex":
+            if SPEEX_AVAILABLE:
+                self._aec = SpeexEchoCanceller(sample_rate=VAD_WORK_RATE, filter_ms=AEC_FILTER_MS, mu=AEC_STEP_SIZE)
+                self._aec_kind = "speexdsp"
+            else:
+                self._aec = EchoCanceller(sample_rate=VAD_WORK_RATE, filter_ms=AEC_FILTER_MS, mu=AEC_STEP_SIZE)
+                self._aec_kind = "nlms"
+        elif AEC3_AVAILABLE:
+            # AEC3 does its OWN delay estimation/compensation via
+            # stream_delay_ms (fed the raw, unshifted reference) -- see the
+            # DELAY HANDLING note in aec.py and the ref_delay_samples branch
+            # in _watch_loop below (review finding F5: do not also pre-shift
+            # the reference via AEC_REF_DELAY_MS, that would double-compensate).
+            self._aec = AEC3EchoCanceller(
+                sample_rate=VAD_WORK_RATE, filter_ms=AEC_FILTER_MS, mu=AEC_STEP_SIZE,
+                stream_delay_ms=AEC_REF_DELAY_MS,
+            )
+            self._aec_kind = "aec3"
+        elif SPEEX_AVAILABLE:
             self._aec = SpeexEchoCanceller(sample_rate=VAD_WORK_RATE, filter_ms=AEC_FILTER_MS, mu=AEC_STEP_SIZE)
             self._aec_kind = "speexdsp"
         else:
@@ -196,6 +229,11 @@ class BargeInListener:
 
         audio_player.reset_barge_in_event()
         self._stop_event.clear()
+        # Fresh turn -- clear the AEC's adaptive-filter/delay-estimator state
+        # (review finding F5b: it otherwise persists across turns, biasing the
+        # new turn's cancellation on whatever echo path the previous turn
+        # converged to) same as Silero's RNN state just below.
+        self._aec.reset()
         if self._silero is not None:
             # Fresh turn -- clear Silero's RNN state + reframing buffer/context
             # so the earliest frames of THIS arm aren't biased by whatever the
@@ -246,7 +284,13 @@ class BargeInListener:
         from scipy import signal as scipy_signal
 
         speech_run_ms = 0
-        ref_delay_samples = int(SAMPLE_RATE * AEC_REF_DELAY_MS / 1000)
+        # F5: AEC3 does its OWN delay estimation/compensation via
+        # stream_delay_ms (set at construction above from AEC_REF_DELAY_MS,
+        # fed the RAW reference as an initial estimate it refines). NLMS/speex
+        # have no delay model of their own, so they still need the caller to
+        # pre-shift the reference here. Pre-shifting AND letting AEC3
+        # compensate would shift the acoustic delay twice.
+        ref_delay_samples = 0 if self._aec_kind == "aec3" else int(SAMPLE_RATE * AEC_REF_DELAY_MS / 1000)
         # Adaptive echo-floor gate state (see config.BARGE_IN_ENERGY_MARGIN
         # docstring for why this exists). echo_floor is an ASYMMETRIC
         # minimum-statistics tracker of rms_clean -- the same family of

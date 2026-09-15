@@ -249,3 +249,129 @@ class SpeexEchoCanceller:
         if float_in:
             return (out.astype(np.float64) / 32768.0).astype(out_dtype)
         return out.astype(out_dtype)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AEC3 Phase 1 — WebRTC AEC3 via `pywebrtc-audio` (drop-in for EchoCanceller).
+#
+# The hand-rolled NLMS filter measures ~3-4 dB of real cancellation on hardware
+# (SPEEX_AVAILABLE is False there, so it's the live fallback); AEC3 is WebRTC's
+# production echo canceller (Chrome/Meet/Zoom-grade), rated ~25-45 dB. Unlike
+# the speexdsp binding above, `pywebrtc-audio` ships PREBUILT macOS arm64
+# wheels (v0.2.0) -- no C++ toolchain, no source build, so the "fragile native
+# dependency" concern that ruled out webrtc-audio-processing/aec-audio-
+# processing (see the module docstring) does not apply to this package.
+#
+# THE ACTUAL API (discovered by hands-on probe of pywebrtc-audio 0.2.0 -- the
+# design doc's assumption of a separate render-then-capture call pair was
+# wrong; document the real shape here so nobody re-derives it from scratch):
+#   - `pywebrtc_audio.EchoCanceller(sample_rate, num_channels=1,
+#      stream_delay_ms=0)` is the AEC3-only processor (there is also a wider
+#      `AudioProcessor(echo_cancellation=True, ...)` that bundles NS/AGC/HPF --
+#      not used here, we want AEC3 in isolation to compare cleanly against
+#      NLMS/speex).
+#   - ONE call does the whole job: `.process(near, far) -> np.ndarray` takes
+#      BOTH near-end and far-end for the SAME frame and returns the
+#      echo-cancelled near-end -- there is no separate `process_render` /
+#      `process_capture` pair to sequence.
+#   - `near`/`far` MUST be `float32` (or `int16`); `float64` raises
+#      `ValueError: audio dtype must be float32 or int16, got format 'd'`.
+#      barge_in.py's `near_16k`/`far_16k` are float64 (see the SCALE CONTRACT
+#      note on SpeexEchoCanceller above), so `process()` below casts down to
+#      float32 for the call and back up on return, same pattern as speex's
+#      int16 round-trip.
+#   - Frame length is NOT constrained to an exact 10ms multiple -- probed with
+#      150, 480 (barge_in's 30ms/16kHz chunk), and other odd lengths, all
+#      succeeded; the binding frames internally. No manual sub-framing needed
+#      (unlike SpeexEchoCanceller.frame_size above).
+#   - `near`/`far` must be the SAME length per call (`ValueError` otherwise) --
+#      `process()` below pads/truncates `far` to match `near`, mirroring
+#      EchoCanceller's contract.
+#   - Delay is a `stream_delay_ms` CONSTRUCTOR ARG (and a live-settable
+#      property) on the C++ object itself, NOT something the caller
+#      pre-shifts into the reference signal.
+#
+# DELAY HANDLING (review finding F5 -- do NOT double-compensate): the NLMS/
+# speex engines rely on `barge_in.py` pre-shifting the far-end reference by
+# `AEC_REF_DELAY_MS` before it ever reaches `.process()` (via
+# `audio_player.get_reference_audio(..., delay_samples=ref_delay_samples)`),
+# because neither of those engines has its own delay model. AEC3 is
+# DIFFERENT: it has a real delay estimator/compensator built on
+# `stream_delay_ms`, which expects the RAW, unshifted far-end reference as an
+# initial delay ESTIMATE it then refines -- feeding it an ALREADY-shifted
+# reference on top of that would shift the acoustic delay twice (once by the
+# caller, once by AEC3's own compensation), which is worse than not
+# compensating at all. So: `AEC3EchoCanceller` takes `stream_delay_ms` as an
+# init-time hint (barge_in.py passes `AEC_REF_DELAY_MS` here, NOT into
+# `get_reference_audio`'s `delay_samples`), and barge_in.py's engine-select
+# is responsible for passing `delay_samples=0` to `get_reference_audio` only
+# when `self._aec_kind == "aec3"` -- see barge_in.py's `_watch_loop`.
+#
+# Availability is soft, same pattern as SPEEX_AVAILABLE: if pywebrtc-audio (or
+# its compiled extension) isn't importable, AEC3_AVAILABLE is False and
+# callers fall back to speex, then NLMS.
+try:
+    import pywebrtc_audio as _pywebrtc_audio
+    AEC3_AVAILABLE = True
+except Exception:  # pragma: no cover - import guard
+    _pywebrtc_audio = None
+    AEC3_AVAILABLE = False
+
+
+class AEC3EchoCanceller:
+    """WebRTC AEC3 echo canceller with the EchoCanceller interface.
+
+    Same constructor + `process(near, far)` + `reset()` contract as the NLMS
+    `EchoCanceller` / `SpeexEchoCanceller`, so it is a literal drop-in.
+    `filter_ms`/`mu`/`eps` are accepted for signature-compatibility and
+    ignored (AEC3 is not an NLMS filter and has no comparable tunables at
+    this binding's surface). `stream_delay_ms` is AEC3-specific -- see the
+    DELAY HANDLING note above; barge_in.py is expected to pass
+    `AEC_REF_DELAY_MS` here instead of pre-shifting the reference signal.
+    """
+
+    def __init__(self, sample_rate: int, filter_ms: int = 200, mu: float = 0.5,
+                 eps: float = 1e-6, stream_delay_ms: int = 0):
+        if not AEC3_AVAILABLE:
+            raise RuntimeError("pywebrtc-audio not available")
+        self.sample_rate = int(sample_rate)
+        self._stream_delay_ms = int(stream_delay_ms)
+        self._new_aec = lambda: _pywebrtc_audio.EchoCanceller(
+            sample_rate=self.sample_rate, num_channels=1,
+            stream_delay_ms=self._stream_delay_ms,
+        )
+        self._aec = self._new_aec()
+
+    def reset(self):
+        """Clear AEC3's adaptive-filter/delay-estimator state (e.g. after a
+        device/route change, or at the start of a new turn -- see F5b: this
+        state persists across turns unless explicitly reset)."""
+        self._aec = self._new_aec()
+
+    def process(self, near: np.ndarray, far: np.ndarray) -> np.ndarray:
+        near = np.asarray(near).reshape(-1)
+        far = np.asarray(far).reshape(-1)
+        n = len(near)
+        if n == 0:
+            return near.astype(near.dtype)
+        out_dtype = near.dtype if near.dtype.kind == "f" else np.float64
+
+        # Pad/truncate far-end to match near-end length (silence-fill if the
+        # reference ran short), same contract as EchoCanceller/
+        # SpeexEchoCanceller above -- pywebrtc-audio raises ValueError on a
+        # near/far length mismatch rather than tolerating it.
+        if len(far) < n:
+            far = np.concatenate([far, np.zeros(n - len(far), dtype=np.float64)])
+        elif len(far) > n:
+            far = far[:n]
+
+        # SCALE CONTRACT: pywebrtc-audio requires float32 (or int16); the
+        # normalised-float [-1, 1] domain barge_in.py passes is float64.
+        # Round-trip through float32 -- unlike the speex int16 round-trip,
+        # this is NOT a truncation trap: float64->float32 is a precision
+        # narrowing, not a domain change, so silence-in silence-out; verified
+        # via the offline ERLE harness (tests/aec3_erle_offline.py).
+        near32 = np.asarray(near, dtype=np.float32)
+        far32 = np.asarray(far, dtype=np.float32)
+        clean = self._aec.process(near32, far32)
+        return np.asarray(clean, dtype=np.float64).astype(out_dtype)
