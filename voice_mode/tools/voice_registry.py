@@ -32,8 +32,11 @@ def _default_stt_models(provider: str) -> list[str]:
     # mlx-audio rejects "whisper-1" (it expects a full HF repo id), so
     # advertise its websocket default instead. Mirrors the legacy
     # provider_discovery._default_stt_models seeding behaviour.
+    # NOTE: the plain "...-turbo" HF repo ships no processor and 500s at
+    # transcribe time -- "-asr-fp16" is mlx-audio's own variant that
+    # bundles one (kept in sync with provider_discovery.py's fix).
     if provider == "mlx-audio":
-        return ["mlx-community/whisper-large-v3-turbo"]
+        return ["mlx-community/whisper-large-v3-turbo-asr-fp16"]
     return ["whisper-1"]
 
 
