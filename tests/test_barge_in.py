@@ -110,6 +110,20 @@ class TestBargeInListenerStateMachine:
         alive for the caller's whole test (closed automatically by the
         `exit_stack` fixture below)."""
         triggered_calls = []
+        # vm-aec3-phase1: these tests validate the barge-in STATE MACHINE
+        # with a synthetic constant-value near-end "speech" chunk against an
+        # all-zero far-end reference (see module docstring) -- an assumption
+        # that only holds for NLMS/speex, which are near-transparent
+        # passthroughs when far=0. AEC3 is a real production echo canceller
+        # with its own residual/stationary-noise suppression that also
+        # attenuates a non-modulated constant-value signal even with a
+        # silent reference (verified: ~-23dB on a DC chunk, far=zeros) --
+        # correct behavior for real speech (never DC), but it breaks this
+        # synthetic fixture. Pin these state-machine tests to the engine
+        # they were written and validated against; the AEC3 algorithm
+        # itself is covered by tests/test_aec3_engine.py and the offline
+        # ERLE harness instead.
+        monkeypatch.setattr(bi, "AEC3_AVAILABLE", False)
         monkeypatch.setattr(bi.audio_player, "is_tts_speaking", lambda: tts_speaking)
         monkeypatch.setattr(
             bi.audio_player, "get_reference_audio",
