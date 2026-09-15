@@ -89,6 +89,7 @@ from voice_mode.config import (
     APPEND_WINDOW_FLAG_PATH,
     STEP_AWAY_PHRASES,
     STEP_AWAY_RESUME_PHRASES,
+    PTT_HOLD_FLAG_PATH,
 )
 import voice_mode.config
 from voice_mode.provider_discovery import provider_registry
@@ -1104,6 +1105,28 @@ def append_window_ms() -> int:
     return max(0, APPEND_WINDOW_MS)
 
 
+def ptt_hold_active() -> bool:
+    """Runtime check (W3d push-to-talk): True while William is PHYSICALLY
+    HOLDING the push-to-talk key/button. A Hammerspoon key-down writes
+    PTT_HOLD_FLAG_PATH; key-up removes it AND drops turn-end.signal (see
+    convomode-turn-end.sh's `hold`/`release` subcommands) so letting go ends
+    the turn immediately via the pre-existing, unconditionally-honored manual
+    turn-end signal rather than waiting on VAD. While this returns True, the
+    two silence-based stop decisions below (webrtcvad silence-threshold and
+    Silero endpointing) are skipped entirely -- a mid-thought pause while held
+    can never end the turn early. Mirrors the natural-mode.flag / step-away.flag
+    discipline already in this module: a live-pollable flag file, not an env
+    var, because it's a moment-to-moment physical gesture, not deployment
+    config. Fail-safe direction: unreadable/missing -> False (not holding) --
+    a stuck True would silently disable silence-based stopping forever, which
+    is the worse failure since the turn-end signal is the caller's job to keep
+    wired to release, not this function's to guarantee."""
+    try:
+        return os.path.exists(PTT_HOLD_FLAG_PATH)
+    except Exception:
+        return False
+
+
 def _normalize_phrase(text: Optional[str]) -> str:
     """Lowercase, strip punctuation/extra spaces for whole-utterance matching."""
     if not text:
@@ -1588,11 +1611,13 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                                 logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: speech_prob={endpoint_state.speech_prob:.3f}, "
                                             f"speech_started={endpoint_state.speech_started}, endpointed={endpoint_state.endpointed}")
 
-                            if endpoint_state.endpointed:
+                            if endpoint_state.endpointed and not ptt_hold_active():
                                 # Use the larger of MIN_RECORDING_DURATION (global) or
                                 # min_duration (parameter) -- same floor as the
                                 # webrtcvad path, so a too-early endpoint can't return
-                                # a clipped recording.
+                                # a clipped recording. Suppressed entirely while
+                                # push-to-talk is physically held (W3d) -- see
+                                # ptt_hold_active()'s docstring.
                                 effective_min_duration = max(MIN_RECORDING_DURATION, min_duration)
                                 if recording_duration >= effective_min_duration:
                                     logger.info(f"✓ Endpoint detected after {recording_duration:.1f}s of recording (Silero)")
@@ -1661,7 +1686,13 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                                     # silence threshold by the append window. _append_ms=0
                                     # (default) → identical to prior behavior.
                                     _silence_stop_threshold = SILENCE_THRESHOLD_MS + _append_ms
-                                    if recording_duration >= effective_min_duration and silence_duration_ms >= _silence_stop_threshold:
+                                    # Push-to-talk hold (W3d): while physically held,
+                                    # never stop on silence -- only the manual
+                                    # turn-end signal (release) or max_duration can
+                                    # end the turn. See ptt_hold_active()'s docstring.
+                                    if (recording_duration >= effective_min_duration
+                                            and silence_duration_ms >= _silence_stop_threshold
+                                            and not ptt_hold_active()):
                                         logger.info(f"✓ Silence threshold reached after {recording_duration:.1f}s of recording")
                                         if VAD_DEBUG:
                                             logger.info(f"[VAD_DEBUG] STOP: silence_duration={silence_duration_ms}ms >= threshold={_silence_stop_threshold}ms")

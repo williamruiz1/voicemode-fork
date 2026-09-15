@@ -1006,6 +1006,26 @@ APPEND_WINDOW_FLAG_PATH = os.path.expanduser(
     os.getenv("VOICEMODE_APPEND_WINDOW_FLAG_PATH", "~/.voicemode/append-window-ms")
 )
 
+# 3) PUSH-TO-TALK HOLD (W3d push-to-talk dispatch, 2026-09-15): while a key/button
+#    is PHYSICALLY HELD, the trailing-silence stop decision (both the webrtcvad
+#    silence-threshold path and the Silero endpointing path) is suppressed
+#    entirely -- a natural pause mid-thought while held can never end the turn.
+#    Release is expected to ALSO drop ~/.voicemode/turn-end.signal (the existing
+#    push-to-talk "I'm done" signal, honored unconditionally every loop iteration
+#    regardless of this flag -- see converse.py's "Honor a manual turn-end signal
+#    first" block), so letting go ends the turn immediately rather than waiting
+#    for VAD. This is the seam a Hammerspoon press/release hotkey pair (or the
+#    equivalent SSH-over-Tailscale Shortcut pair) drives via
+#    convomode-turn-end.sh's `hold`/`release` subcommands. Same flag-file
+#    discipline as natural-mode.flag/step-away.enabled above: a live-pollable
+#    file, not an env var, because it's a moment-to-moment physical gesture.
+#    Absence (the default) is fully inert -- the outer max_duration ceiling and
+#    the turn-end signal are the only ways a turn ever ends either way, so this
+#    flag can never cause a hang, only suppress an early VAD stop.
+PTT_HOLD_FLAG_PATH = os.path.expanduser(
+    os.getenv("VOICEMODE_PTT_HOLD_FLAG_PATH", "~/.voicemode/ptt-hold.flag")
+)
+
 # Spoken-keyword triggers (only consulted when STEP_AWAY is enabled). A completed
 # transcription matching a step-away phrase makes the tool set the pause flag +
 # wait; a resume phrase (or the widget clearing the flag) resumes with a recap.
