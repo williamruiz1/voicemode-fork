@@ -104,6 +104,7 @@ from voice_mode.core import (
     play_system_audio
 )
 from voice_mode.audio_player import NonBlockingAudioPlayer, SPEAKING_FLAG_PATH, convomode_paused, PAUSE_FLAG_PATH
+from voice_mode import audio_player
 from voice_mode import barge_in
 from voice_mode.statistics_tracking import track_voice_interaction
 from voice_mode.utils import (
@@ -2123,6 +2124,12 @@ consult the MCP resources listed above.
                 # Speak the message
                 tts_start = time.perf_counter()
                 barge_in_result = None  # set below only when natural mode actually armed a listener
+                # Clear any barge-in flag left set by a prior turn before we
+                # speak, so a stale trigger (e.g. from a previous natural-mode
+                # turn that fired, then natural mode was switched off) can never
+                # truncate THIS playback. reset is otherwise only reached inside
+                # BargeInListener.start(), i.e. natural-mode turns only.
+                audio_player.reset_barge_in_event()
                 if should_skip_tts:
                     # Skip TTS entirely for faster response
                     tts_success = True
