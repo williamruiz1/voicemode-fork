@@ -90,6 +90,8 @@ from voice_mode.config import (
     STEP_AWAY_PHRASES,
     STEP_AWAY_RESUME_PHRASES,
     PTT_HOLD_FLAG_PATH,
+    BT_MIC_HOLD_ENABLED,
+    LISTEN_STALL_TIMEOUT_SECONDS,
 )
 import voice_mode.config
 from voice_mode.provider_discovery import provider_registry
@@ -906,6 +908,55 @@ def _duplex_device_pair():
     return (in_dev, None)
 
 
+def _open_bt_mic_hold(force: bool = False):
+    """Open a silent full-duplex "holder" stream on a Bluetooth headset BEFORE
+    the "listening" chime, so the A2DP->HFP switch (measured ~0.6-0.7s of
+    digital-zero input on AirPods, 2026-09-27) finishes before William starts
+    talking. Keep it open until the recording returns (_close_bt_mic_hold):
+    the recording stream then opens onto an already-live HFP link.
+
+    The holder's input is DISCARDED. Unlike the reverted pre-roll warm-up
+    (e407941f), nothing it captures reaches the recording, the VAD, or
+    speech_detected, and the recording path is byte-for-byte unchanged.
+
+    No-op (returns None) when disabled or when the input isn't Bluetooth
+    (unless force=True, used by the verification harness). Never raises.
+    """
+    if not force and not (BT_MIC_HOLD_ENABLED and _bluetooth_input_active()):
+        return None
+
+    def _in_cb(indata, frames, time_info, status):
+        pass
+
+    def _duplex_cb(indata, outdata, frames, time_info, status):
+        outdata.fill(0)
+
+    try:
+        if _bluetooth_input_active():
+            stream = sd.Stream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
+                               device=_duplex_device_pair(), callback=_duplex_cb)
+        else:
+            stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
+                                    callback=_in_cb)
+        stream.start()
+        logger.info("🎧 Bluetooth mic hold opened before the chime")
+        return stream
+    except Exception as e:
+        logger.debug(f"Bluetooth mic hold failed to open (continuing without it): {e}")
+        return None
+
+
+def _close_bt_mic_hold(stream) -> None:
+    """Close a holder from _open_bt_mic_hold(). Safe on None; never raises."""
+    if stream is None:
+        return
+    try:
+        stream.stop()
+        stream.close()
+    except Exception as e:
+        logger.debug(f"Bluetooth mic hold close failed (ignored): {e}")
+
+
 def _record_audio_duplex(samples_to_record: int) -> np.ndarray:
     """Fixed-length capture over a full-duplex stream whose output is silence.
 
@@ -1385,7 +1436,11 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
         # so his interruption becomes the start of this turn's speech rather
         # than being thrown away.
         has_pre_roll = pre_roll is not None and len(pre_roll) > 0
-        chunks = [pre_roll] if has_pre_roll else []
+        # Flatten: every live chunk below is 1-D, and np.concatenate of a 2-D
+        # (n, 1) pre-roll with 1-D chunks raises -> the except path falls back
+        # to a FIXED max_duration (120s) recording. That is exactly how the
+        # reverted pre-chime warm-up (e407941f) made recordings never end.
+        chunks = [np.asarray(pre_roll).reshape(-1)] if has_pre_roll else []
         silence_duration_ms = 0
         recording_duration = (len(pre_roll) / SAMPLE_RATE) if has_pre_roll else 0
         speech_detected = has_pre_roll
@@ -1475,6 +1530,7 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
             with stream_ctx:
                 
                 logger.debug("Started continuous audio stream")
+                _last_chunk_at = [None]  # stall guard (see queue.Empty below)
 
                 # Manual turn-end signal (push-to-talk "I'm done"). A reachable-while-
                 # driving surface (Apple Shortcut → SSH → `touch`) drops this file to end
@@ -1580,6 +1636,7 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                             # Raise an exception to trigger recovery logic
                             raise sd.PortAudioError("Audio device disconnected or unavailable")
                         
+                        _last_chunk_at[0] = time.monotonic()
                         # Flatten for consistency
                         chunk_flat = chunk.flatten()
                         chunks.append(chunk_flat)
@@ -1705,7 +1762,17 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                         recording_duration += chunk_duration_s
                             
                     except queue.Empty:
-                        # No audio data available, continue waiting
+                        # No audio data available, continue waiting -- but a
+                        # stream that delivers NOTHING never advances
+                        # recording_duration, so without this guard the loop
+                        # would spin forever instead of reaching max_duration.
+                        if LISTEN_STALL_TIMEOUT_SECONDS > 0:
+                            _now = time.monotonic()
+                            if _last_chunk_at[0] is None:
+                                _last_chunk_at[0] = _now
+                            elif _now - _last_chunk_at[0] >= LISTEN_STALL_TIMEOUT_SECONDS:
+                                logger.error(f"Input stream delivered no audio for {LISTEN_STALL_TIMEOUT_SECONDS:.0f}s - ending listen")
+                                break
                         continue
                     except Exception as e:
                         logger.error(f"Error processing audio chunk: {e}")
@@ -2328,6 +2395,7 @@ consult the MCP resources listed above.
                     return result
 
                 natural_mode_barge_in = barge_in_result is not None and barge_in_result.triggered
+                _bt_mic_hold = None  # see _open_bt_mic_hold(); closed after the recording returns
 
                 if natural_mode_barge_in:
                     # He was already mid-utterance when he interrupted -- a
@@ -2337,6 +2405,10 @@ consult the MCP resources listed above.
                     # with the audio the barge-in listener already captured.
                     logger.info("🎤 Natural mode barge-in — continuing to listen without a chime")
                 else:
+                    # Hold the Bluetooth mic open BEFORE the pause + chime so the
+                    # A2DP->HFP switch is done before he starts talking.
+                    _bt_mic_hold = _open_bt_mic_hold()
+
                     # Brief pause before listening
                     await asyncio.sleep(0.5)
 
@@ -2433,9 +2505,12 @@ consult the MCP resources listed above.
 
                 record_start = time.perf_counter()
                 logger.debug(f"About to call record_audio_with_silence_detection with duration={listen_duration_max}, disable_silence_detection={disable_silence_detection}, min_duration={listen_duration_min}, vad_aggressiveness={vad_aggressiveness}, natural_mode_barge_in={natural_mode_barge_in}")
-                audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                    None, _record_call
-                )
+                try:
+                    audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
+                        None, _record_call
+                    )
+                finally:
+                    _close_bt_mic_hold(_bt_mic_hold)
                 timings['record'] = time.perf_counter() - record_start
 
                 # Log recording end
@@ -2674,6 +2749,8 @@ consult the MCP resources listed above.
                         # Listen again for response - reuse the recording logic
                         logger.info("Listening for response after repeat...")
 
+                        _bt_mic_hold = _open_bt_mic_hold()  # see primary listen above
+
                         # Play "listening" feedback sound
                         await play_audio_feedback(
                             "listening",
@@ -2686,9 +2763,12 @@ consult the MCP resources listed above.
 
                         # Record audio
                         record_start = time.perf_counter()
-                        audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, _listen_call()
-                        )
+                        try:
+                            audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
+                                None, _listen_call()
+                            )
+                        finally:
+                            _close_bt_mic_hold(_bt_mic_hold)
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
 
@@ -2743,6 +2823,8 @@ consult the MCP resources listed above.
                     # After waiting, listen again
                     logger.info("Wait period ended. Listening for response...")
                     if transport == "local":
+                        _bt_mic_hold = _open_bt_mic_hold()  # see primary listen above
+
                         # Play "listening" feedback sound
                         await play_audio_feedback(
                             "listening",
@@ -2755,9 +2837,12 @@ consult the MCP resources listed above.
 
                         # Record audio
                         record_start = time.perf_counter()
-                        audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, _listen_call()
-                        )
+                        try:
+                            audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
+                                None, _listen_call()
+                            )
+                        finally:
+                            _close_bt_mic_hold(_bt_mic_hold)
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
 

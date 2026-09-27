@@ -1062,6 +1062,21 @@ CHIME_LEADING_SILENCE = float(os.getenv("VOICEMODE_CHIME_LEADING_SILENCE", "0.1"
 # Trailing silence after chimes to prevent cutoff
 CHIME_TRAILING_SILENCE = float(os.getenv("VOICEMODE_CHIME_TRAILING_SILENCE", "0.2"))  # Default 0.2s - reduced for responsiveness
 
+# Bluetooth mic hold (2026-09-27 fix: first words clipped after the chime on
+# AirPods). When the default input is a Bluetooth headset, a silent
+# full-duplex "holder" stream is opened BEFORE the pre-listen pause + chime
+# and kept open until the recording returns, so the A2DP->HFP switch (~0.6s
+# of digital-zero input) finishes before he starts talking and the recording
+# stream opens onto an already-live mic. The holder only holds the link; its
+# input is discarded -- nothing is fed into the recording or the VAD.
+BT_MIC_HOLD_ENABLED = os.getenv("VOICEMODE_BT_MIC_HOLD_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+
+# Stall guard for the silence-detection listen loop: if the input stream
+# delivers no audio at all for this many seconds, stop the listen instead of
+# spinning forever (recording_duration only advances on delivered chunks, so
+# a stalled stream otherwise never reaches max_duration). 0 disables.
+LISTEN_STALL_TIMEOUT_SECONDS = float(os.getenv("VOICEMODE_LISTEN_STALL_TIMEOUT_SECONDS", "5.0"))
+
 # Audio format configuration
 AUDIO_FORMAT = os.getenv("VOICEMODE_AUDIO_FORMAT", "pcm").lower()
 TTS_AUDIO_FORMAT = os.getenv("VOICEMODE_TTS_AUDIO_FORMAT", "pcm").lower()  # Default to PCM for optimal streaming
