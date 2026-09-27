@@ -90,6 +90,8 @@ from voice_mode.config import (
     STEP_AWAY_PHRASES,
     STEP_AWAY_RESUME_PHRASES,
     PTT_HOLD_FLAG_PATH,
+    PRE_CHIME_WARMUP_ENABLED,
+    PRE_CHIME_WARMUP_MAX_SECONDS,
 )
 import voice_mode.config
 from voice_mode.provider_discovery import provider_registry
@@ -904,6 +906,73 @@ def _duplex_device_pair():
     except Exception as e:
         logger.debug(f"Duplex output resolution failed (using default output): {e}")
     return (in_dev, None)
+
+
+def _start_pre_chime_capture():
+    """Open the listen-mode input stream EARLY (before/while the "listening"
+    chime plays) and start filling a ring buffer, so a Bluetooth headset's
+    A2DP->HFP profile renegotiation happens during the chime instead of
+    after it -- fixes recording-start cutoff (2026-09-27, William, AirPods:
+    the first ~2 words after the chime were lost; a diagnostic harness
+    confirmed ~0.6-0.7s of literal digital-zero capture beginning the moment
+    the mic stream opens today, landing squarely in the window he starts
+    talking. Opening the same kind of stream ~1s earlier moves that same
+    dead window entirely before the chime ends, per the harness's --warm
+    run: first live audio at +0.010s after chime-end vs +0.998s baseline).
+
+    Mirrors _bluetooth_input_active()/_duplex_device_pair() above -- full
+    duplex (silent output + live input) on Bluetooth, plain input-only
+    otherwise. Returns (stream, chunks) on success; (None, None) if the
+    stream can't be opened, in which case the caller simply gets no pre-roll
+    (today's behavior, unchanged).
+    """
+    if not PRE_CHIME_WARMUP_ENABLED:
+        return None, None
+
+    chunks = []
+
+    def _cb(indata, frames, time_info, status):
+        if status:
+            logger.debug(f"pre-chime warm-up stream status: {status}")
+        chunks.append(indata.copy())
+
+    def _duplex_cb(indata, outdata, frames, time_info, status):
+        outdata.fill(0)
+        _cb(indata, frames, time_info, status)
+
+    try:
+        if _bluetooth_input_active():
+            stream = sd.Stream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
+                               device=_duplex_device_pair(), callback=_duplex_cb)
+        else:
+            stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
+                                    callback=_cb)
+        stream.start()
+        return stream, chunks
+    except Exception as e:
+        logger.debug(f"pre-chime mic warm-up failed to open (continuing without pre-roll): {e}")
+        return None, None
+
+
+def _stop_pre_chime_capture(stream, chunks):
+    """Stop/close the warm-up stream from _start_pre_chime_capture() and
+    return its captured audio as a (n, 1) int16 array (or None if nothing
+    was captured), capped to PRE_CHIME_WARMUP_MAX_SECONDS -- defensive only;
+    the real pre-listen window is well under a second, this just bounds it
+    if chime playback itself ever hangs."""
+    if stream is not None:
+        try:
+            stream.stop()
+            stream.close()
+        except Exception as e:
+            logger.debug(f"pre-chime warm-up stream close failed (ignored): {e}")
+    if not chunks:
+        return None
+    data = np.concatenate([c.reshape(-1) for c in chunks])
+    max_samples = int(PRE_CHIME_WARMUP_MAX_SECONDS * SAMPLE_RATE)
+    if len(data) > max_samples:
+        data = data[-max_samples:]
+    return data.reshape(-1, 1)
 
 
 def _record_audio_duplex(samples_to_record: int) -> np.ndarray:
@@ -2328,6 +2397,7 @@ consult the MCP resources listed above.
                     return result
 
                 natural_mode_barge_in = barge_in_result is not None and barge_in_result.triggered
+                chime_pre_roll = None  # set below only on the chime path (see fix note on _start_pre_chime_capture)
 
                 if natural_mode_barge_in:
                     # He was already mid-utterance when he interrupted -- a
@@ -2337,6 +2407,12 @@ consult the MCP resources listed above.
                     # with the audio the barge-in listener already captured.
                     logger.info("🎤 Natural mode barge-in — continuing to listen without a chime")
                 else:
+                    # Warm the mic BEFORE the pause+chime (recording-start-cutoff
+                    # fix) so a Bluetooth A2DP->HFP switch happens while nobody's
+                    # talking yet, not in the moment he starts. See
+                    # _start_pre_chime_capture()'s docstring for the measured fix.
+                    _pre_chime_stream, _pre_chime_chunks = _start_pre_chime_capture()
+
                     # Brief pause before listening
                     await asyncio.sleep(0.5)
 
@@ -2349,6 +2425,8 @@ consult the MCP resources listed above.
                         chime_leading_silence=chime_leading_silence,
                         chime_trailing_silence=chime_trailing_silence
                     )
+
+                    chime_pre_roll = _stop_pre_chime_capture(_pre_chime_stream, _pre_chime_chunks)
 
                     # Record response
                     logger.info(f"🎤 Listening for {listen_duration_max} seconds...")
@@ -2426,7 +2504,7 @@ consult the MCP resources listed above.
                         logger.debug(f"step-away check-in failed (ignored): {_e}")
 
                 _record_call = _listen_call(
-                    pre_roll=(barge_in_result.pre_roll if natural_mode_barge_in else None),
+                    pre_roll=(barge_in_result.pre_roll if natural_mode_barge_in else chime_pre_roll),
                     step_away_state=step_away_state,
                     checkin_callback=(_stepaway_checkin if _sa_on else None),
                 )
@@ -2674,6 +2752,10 @@ consult the MCP resources listed above.
                         # Listen again for response - reuse the recording logic
                         logger.info("Listening for response after repeat...")
 
+                        # Warm the mic before the chime (same recording-start-
+                        # cutoff fix as the primary listen above).
+                        _pre_chime_stream, _pre_chime_chunks = _start_pre_chime_capture()
+
                         # Play "listening" feedback sound
                         await play_audio_feedback(
                             "listening",
@@ -2684,10 +2766,12 @@ consult the MCP resources listed above.
                             chime_trailing_silence=chime_trailing_silence
                         )
 
+                        _repeat_pre_roll = _stop_pre_chime_capture(_pre_chime_stream, _pre_chime_chunks)
+
                         # Record audio
                         record_start = time.perf_counter()
                         audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, _listen_call()
+                            None, _listen_call(pre_roll=_repeat_pre_roll)
                         )
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
@@ -2743,6 +2827,10 @@ consult the MCP resources listed above.
                     # After waiting, listen again
                     logger.info("Wait period ended. Listening for response...")
                     if transport == "local":
+                        # Warm the mic before the chime (same recording-start-
+                        # cutoff fix as the primary listen above).
+                        _pre_chime_stream, _pre_chime_chunks = _start_pre_chime_capture()
+
                         # Play "listening" feedback sound
                         await play_audio_feedback(
                             "listening",
@@ -2753,10 +2841,12 @@ consult the MCP resources listed above.
                             chime_trailing_silence=chime_trailing_silence
                         )
 
+                        _wait_pre_roll = _stop_pre_chime_capture(_pre_chime_stream, _pre_chime_chunks)
+
                         # Record audio
                         record_start = time.perf_counter()
                         audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, _listen_call()
+                            None, _listen_call(pre_roll=_wait_pre_roll)
                         )
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing

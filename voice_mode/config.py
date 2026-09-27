@@ -262,6 +262,14 @@ def load_voicemode_env():
 # Silence after chime in seconds - prevents cutoff (default: 0.2)
 # VOICEMODE_CHIME_TRAILING_SILENCE=0.2
 
+# Warm up the mic (open the listen-mode input stream) during the pre-listen
+# pause + chime instead of after it, feeding the captured audio in as
+# pre_roll -- fixes Bluetooth A2DP->HFP switch cost eating the first words
+# spoken right after the chime (default: true)
+# VOICEMODE_PRE_CHIME_WARMUP_ENABLED=true
+# Defensive cap in seconds on how much warm-up audio is kept (default: 2.0)
+# VOICEMODE_PRE_CHIME_WARMUP_MAX_SECONDS=2.0
+
 #############
 # Audio Format Configuration
 #############
@@ -1061,6 +1069,17 @@ WAIT_DURATION = float(os.getenv("VOICEMODE_WAIT_DURATION", "60.0"))  # Default 6
 CHIME_LEADING_SILENCE = float(os.getenv("VOICEMODE_CHIME_LEADING_SILENCE", "0.1"))  # Default 0.1s - minimal delay for Bluetooth
 # Trailing silence after chimes to prevent cutoff
 CHIME_TRAILING_SILENCE = float(os.getenv("VOICEMODE_CHIME_TRAILING_SILENCE", "0.2"))  # Default 0.2s - reduced for responsiveness
+
+# Pre-chime mic warm-up (2026-09-27 fix: recording-start cutoff). Opens the
+# listen-mode input stream (full-duplex on Bluetooth) during the pre-listen
+# pause + "listening" chime instead of after it, so a Bluetooth headset's
+# A2DP->HFP profile renegotiation happens while nobody is talking yet. Its
+# captured audio is fed in as pre_roll -- disable only for debugging.
+PRE_CHIME_WARMUP_ENABLED = os.getenv("VOICEMODE_PRE_CHIME_WARMUP_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+# Defensive cap on how much warm-up audio is kept (seconds) -- the real
+# pre-listen window is well under a second; this only bites if chime
+# playback itself hangs.
+PRE_CHIME_WARMUP_MAX_SECONDS = float(os.getenv("VOICEMODE_PRE_CHIME_WARMUP_MAX_SECONDS", "2.0"))
 
 # Audio format configuration
 AUDIO_FORMAT = os.getenv("VOICEMODE_AUDIO_FORMAT", "pcm").lower()
