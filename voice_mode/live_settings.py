@@ -13,7 +13,8 @@ Schema (all keys optional)::
       "vad_aggressiveness": 2,        # int,    0..3
       "listen_duration_max": 120,     # number, >0..3600 seconds
       "listen_duration_min": 2.0,     # number, 0..3600 seconds
-      "append_window_ms": 0           # int,    0..10000
+      "append_window_ms": 0,          # int,    0..10000
+      "endpointing_min_endpoint_ms": 500  # int,  100..5000 (Silero end-of-turn silence)
     }
 """
 
@@ -63,6 +64,7 @@ _VALIDATORS = {
     "listen_duration_max": _num_in(0, 3600, lo_exclusive=True),
     "listen_duration_min": _num_in(0, 3600),
     "append_window_ms": _int_in(0, 10000),
+    "endpointing_min_endpoint_ms": _int_in(100, 5000),
 }
 
 

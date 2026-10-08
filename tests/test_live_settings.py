@@ -187,3 +187,34 @@ def test_converse_signature_defaults_are_none_so_explicit_wins():
     sig = inspect.signature(fn)
     assert sig.parameters["listen_duration_max"].default is None
     assert sig.parameters["listen_duration_min"].default is None
+
+
+# ---- Silero endpointing: min_endpoint_ms read per call ----
+
+def _endpointer_min_ms():
+    """Run the endpointing record loop on scripted audio; return the min_endpoint_ms the Endpointer was built with."""
+    chunk = np.zeros((int(conv.SAMPLE_RATE * conv.VAD_CHUNK_DURATION_MS / 1000), 1), dtype=np.int16)
+    q = MagicMock()
+    q.get.side_effect = [chunk] * 3
+    with patch.object(conv, "Endpointer") as ep, patch.object(conv, "ENDPOINTING_ENABLED", True), \
+         patch.object(conv, "SILERO_AVAILABLE", True), patch.object(conv, "VAD_AVAILABLE", True), \
+         patch.object(conv, "DISABLE_SILENCE_DETECTION", False), patch.object(conv, "webrtcvad"), \
+         patch.object(conv, "sd") as sd, patch("queue.Queue", return_value=q):
+        sd.InputStream.return_value.__enter__.return_value = MagicMock()
+        try:
+            conv.record_audio_with_silence_detection(max_duration=1.0, min_duration=0.0)
+        except Exception:
+            pass
+        return ep.call_args.kwargs["min_endpoint_ms"]
+
+
+def test_endpointing_min_endpoint_ms_live_on_next_call(temp_home):
+    assert _endpointer_min_ms() == conv.ENDPOINTING_MIN_ENDPOINT_MS  # no file = old behavior
+    write(temp_home, {"endpointing_min_endpoint_ms": 1200})
+    assert _endpointer_min_ms() == 1200
+    write(temp_home, {"endpointing_min_endpoint_ms": 300, "append_window_ms": 200})
+    assert _endpointer_min_ms() == 500  # 300 + 200 append
+    write(temp_home, {"endpointing_min_endpoint_ms": 50})  # out of range -> ignored
+    assert _endpointer_min_ms() == conv.ENDPOINTING_MIN_ENDPOINT_MS
+    write(temp_home, {"endpointing_min_endpoint_ms": 6000})
+    assert _endpointer_min_ms() == conv.ENDPOINTING_MIN_ENDPOINT_MS

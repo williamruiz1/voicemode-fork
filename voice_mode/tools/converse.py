@@ -1358,16 +1358,17 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
             # reproduces the webrtcvad path's `_silence_stop_threshold =
             # SILENCE_THRESHOLD_MS + _append_ms` + resume-cancels-the-timer
             # behavior exactly. _append_ms == 0 (default) -> unchanged.
+            _live_endpoint_ms = get_live("endpointing_min_endpoint_ms", ENDPOINTING_MIN_ENDPOINT_MS)
             endpointer = Endpointer(
                 sample_rate=vad_sample_rate,
                 speech_threshold=ENDPOINTING_SPEECH_THRESHOLD,
-                min_endpoint_ms=ENDPOINTING_MIN_ENDPOINT_MS + _append_ms,
+                min_endpoint_ms=_live_endpoint_ms + _append_ms,
                 min_speech_ms=ENDPOINTING_MIN_SPEECH_MS,
             )
             endpointer.reset()
             logger.info(
                 f"🎙️ endpointing enabled (Silero): speech_threshold={ENDPOINTING_SPEECH_THRESHOLD}, "
-                f"min_endpoint_ms={ENDPOINTING_MIN_ENDPOINT_MS}(+{_append_ms} append)={ENDPOINTING_MIN_ENDPOINT_MS + _append_ms}, "
+                f"min_endpoint_ms={_live_endpoint_ms}(+{_append_ms} append)={_live_endpoint_ms + _append_ms}, "
                 f"min_speech_ms={ENDPOINTING_MIN_SPEECH_MS}"
             )
 
