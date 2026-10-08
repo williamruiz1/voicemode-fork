@@ -1079,6 +1079,9 @@ async def _preempt_conch_after_tts_grace(conch: Conch, speaking_flag_path: str =
 # Small PURE helpers so the record loop's new behavior is unit-testable without a
 # microphone. All resolve to inert values by default (step-away off, append 0).
 
+from voice_mode.live_settings import get_live  # noqa: E402
+
+
 def step_away_enabled() -> bool:
     """Runtime check: step-away is ON if the env flag is set OR the flag file
     exists (mirrors the natural-mode.flag discipline — toggle live, no respawn).
@@ -1095,6 +1098,13 @@ def append_window_ms() -> int:
     """Runtime resolve of the append-to-turn grace (ms). A live knob file
     (~/.voicemode/append-window-ms with an integer body) overrides the env so it
     can be tuned without a respawn. Default 0 = OFF = byte-for-byte prior loop."""
+    try:
+        from voice_mode.live_settings import load_live_settings
+        _live = load_live_settings()
+        if "append_window_ms" in _live:
+            return _live["append_window_ms"]
+    except Exception:
+        pass
     try:
         if os.path.exists(APPEND_WINDOW_FLAG_PATH):
             with open(APPEND_WINDOW_FLAG_PATH) as f:
@@ -1291,6 +1301,9 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
 
     # --- founder-os#11655: resolve pause/step-away/append config (all inert by default) ---
     _append_ms = append_window_override_ms if append_window_override_ms is not None else append_window_ms()
+    # Live settings (re-read every call; see voice_mode/live_settings.py).
+    _live_silence_ms = get_live("silence_threshold_ms", SILENCE_THRESHOLD_MS)
+    _live_vad = get_live("vad_aggressiveness", VAD_AGGRESSIVENESS)
     _step_away_on = step_away_enabled_override if step_away_enabled_override is not None else step_away_enabled()
     if _step_away_on and pause_check is None:
         pause_check = convomode_paused  # reuse the existing pause primitive
@@ -1317,7 +1330,7 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
     
     try:
         # Initialize VAD with provided aggressiveness or default
-        effective_vad_aggressiveness = vad_aggressiveness if vad_aggressiveness is not None else VAD_AGGRESSIVENESS
+        effective_vad_aggressiveness = vad_aggressiveness if vad_aggressiveness is not None else _live_vad
         vad = webrtcvad.Vad(effective_vad_aggressiveness)
 
         # Calculate chunk size (must be 10, 20, or 30ms worth of samples)
@@ -1391,7 +1404,7 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
         original_stderr = sys.stderr
         
         logger.debug(f"VAD config - Aggressiveness: {effective_vad_aggressiveness} (param: {vad_aggressiveness}, default: {VAD_AGGRESSIVENESS}), "
-                    f"Silence threshold: {SILENCE_THRESHOLD_MS}ms, "
+                    f"Silence threshold: {_live_silence_ms}ms, "
                     f"Min duration: {MIN_RECORDING_DURATION}s, "
                     f"Initial grace period: {INITIAL_SILENCE_GRACE_PERIOD}s")
         
@@ -1401,7 +1414,7 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
             logger.info(f"[VAD_DEBUG]   min_duration: {min_duration}s")
             logger.info(f"[VAD_DEBUG]   effective_min_duration: {max(MIN_RECORDING_DURATION, min_duration)}s")
             logger.info(f"[VAD_DEBUG]   VAD aggressiveness: {effective_vad_aggressiveness}")
-            logger.info(f"[VAD_DEBUG]   Silence threshold: {SILENCE_THRESHOLD_MS}ms")
+            logger.info(f"[VAD_DEBUG]   Silence threshold: {_live_silence_ms}ms")
             logger.info(f"[VAD_DEBUG]   Sample rate: {SAMPLE_RATE}Hz (VAD using {vad_sample_rate}Hz)")
             logger.info(f"[VAD_DEBUG]   Chunk duration: {VAD_CHUNK_DURATION_MS}ms")
         
@@ -1643,14 +1656,14 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                                     # Append-to-turn (founder-os#11655): if speech resumes
                                     # AFTER the normal silence threshold but within the
                                     # extra append window, it continues the SAME turn.
-                                    if _append_ms > 0 and silence_duration_ms >= SILENCE_THRESHOLD_MS:
+                                    if _append_ms > 0 and silence_duration_ms >= _live_silence_ms:
                                         logger.info(f"➕ append-to-turn: speech resumed within window (was {silence_duration_ms}ms silent) — continuing same turn")
                                     silence_duration_ms = 0
                                 else:
                                     # SILENCE_AFTER_SPEECH state - accumulate silence
                                     silence_duration_ms += VAD_CHUNK_DURATION_MS
                                     if VAD_DEBUG and silence_duration_ms % 100 == 0:  # More frequent logging in debug mode
-                                        logger.info(f"[VAD_DEBUG] Accumulating silence: {silence_duration_ms}/{SILENCE_THRESHOLD_MS}ms, t={recording_duration:.1f}s")
+                                        logger.info(f"[VAD_DEBUG] Accumulating silence: {silence_duration_ms}/{_live_silence_ms}ms, t={recording_duration:.1f}s")
                                     elif silence_duration_ms % 200 == 0:  # Log every 200ms
                                         logger.debug(f"Silence: {silence_duration_ms}ms")
 
@@ -1660,7 +1673,7 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                                     # Append-to-turn (founder-os#11655): extend the trailing-
                                     # silence threshold by the append window. _append_ms=0
                                     # (default) → identical to prior behavior.
-                                    _silence_stop_threshold = SILENCE_THRESHOLD_MS + _append_ms
+                                    _silence_stop_threshold = _live_silence_ms + _append_ms
                                     if recording_duration >= effective_min_duration and silence_duration_ms >= _silence_stop_threshold:
                                         logger.info(f"✓ Silence threshold reached after {recording_duration:.1f}s of recording")
                                         if VAD_DEBUG:
@@ -1791,8 +1804,8 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
 async def converse(
     message: str,
     wait_for_response: Union[bool, str] = True,
-    listen_duration_max: float = DEFAULT_LISTEN_DURATION,
-    listen_duration_min: float = 2.0,
+    listen_duration_max: Optional[float] = None,
+    listen_duration_min: Optional[float] = None,
     timeout: float = 60.0,
     voice: Optional[str] = None,
     tts_provider: Optional[Literal["openai", "kokoro"]] = None,
@@ -1870,8 +1883,8 @@ TIMING PARAMETERS (usually leave at defaults):
   Silence detection handles most cases automatically. Only override these if
   silence detection is disabled or the user reports being cut off.
   Defaults are configurable by the user via ~/.voicemode/voicemode.env.
-• listen_duration_max (number, default: 120): Max listen time in seconds
-• listen_duration_min (number, default: 2.0): Min recording time before silence detection
+• listen_duration_max (number, default: 120): Max listen time in seconds (omit to use the live setting)
+• listen_duration_min (number, default: 2.0): Min recording time before silence detection (omit to use the live setting)
 
 PRIVACY: Microphone access required when wait_for_response=true.
          Audio processed via STT service, not stored.
@@ -1961,6 +1974,13 @@ consult the MCP resources listed above.
         if not isinstance(vad_aggressiveness, int) or vad_aggressiveness < 0 or vad_aggressiveness > 3:
             return f"Error: vad_aggressiveness must be an integer between 0 and 3 (got {vad_aggressiveness})"
     
+    # Live settings: explicit per-call params win; otherwise the live file (re-read
+    # on every call), otherwise the configured defaults.
+    if listen_duration_max is None:
+        listen_duration_max = get_live("listen_duration_max", DEFAULT_LISTEN_DURATION)
+    if listen_duration_min is None:
+        listen_duration_min = get_live("listen_duration_min", 2.0)
+
     # Validate duration parameters
     if wait_for_response:
         if listen_duration_min < 0:
@@ -2811,8 +2831,8 @@ consult the MCP resources listed above.
                         timing=stt_timing_str,
                         silence_detection={
                             "enabled": not (DISABLE_SILENCE_DETECTION or disable_silence_detection),
-                            "vad_aggressiveness": VAD_AGGRESSIVENESS,
-                            "silence_threshold_ms": SILENCE_THRESHOLD_MS
+                            "vad_aggressiveness": vad_aggressiveness if vad_aggressiveness is not None else get_live("vad_aggressiveness", VAD_AGGRESSIVENESS),
+                            "silence_threshold_ms": get_live("silence_threshold_ms", SILENCE_THRESHOLD_MS)
                         },
                         # Add timing metrics
                         transcription_time=timings.get('stt'),
