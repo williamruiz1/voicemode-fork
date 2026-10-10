@@ -186,6 +186,16 @@ def _reset_audio_player_state():
     ap.reset_barge_in_event()
 
 
+@pytest.fixture(autouse=True)
+def _natural_mode_on(monkeypatch):
+    """Mid-stream barge-in is only honoured in natural mode (streaming.py gates
+    audio_player.barge_in_triggered() on barge_in.natural_mode_enabled(), added
+    when the sticky flag was fixed). These tests exercise that path, so turn it
+    on explicitly instead of depending on a flag file existing on the host."""
+    from voice_mode import barge_in
+    monkeypatch.setattr(barge_in, "natural_mode_enabled", lambda: True)
+
+
 def _chunk(n_samples, value=100):
     """One PCM chunk: n_samples of int16, as bytes."""
     return np.full(n_samples, value, dtype=np.int16).tobytes()
@@ -336,3 +346,38 @@ class TestFormatTruncationNote:
         note = _format_truncation_note({"truncated": True})
         assert note is not None
         assert "INTERRUPTED" in note
+
+
+class TestTriggerLeadSubtractionDirection:
+    """Pin the SIGN of the barge-in trigger-lead correction.
+
+    A verifier flipped `elapsed - lead` to `elapsed + lead` in a scratch copy
+    and every other test still passed. He was already talking BARGE_IN_
+    TRIGGER_MS before the trigger fired, so the audio he actually heard is
+    SHORTER than what was written: the estimate must be fed elapsed MINUS lead.
+    """
+
+    async def test_estimate_is_fed_elapsed_minus_trigger_lead(self, monkeypatch):
+        monkeypatch.setattr(streaming.sd, "OutputStream", _FakeOutputStream)
+        monkeypatch.setattr(streaming, "BARGE_IN_TRIGGER_MS", 400)
+        seen = {}
+        real = streaming.estimate_truncation
+
+        def _spy(text, delivered_seconds, *a, **kw):
+            seen["delivered_seconds"] = delivered_seconds
+            return real(text, delivered_seconds, *a, **kw)
+
+        monkeypatch.setattr(streaming, "estimate_truncation", _spy)
+        sr = streaming.SAMPLE_RATE
+        client = _FakeOpenAIClient([_chunk(sr) for _ in range(4)], trigger_before_index=2)
+
+        _, metrics = await streaming.stream_pcm_audio(
+            text="First sentence here. Second sentence here. Third sentence here.",
+            openai_client=client,
+            request_params={"response_format": "pcm"},
+        )
+
+        assert metrics.elapsed_audio_seconds == pytest.approx(2.0, abs=1e-3)
+        assert seen["delivered_seconds"] == pytest.approx(2.0 - 0.4, abs=1e-3), (
+            "trigger-lead must be SUBTRACTED from the written audio time, not added"
+        )
