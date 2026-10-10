@@ -34,6 +34,7 @@ import fcntl
 import json
 import logging
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
@@ -119,6 +120,27 @@ class Conch:
     # Record key holding the monotonic generation counter (see is_superseded).
     EPOCH_KEY = "epoch"
 
+    # Record key set by preempt_acquire(). A PREEMPTED record may be backed by
+    # the epoch alone (no flock) while the superseded holder stands down, so
+    # try_acquire() treats a fresh, live one as authoritative even when the
+    # flock itself is free (see try_acquire).
+    PREEMPTED_KEY = "preempted"
+
+    # How long a preempter keeps re-attempting the flock for the superseded
+    # holder to stand down (it polls every audio chunk, so this is normally
+    # tens of ms). A holder that never drops it is stuck; we then proceed on
+    # the epoch alone -- the deliberate escape hatch.
+    PREEMPT_FLOCK_WAIT = 1.0
+    PREEMPT_FLOCK_POLL = 0.02
+
+    # A second preempter must not supersede a preemption that happened this
+    # recently: the first preempter won the race, and two simultaneous
+    # "winners" (one utterance of overlap) is the bug this closes.
+    PREEMPT_SETTLE_SECONDS = 5.0
+
+    # Max time to wait for the preemption mutex (serializes preempters).
+    PREEMPT_MUTEX_WAIT = 10.0
+
     def __init__(self, agent_name: Optional[str] = None):
         """Initialize Conch with optional agent name.
 
@@ -200,6 +222,26 @@ class Conch:
             # Try to get exclusive lock (non-blocking)
             fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
+            # A free flock is not proof the conch is free: a preempter may
+            # hold the RECORD by epoch alone while the superseded holder (which
+            # held the flock) stands down. A fresh, live preempted record is
+            # authoritative -- refuse rather than steal it.
+            live_preempter = self._live_preempted_record_from_fd(self._fd)
+            if live_preempter is not None:
+                logger.info(
+                    "Conch flock was free but a live preempter (pid %s, agent "
+                    "%s) holds a fresh record; refusing.",
+                    live_preempter.get("pid"), live_preempter.get("agent"),
+                )
+                try:
+                    fcntl.flock(self._fd, fcntl.LOCK_UN)
+                    os.close(self._fd)
+                except OSError:
+                    pass
+                self._fd = None
+                self._epoch = None
+                return False
+
             # Got lock - bump the generation counter and write our info. The
             # epoch is read from the record we are about to replace (we hold
             # the flock, so nobody can be mid-write), which makes it monotonic
@@ -234,6 +276,42 @@ class Conch:
                 self._fd = None
             self._epoch = None
             return False
+
+    @classmethod
+    def _live_preempted_record_from_fd(cls, fd: int) -> Optional[dict]:
+        """Return the record in `fd` iff it is a FRESH preempted claim whose
+        process is alive; otherwise None. Never raises."""
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            data = json.loads(os.read(fd, 65536).decode())
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+        return data if cls._is_live_fresh_preemption(data, cls._get_expiry()) else None
+
+    @staticmethod
+    def _get_expiry() -> float:
+        return _get_lock_expiry()
+
+    @classmethod
+    def _is_live_fresh_preemption(cls, data, max_age: float) -> bool:
+        if not isinstance(data, dict) or not data.get(cls.PREEMPTED_KEY):
+            return False
+        pid = data.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError):
+            pass
+        if max_age and max_age > 0:
+            try:
+                age = (datetime.now() - datetime.fromisoformat(data.get("acquired"))).total_seconds()
+            except (TypeError, ValueError):
+                return True  # cannot date it: fail closed
+            return age <= max_age
+        return True
 
     @staticmethod
     def _read_epoch_from_fd(fd: int) -> int:
@@ -746,6 +824,47 @@ class Conch:
         if not self.LOCK_FILE.exists():
             return self.try_acquire(agent)
 
+        # SERIALIZE preemption. Two preempters racing a holder neither can
+        # flock used to both claim the conch; now only one runs this section
+        # at a time and the loser sees the winner's fresh record (below).
+        mutex_fd = self._take_preempt_mutex()
+        if mutex_fd is None:
+            logger.warning("Conch preempt: could not take the preemption mutex "
+                           "within %.1fs; not preempting.", self.PREEMPT_MUTEX_WAIT)
+            return False
+        try:
+            return self._preempt_locked(agent)
+        finally:
+            try:
+                fcntl.flock(mutex_fd, fcntl.LOCK_UN)
+                os.close(mutex_fd)
+            except OSError:
+                pass
+
+    def _take_preempt_mutex(self) -> Optional[int]:
+        """Blocking-with-deadline flock on a sibling mutex file, or None."""
+        path = str(self.LOCK_FILE) + ".preempt"
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError:
+            return None
+        deadline = time.monotonic() + self.PREEMPT_MUTEX_WAIT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    return None
+                time.sleep(0.01)
+
+    def _preempt_locked(self, agent: str) -> bool:
+        """Body of preempt_acquire(); runs under the preemption mutex."""
+
         old_holder = None
         try:
             parsed = json.loads(self.LOCK_FILE.read_text())
@@ -759,6 +878,16 @@ class Conch:
                 "Conch preempt: existing lock record at %s is unreadable; "
                 "superseding it.", self.LOCK_FILE,
             )
+
+        # Someone else JUST preempted (and is alive): they won the race. Do not
+        # supersede them -- that would leave two processes each believing they
+        # hold the conch until the loser's next poll.
+        if (old_holder is not None and self.PREEMPT_SETTLE_SECONDS > 0
+                and self._is_live_fresh_preemption(old_holder, self.PREEMPT_SETTLE_SECONDS)):
+            logger.info("Conch preempt: pid %s preempted %s ago-or-less; not "
+                        "superseding a fresh preemption.", old_holder.get("pid"),
+                        self.PREEMPT_SETTLE_SECONDS)
+            return False
 
         prev_epoch = 0
         if old_holder is not None:
@@ -783,7 +912,8 @@ class Conch:
             prev_epoch = max(prev_epoch, self._read_epoch_from_fd(fd))
         except (BlockingIOError, OSError):
             # The superseded holder still flocks this inode. It stands down on
-            # its next should_yield() poll; we proceed by epoch.
+            # its next should_yield() poll; we proceed by epoch (below) and
+            # re-attempt the flock as it does.
             pass
 
         self._acquire_time = datetime.now()
@@ -794,6 +924,7 @@ class Conch:
             "acquired": self._acquire_time.isoformat(),
             "expires": None,
             self.EPOCH_KEY: self._epoch,
+            self.PREEMPTED_KEY: True,
         }
 
         try:
@@ -810,6 +941,22 @@ class Conch:
             self._epoch = None
             self._acquire_time = None
             return False
+
+        # The epoch is written, so the superseded holder can now see it lost and
+        # stand down (dropping its flock). Re-attempt the flock for a bounded
+        # time so the preempter ends up holding the record AND the flock; only
+        # a holder that never lets go (stuck) leaves us on the epoch alone.
+        if not have_flock:
+            deadline = time.monotonic() + max(0.0, self.PREEMPT_FLOCK_WAIT)
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    have_flock = True
+                    break
+                except (BlockingIOError, OSError):
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(self.PREEMPT_FLOCK_POLL)
 
         if have_flock:
             self._fd = fd
