@@ -156,6 +156,8 @@ class TestEngineSelectPreference:
         monkeypatch.setattr(bi, "SILERO_AVAILABLE", False)
 
     def test_default_prefers_aec3_when_available(self, monkeypatch):
+        # Constructs the REAL AEC3EchoCanceller (needs the native lib).
+        _skip_if_aec3_unavailable()
         monkeypatch.delenv("VOICEMODE_AEC", raising=False)
         monkeypatch.setattr(bi, "AEC3_AVAILABLE", True)
         monkeypatch.setattr(bi, "SPEEX_AVAILABLE", True)
@@ -188,6 +190,8 @@ class TestEngineSelectPreference:
         assert isinstance(listener._aec, bi.EchoCanceller)
 
     def test_explicit_aec3_pref_same_as_default(self, monkeypatch):
+        # Constructs the REAL AEC3EchoCanceller (needs the native lib).
+        _skip_if_aec3_unavailable()
         monkeypatch.setenv("VOICEMODE_AEC", "aec3")
         monkeypatch.setattr(bi, "AEC3_AVAILABLE", True)
         listener = bi.BargeInListener()
@@ -217,6 +221,8 @@ class TestEngineSelectPreference:
         assert listener._aec_kind == "nlms"
 
     def test_aec3_constructed_with_stream_delay_ms_not_manual_shift(self, monkeypatch):
+        # Constructs the REAL AEC3EchoCanceller (needs the native lib).
+        _skip_if_aec3_unavailable()
         """F5: AEC3 must receive the delay via stream_delay_ms at
         construction, not have the caller pre-shift the reference."""
         monkeypatch.delenv("VOICEMODE_AEC", raising=False)
