@@ -23,7 +23,9 @@ async def test_stt_audio_saved_with_simple_failover():
 
     # Create test audio data (1 second of silence at 24kHz to match SAMPLE_RATE)
     sample_rate = 24000  # Match SAMPLE_RATE from config
-    audio_data = np.zeros(sample_rate, dtype=np.int16)
+    # Non-silent: all-zero audio is (correctly) short-circuited by the STT
+    # silence gate before any provider call, which these tests need to reach.
+    audio_data = np.tile(np.array([3000, -3000], dtype=np.int16), sample_rate // 2)
 
     # Create a temporary directory for testing
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -78,7 +80,9 @@ async def test_stt_audio_not_saved_when_disabled():
 
     # Create test audio data at 24kHz to match SAMPLE_RATE
     sample_rate = 24000
-    audio_data = np.zeros(sample_rate, dtype=np.int16)
+    # Non-silent: all-zero audio is (correctly) short-circuited by the STT
+    # silence gate before any provider call, which these tests need to reach.
+    audio_data = np.tile(np.array([3000, -3000], dtype=np.int16), sample_rate // 2)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         test_audio_dir = Path(temp_dir) / "audio"

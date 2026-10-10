@@ -328,13 +328,16 @@ class TestBundledPatchShips:
         )
 
     def test_patch_targets_response_format(self):
-        """Smoke test: patch should add response_format form param and the
-        text/json/verbose_json branching block."""
+        """Smoke test: the patch (refreshed in a147ba9f after upstream absorbed
+        the response_format Form param + text/json branching natively) must
+        still hook the response_format branch and strip trailing-silence
+        hallucination segments."""
         from voice_mode.tools.mlx_audio.install import _PATCH_RESOURCE
         text = _PATCH_RESOURCE.read_text(encoding="utf-8")
-        assert "response_format: str = Form" in text
+        assert "voicemode-patch: honor OpenAI-style response_format" in text
+        assert 'response_format in ("text", "json", "verbose_json")' in text
         assert "PlainTextResponse" in text
-        assert "JSONResponse" in text
+        assert '("", ".", "...")' in text
 
     def test_pyproject_includes_patches_glob(self):
         """The wheel target must include *.patch under data/ or the patch
