@@ -218,3 +218,29 @@ class TestSupersedeCheckOnListenAgainSites:
             "supersede_check stopped working once CONCH_YIELD_ENABLED was "
             "turned off -- it must be independent of that flag"
         )
+
+
+class TestMidUtteranceSupersessionSurfacedByConverse:
+    @pytest.mark.asyncio
+    async def test_words_delivered_and_floor_loss_reported(self, clean_conch):
+        from voice_mode.tools.converse import converse
+
+        def _record(*args, **kwargs):
+            kwargs["yield_state"]["superseded_mid_utterance"] = True
+            return (_SPEECH_AUDIO.copy(), True)
+
+        with ExitStack() as stack:
+            stack.enter_context(patch(
+                "voice_mode.tools.converse.record_audio_with_silence_detection",
+                side_effect=_record,
+            ))
+            stack.enter_context(patch(
+                "voice_mode.simple_failover.simple_stt_failover",
+                new=AsyncMock(return_value={"text": "hello there", "provider": "test"}),
+            ))
+            _patch_tts_and_system_audio(stack)
+            result = await getattr(converse, "fn", converse)(
+                message="Test message", wait_for_response=True, chime_enabled=False,
+            )
+        assert "hello there" in result, "his words must not be discarded"
+        assert "floor lost mid-utterance" in result.lower()

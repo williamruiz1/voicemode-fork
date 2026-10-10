@@ -206,6 +206,9 @@ def isolate_home_directory(tmp_path, monkeypatch):
         from voice_mode.conch import Conch
         monkeypatch.setattr(Conch, "LOCK_FILE", fake_home / ".voicemode" / "conch")
         monkeypatch.setattr(Conch, "WANTED_FILE", fake_home / ".voicemode" / "conch-wanted")
+        # Keep preempt tests fast: don't wait a real second for a holder that
+        # (in single-process tests) is never going to stand down.
+        monkeypatch.setattr(Conch, "PREEMPT_FLOCK_WAIT", 0.05)
     except ImportError:
         pass
 

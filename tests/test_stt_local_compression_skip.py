@@ -17,7 +17,9 @@ async def test_stt_skips_compression_for_local_endpoint():
 
     # Create test audio data (1 second of silence at 24kHz to match SAMPLE_RATE)
     sample_rate = 24000
-    audio_data = np.zeros(sample_rate, dtype=np.int16)
+    # Non-silent: all-zero audio is (correctly) short-circuited by the STT
+    # silence gate before any provider call, which these tests need to reach.
+    audio_data = np.tile(np.array([3000, -3000], dtype=np.int16), sample_rate // 2)
 
     # Track what format was used
     format_used = None
@@ -65,7 +67,9 @@ async def test_stt_compresses_for_remote_endpoint():
     """Test that STT compresses when primary endpoint is remote (auto mode)."""
 
     sample_rate = 24000
-    audio_data = np.zeros(sample_rate, dtype=np.int16)
+    # Non-silent: all-zero audio is (correctly) short-circuited by the STT
+    # silence gate before any provider call, which these tests need to reach.
+    audio_data = np.tile(np.array([3000, -3000], dtype=np.int16), sample_rate // 2)
 
     format_used = None
 
@@ -112,7 +116,9 @@ async def test_stt_always_mode_compresses_local():
     """Test that STT_COMPRESS=always compresses even for local endpoints."""
 
     sample_rate = 24000
-    audio_data = np.zeros(sample_rate, dtype=np.int16)
+    # Non-silent: all-zero audio is (correctly) short-circuited by the STT
+    # silence gate before any provider call, which these tests need to reach.
+    audio_data = np.tile(np.array([3000, -3000], dtype=np.int16), sample_rate // 2)
 
     format_used = None
 
@@ -159,7 +165,9 @@ async def test_stt_never_mode_skips_compression_for_remote():
     """Test that STT_COMPRESS=never skips compression even for remote endpoints."""
 
     sample_rate = 24000
-    audio_data = np.zeros(sample_rate, dtype=np.int16)
+    # Non-silent: all-zero audio is (correctly) short-circuited by the STT
+    # silence gate before any provider call, which these tests need to reach.
+    audio_data = np.tile(np.array([3000, -3000], dtype=np.int16), sample_rate // 2)
 
     format_used = None
 

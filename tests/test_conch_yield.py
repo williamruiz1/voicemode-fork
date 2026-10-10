@@ -516,3 +516,51 @@ class TestPreemptAcquire:
         finally:
             proc.kill()
             proc.wait()
+
+
+class TestSupersessionMidUtterance:
+    """A holder superseded WHILE the human is mid-utterance must notice.
+
+    The old loop gated the supersede poll on `not speech_detected`, so a
+    superseded holder never learned it had lost until it next went idle. The
+    utterance still completes (standing down mid-sentence would throw away
+    what he is saying) but the loop must RECORD that supersession happened so
+    the caller can hand the floor over right after delivering it.
+    """
+
+    @staticmethod
+    def _run(supersede_check):
+        speech_chunk = (np.ones(_CHUNK_SAMPLES, dtype=np.int16) * 3000).reshape(-1, 1)
+        silence_chunk = np.zeros(_CHUNK_SAMPLES, dtype=np.int16).reshape(-1, 1)
+        q = MagicMock()
+        q.get.side_effect = [speech_chunk] * 5 + [silence_chunk] * 400
+        pre_roll = np.ones(int(SAMPLE_RATE * 0.3), dtype=np.int16) * 3000
+        yield_state = {"yielded": False}
+        vad = MagicMock()
+        vad.is_speech.return_value = False
+        with patch("voice_mode.tools.converse.sd") as mock_sd, \
+             patch("voice_mode.tools.converse.ENDPOINTING_ENABLED", False), \
+             patch("voice_mode.tools.converse.webrtcvad") as wv, \
+             patch("queue.Queue", return_value=q):
+            wv.Vad.return_value = vad
+            mock_sd.InputStream.return_value.__enter__.return_value = MagicMock()
+            mock_sd.InputStream.return_value.__exit__.return_value = False
+            audio, speech = record_audio_with_silence_detection(
+                max_duration=8.0, pre_roll=pre_roll,
+                supersede_check=supersede_check, yield_state=yield_state,
+            )
+        return audio, speech, yield_state
+
+    def test_mid_utterance_supersession_is_recorded_and_utterance_kept(self):
+        audio, speech, state = self._run(lambda: True)
+        assert speech is True and len(audio) > 0, "the utterance must not be discarded"
+        assert state["yielded"] is False, "must not abort mid-sentence"
+        assert state.get("superseded_mid_utterance") is True, (
+            "holder superseded mid-utterance never noticed -- it will keep "
+            "the conversation going on a conch it no longer owns"
+        )
+
+    def test_no_supersession_leaves_flag_unset(self):
+        _, speech, state = self._run(lambda: False)
+        assert speech is True
+        assert not state.get("superseded_mid_utterance")

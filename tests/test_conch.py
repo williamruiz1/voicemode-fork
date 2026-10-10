@@ -958,8 +958,11 @@ class TestConchSupersession:
         assert record[Conch.EPOCH_KEY] == 1
         rescuer.release()
 
-    def test_epoch_is_monotonic_across_successive_in_place_takeovers(self):
+    def test_epoch_is_monotonic_across_successive_in_place_takeovers(self, monkeypatch):
         """Each takeover of the same inode advances the generation counter."""
+        # Rapid successive takeovers are exactly what the preempt settle window
+        # refuses (see test_conch_preempt_flock.py); disable it for this test.
+        monkeypatch.setattr(Conch, "PREEMPT_SETTLE_SECONDS", 0.0)
         import fcntl as _fcntl
         seen = []
         for agent in ("a", "b", "c"):

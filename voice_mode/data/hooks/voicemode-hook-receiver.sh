@@ -180,27 +180,42 @@ if ! soundfonts_enabled; then
 fi
 
 # Check if a voice conversation is active (conch lock file)
-# If active, skip sound playback to avoid disrupting voice recording
+# If active, skip sound playback to avoid disrupting voice recording.
+#
+# FAIL CLOSED (mirrors Conch.read_lock_state() on the Python side): a lock file
+# that EXISTS but cannot be parsed, or carries no usable holder PID, is NOT
+# evidence the microphone is free -- it reads as ACTIVE. Only an ABSENT lock
+# file, or a holder PID confirmed dead, reads as inactive. (This used to return
+# "not active" on a corrupt record, so sound effects played over a live call.)
 converse_active() {
   local conch_file="$HOME/.voicemode/conch"
 
   # No lock file = no active conversation
-  [[ ! -f "$conch_file" ]] && return 1
+  [[ ! -e "$conch_file" ]] && return 1
 
-  # Check if the process holding the lock is still alive
+  # Lock file exists from here on: anything we cannot read is HELD.
+  [[ -r "$conch_file" ]] || return 0
+
   local pid
   if command -v jq &>/dev/null; then
-    pid=$(jq -r '.pid // ""' "$conch_file" 2>/dev/null)
+    pid=$(jq -r '.pid // ""' "$conch_file" 2>/dev/null) || return 0
   else
     # Fallback: basic grep for pid field
-    pid=$(grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' "$conch_file" | grep -o '[0-9]*' || echo "")
+    pid=$(grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' "$conch_file" 2>/dev/null | grep -o '[0-9]*' || echo "")
   fi
 
-  # If no valid PID, lock is stale
-  [[ -z "$pid" ]] && return 1
+  # No valid positive integer PID: liveness is undeterminable -> HELD.
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  (( pid > 0 )) || return 0
 
-  # Check if process is alive (signal 0 doesn't send a signal, just checks)
-  kill -0 "$pid" 2>/dev/null
+  # kill -0 sends no signal. Success = alive. Failure is only "dead" when the
+  # error is "No such process"; EPERM means alive-but-not-ours, so HELD.
+  local err
+  if err=$(kill -0 "$pid" 2>&1); then
+    return 0
+  fi
+  [[ "$err" == *"No such process"* ]] && return 1
+  return 0
 }
 
 if converse_active && [[ "$EVENT" != "PermissionRequest" ]]; then

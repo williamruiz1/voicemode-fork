@@ -1519,6 +1519,23 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                         except Exception:
                             pass
 
+                    # MID-UTTERANCE supersession: do NOT cut the human off (the
+                    # utterance completes via VAD and is delivered), but DO
+                    # notice -- previously a holder superseded after speech
+                    # began never learned of it until it next went idle. The
+                    # flag lets converse() deliver the words and then hand the
+                    # floor over instead of carrying on as the conch holder.
+                    if (supersede_check is not None and speech_detected
+                            and yield_state is not None
+                            and not yield_state.get("superseded_mid_utterance")):
+                        try:
+                            if supersede_check():
+                                yield_state["superseded_mid_utterance"] = True
+                                logger.info("Conch superseded MID-UTTERANCE -- finishing this "
+                                            "utterance, then standing down")
+                        except Exception:
+                            pass
+
                     # Yieldable listen (vibedispatcher#132): another agent is asking
                     # for the mic. Yield ONLY while idle — once speech has been
                     # detected, the in-progress utterance completes via VAD as usual.
@@ -2936,6 +2953,17 @@ consult the MCP resources listed above.
             truncation_note = _format_truncation_note(tts_metrics if 'tts_metrics' in locals() else None)
             if truncation_note:
                 result = f"{truncation_note}\n{result}"
+
+            # Superseded while he was mid-utterance: his words are delivered
+            # above (never discarded), but this agent no longer owns the floor.
+            if locals().get("yield_state") and yield_state.get("superseded_mid_utterance"):
+                if event_logger:
+                    event_logger.log_event("CONCH_SUPERSEDED_MID_UTTERANCE", {
+                        "pid": os.getpid(), "agent": "converse",
+                    })
+                result = (f"{result}\n[Floor lost mid-utterance: another agent took the "
+                          f"conch while he was speaking. Do not continue the conversation; "
+                          f"re-call converse (wait_for_conch=true) only if you still need the floor.]")
 
             return result
                 
