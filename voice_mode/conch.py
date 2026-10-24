@@ -39,6 +39,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
+from voice_mode.client_identity import current_owner, owner_is_dead, record_owner
+
 logger = logging.getLogger("voicemode.conch")
 
 
@@ -100,6 +102,9 @@ class Conch:
     Creates a lock file at ~/.voicemode/conch when a voice conversation
     is active. The lock file contains:
     - pid: Process ID of the lock holder (for stale lock detection)
+    - owner: who holds it, as a client_identity owner token. Equals
+      "pid:<pid>" under stdio; under the shared HTTP daemon it names the
+      client session, since every session shares the daemon's pid.
     - agent: Name of the agent holding the lock
     - acquired: ISO timestamp when lock was acquired
     - expires: Optional expiry time (reserved for future use)
@@ -152,6 +157,10 @@ class Conch:
         self._fd = None  # File descriptor for flock
         self._acquire_time = None  # Track when acquired
         self._epoch = None  # Generation we wrote; None until acquired
+        # Captured now, in the requesting client's context: listen-loop checks
+        # (is_superseded / is_wanted) later run on executor threads that do not
+        # carry that context.
+        self.owner = current_owner()
 
     def acquire(self, agent_name: Optional[str] = None) -> bool:
         """Acquire the conch. Thin alias for the atomic try_acquire().
@@ -252,6 +261,7 @@ class Conch:
             self._epoch = prev_epoch + 1
             data = {
                 "pid": os.getpid(),
+                "owner": self.owner,
                 "agent": agent,
                 "acquired": self._acquire_time.isoformat(),
                 "expires": None,
@@ -366,8 +376,22 @@ class Conch:
         except (json.JSONDecodeError, OSError):
             return
 
-        # Fast-fail on dead holder -- no need to wait for timestamp expiry.
+        # Shared daemon: the record pid is the live daemon, but the CLIENT that
+        # owns the call may be dead (tab killed mid-call). Treat that as a dead
+        # holder; the orphaned call is also cancelled by the daemon middleware.
         pid = data.get("pid")
+        if owner_is_dead(data.get("owner")):
+            try:
+                self.LOCK_FILE.unlink()
+            except OSError:
+                pass
+            _log_conch_event("CONCH_DEAD_OWNER_CLEARED", {
+                "stale_owner": data.get("owner"),
+                "stale_agent": data.get("agent", "unknown"),
+            })
+            return
+
+        # Fast-fail on dead holder -- no need to wait for timestamp expiry.
         if pid is not None:
             try:
                 os.kill(pid, 0)
@@ -554,6 +578,10 @@ class Conch:
             # os.kill would address a process group, not a process.)
             return cls.STATE_UNREADABLE, None
 
+        if owner_is_dead(data.get("owner")):
+            # Shared daemon: the owning client is gone (its call is orphaned).
+            return cls.STATE_FREE, data
+
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -593,7 +621,7 @@ class Conch:
         holder that cannot demonstrate it still owns the conch must stand down:
           - the record is unreadable      -> superseded
           - the record is gone            -> superseded
-          - the record names another pid  -> superseded
+          - the record names another owner -> superseded
           - the epoch moved on            -> superseded
 
         Returns False when we never acquired the lock (nothing to lose).
@@ -607,7 +635,7 @@ class Conch:
         if not isinstance(data, dict):
             # No record at all -- we are not the holder any more.
             return True
-        if data.get("pid") != os.getpid():
+        if record_owner(data) != self.owner:
             return True
         if data.get(self.EPOCH_KEY, 0) != self._epoch:
             return True
@@ -633,7 +661,7 @@ class Conch:
                 " -- standing down from this listen.", self._epoch,
             )
             return True
-        return _get_yield_enabled() and self.is_wanted()
+        return _get_yield_enabled() and self.is_wanted(owner=self.owner)
 
     @classmethod
     def is_active(cls) -> bool:
@@ -664,6 +692,8 @@ class Conch:
 
             # Check if process is alive (signal 0 doesn't actually send a signal)
             os.kill(pid, 0)
+            if owner_is_dead(data.get("owner")):
+                return False
 
             # Check if lock is stale based on timestamp
             lock_expiry = _get_lock_expiry()
@@ -712,8 +742,9 @@ class Conch:
     WANTED_FILE = Path.home() / ".voicemode" / "conch-wanted"
 
     @classmethod
-    def request_yield(cls, agent_name: Optional[str] = None) -> None:
-        """Write/refresh the conch-wanted request as this process.
+    def request_yield(cls, agent_name: Optional[str] = None,
+                      owner: Optional[str] = None) -> None:
+        """Write/refresh the conch-wanted request as this requester.
 
         Best-effort: any failure is swallowed (the waiter still has the
         timeout/preempt path as its backstop).
@@ -722,6 +753,7 @@ class Conch:
             cls.WANTED_FILE.parent.mkdir(parents=True, exist_ok=True)
             cls.WANTED_FILE.write_text(json.dumps({
                 "pid": os.getpid(),
+                "owner": owner or current_owner(),
                 "agent": agent_name or "unknown",
                 "requested": datetime.now().isoformat(),
             }, indent=2))
@@ -729,26 +761,26 @@ class Conch:
             pass
 
     @classmethod
-    def clear_yield_request(cls) -> None:
-        """Remove this process's conch-wanted request (no-op if it isn't ours).
+    def clear_yield_request(cls, owner: Optional[str] = None) -> None:
+        """Remove this requester's conch-wanted request (no-op if it isn't ours).
 
         Only the requester clears its own request — clearing another waiter's
         fresh request would silently cancel their preemption.
         """
         try:
             data = json.loads(cls.WANTED_FILE.read_text())
-            if data.get("pid") == os.getpid():
+            if record_owner(data) == (owner or current_owner()):
                 cls.WANTED_FILE.unlink()
         except (json.JSONDecodeError, OSError):
             pass
 
     @classmethod
-    def is_wanted(cls) -> bool:
-        """True if another live process is currently requesting the conch.
+    def is_wanted(cls, owner: Optional[str] = None) -> bool:
+        """True if another live requester is currently requesting the conch.
 
         A request counts only when ALL of:
         - the wanted file exists and parses,
-        - the requester is not this process,
+        - the requester is not `owner` (default: the current client),
         - the requester PID is still alive,
         - the request timestamp is within CONCH_WANTED_FRESH seconds.
 
@@ -760,7 +792,8 @@ class Conch:
             return False
 
         pid = data.get("pid")
-        if not isinstance(pid, int) or pid == os.getpid():
+        requester = record_owner(data)
+        if not isinstance(pid, int) or requester is None or requester == (owner or current_owner()):
             return False
 
         try:
@@ -920,6 +953,7 @@ class Conch:
         self._epoch = prev_epoch + 1
         data = {
             "pid": os.getpid(),
+            "owner": self.owner,
             "agent": agent,
             "acquired": self._acquire_time.isoformat(),
             "expires": None,
