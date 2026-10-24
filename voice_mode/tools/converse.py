@@ -1974,17 +1974,18 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                         else:
                             _pause_started = time.monotonic()
                             _pause_started_wall = time.time()
-                            stats["pause_count"] = stats.get("pause_count", 0) + 1
                             logger.info(f"⏸️ Listen paused at {recording_duration:.1f}s "
                                         f"(held={_held}, speech={speech_detected}) - audio discarded until Proceed")
                             _write_listening_state(stats.get("started_at", time.time()), _held,
                                                    paused_at=_pause_started_wall, paused_seconds=_paused_total)
+                            # Bump last: observers waiting on pause_count must
+                            # find listening.json already marked paused.
+                            stats["pause_count"] = stats.get("pause_count", 0) + 1
                     elif not _paused_now:
                         _pause_stepaway = False
                         if _pause_started is not None:
                             _this_pause = time.monotonic() - _pause_started
                             _paused_total += _this_pause
-                            stats["paused_seconds"] = _paused_total
                             _pause_started = _pause_started_wall = None
                             # Fresh silence clock: the pause gap is not trailing
                             # silence, and the stall watchdog restarts too.
@@ -1995,6 +1996,9 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                             logger.info(f"▶️ Listen resumed after {_this_pause:.1f}s paused - same turn continues")
                             _write_listening_state(stats.get("started_at", time.time()), _held,
                                                    paused_seconds=_paused_total)
+                            # Publish last: observers waiting on paused_seconds
+                            # must find listening.json already un-paused.
+                            stats["paused_seconds"] = _paused_total
                     if _pause_started is not None:
                         _now = time.monotonic()
                         _this_pause = _now - _pause_started
@@ -2008,6 +2012,21 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                                 break
                         except Exception:
                             pass
+                        # A superseded conch is a fact even while paused: don't
+                        # hold the mic until Send/Proceed/paused_timeout. Audio
+                        # captured so far is kept. yield_check (a request, with a
+                        # grace period) is deliberately not polled while paused.
+                        if supersede_check is not None:
+                            try:
+                                if supersede_check():
+                                    logger.info("✓ Conch superseded while paused — ending the paused listen")
+                                    if yield_state is not None:
+                                        yield_state["yielded"] = True
+                                    _end_reason = "supersede"
+                                    stop_recording = True
+                                    break
+                            except Exception:
+                                pass
                         if _this_pause >= _pause_max or (pause_deadline is not None and _now >= pause_deadline):
                             logger.warning(f"⏸️ Listen paused for {_this_pause:.0f}s - giving up (paused_timeout)")
                             _end_reason = "paused_timeout"

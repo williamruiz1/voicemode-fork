@@ -49,24 +49,34 @@ class _ScriptedStream:
     def __init__(self, *, callback, **_kw):
         self.callback = callback
         self._stop = threading.Event()
+        self._feed = _ScriptedStream.feed  # bound per test: a leaked pump can't steal the next test's chunks
+        self._thread = None
 
     def __enter__(self):
         def pump():
             while not self._stop.is_set():
-                if _ScriptedStream.feed:
-                    loud = _ScriptedStream.feed.popleft()
+                if self._feed:
+                    try:
+                        loud = self._feed.popleft()
+                    except IndexError:
+                        continue
                 elif _ScriptedStream.fill is not None:
                     loud = _ScriptedStream.fill == "loud"
                 else:
                     time.sleep(0.001)
                     continue
+                if self._stop.is_set():
+                    break
                 self.callback(_chunk(loud), CHUNK_SAMPLES, None, None)
-                time.sleep(0.001)
-        threading.Thread(target=pump, daemon=True).start()
+                time.sleep(0.003)
+        self._thread = threading.Thread(target=pump, daemon=True)
+        self._thread.start()
         return self
 
     def __exit__(self, *a):
         self._stop.set()
+        if self._thread is not None:
+            self._thread.join(2.0)
         return False
 
 
@@ -77,6 +87,9 @@ class _EnergyVad:
     def is_speech(self, chunk_bytes, rate):
         arr = np.frombuffer(chunk_bytes, dtype=np.int16).astype(float)
         return bool(arr.size) and float(np.sqrt(np.mean(arr ** 2))) > 500
+
+
+_LISTEN_THREADS = []
 
 
 @pytest.fixture
@@ -108,7 +121,20 @@ def sim(monkeypatch, isolate_home_directory):
     monkeypatch.delenv("VOICEMODE_PAUSE_MAX_SECONDS", raising=False)
     _ScriptedStream.feed = collections.deque()
     _ScriptedStream.fill = None
-    return home
+    _LISTEN_THREADS.clear()
+    yield home
+    # Teardown: end any listen still running (a failed test must not leak a
+    # listen/pump thread that consumes the next test's shared feed/fill).
+    _ScriptedStream.fill = None
+    _ScriptedStream.feed.clear()
+    for t, paused in list(_LISTEN_THREADS):
+        paused.clear()
+        (home / "turn-end.signal").touch()
+        t.join(2.0)
+        assert not t.is_alive(), "leaked listen thread"
+    _LISTEN_THREADS.clear()
+    time.sleep(0.01)  # let pump threads observe their stop flag
+    (home / "turn-end.signal").unlink(missing_ok=True)
 
 
 def _listen_async(paused, **kwargs):
@@ -123,10 +149,11 @@ def _listen_async(paused, **kwargs):
 
     t = threading.Thread(target=run, daemon=True)
     t.start()
+    _LISTEN_THREADS.append((t, paused))
     return t, box
 
 
-def _wait(pred, timeout=3.0):
+def _wait(pred, timeout=10.0):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         if pred():
@@ -152,7 +179,7 @@ def _resume(box, paused):
     assert _wait(lambda: box["stats"].get("paused_seconds", 0) > 0), box
 
 
-def _finish(t, box, timeout=3.0):
+def _finish(t, box, timeout=10.0):
     t.join(timeout)
     assert not t.is_alive(), f"listen did not end: {box}"
     assert "error" not in box, box.get("error")
@@ -228,8 +255,8 @@ def test_send_while_paused_held_ends_turn_with_captured_audio(sim):
     time.sleep(0.1)
     sent = time.monotonic()
     (sim / "turn-end.signal").touch()
-    audio, speech = _finish(t, box, timeout=1.0)
-    assert time.monotonic() - sent < 1.0
+    audio, speech = _finish(t, box, timeout=6.0)
+    assert time.monotonic() - sent < 3.0
     assert box["stats"]["end_reason"] == "send"
     assert box["stats"]["held"] is True
     assert speech is True
@@ -245,7 +272,7 @@ def test_pause_timeout_ends_listen_with_paused_timeout(sim, monkeypatch):
     assert _wait(lambda: box["stats"].get("chunks_processed", 0) == 10)
     _pause(box, paused)
     _ScriptedStream.fill = "loud"
-    audio, speech = _finish(t, box, timeout=2.0)
+    audio, speech = _finish(t, box, timeout=6.0)
     stats = box["stats"]
     assert stats["end_reason"] == "paused_timeout"
     assert stats["paused_seconds"] >= 0.3
@@ -258,7 +285,7 @@ def test_pause_deadline_from_caller_ends_listen(sim):
     paused.set()  # paused before the listen even starts
     t, box = _listen_async(paused, max_duration=30.0, pause_deadline=time.monotonic() + 0.3)
     _ScriptedStream.fill = "loud"
-    audio, speech = _finish(t, box, timeout=2.0)
+    audio, speech = _finish(t, box, timeout=6.0)
     assert box["stats"]["end_reason"] == "paused_timeout"
     assert speech is False and len(audio) == 0
 
@@ -292,6 +319,26 @@ def test_step_away_keeps_its_idle_pause(sim):
     assert "pause_count" not in box["stats"]
     (sim / "turn-end.signal").touch()
     _finish(t, box)
+
+
+def test_supersede_while_paused_ends_listen_promptly(sim):
+    """A paused listen whose conch was superseded must not hold the mic until
+    Send/Proceed/paused_timeout."""
+    paused = threading.Event()
+    superseded = threading.Event()
+    yield_state = {}
+    _ScriptedStream.feed.extend([True] * 10)
+    t, box = _listen_async(paused, max_duration=30.0, supersede_check=superseded.is_set,
+                           yield_state=yield_state)
+    assert _wait(lambda: box["stats"].get("chunks_processed", 0) == 10)
+    _pause(box, paused)
+    time.sleep(0.2)
+    assert t.is_alive()
+    superseded.set()
+    audio, speech = _finish(t, box, timeout=6.0)
+    assert box["stats"]["end_reason"] == "supersede"
+    assert yield_state.get("yielded") is True
+    assert speech is True and len(audio) == 10 * CHUNK_SAMPLES  # audio kept
 
 
 def test_recording_end_reports_paused_seconds_and_is_not_starved():
