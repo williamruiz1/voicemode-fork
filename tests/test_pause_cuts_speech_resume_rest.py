@@ -179,3 +179,64 @@ class TestResumeAfterPause:
     async def test_not_paused_is_noop(self):
         assert await pause_resume.resume_after_pause(TEXT, {"truncated": True}, None) is None
         assert await pause_resume.resume_after_pause(TEXT, None, None) is None
+
+
+# --- pause cap on wall clock + default under host idle timeout; latch on fast Proceed ---
+
+def test_default_pause_cap_under_host_idle_timeout(monkeypatch):
+    monkeypatch.delenv("VOICEMODE_PAUSE_MAX_SECONDS", raising=False)
+    assert pause_resume.pause_max_seconds() == 1500.0
+    assert pause_resume.pause_max_seconds() < 1800.0
+
+
+@pytest.mark.asyncio
+async def test_wait_for_resume_uses_wall_clock(monkeypatch):
+    """Slow sleeps (loop lag) must not stretch the cap: it's wall time, not 0.1s ticks."""
+    _PAUSED["on"] = True
+    real_sleep = pause_resume.asyncio.sleep
+
+    async def slow_sleep(d):
+        await real_sleep(0.05)
+        # pretend each "0.1s" sleep really took 0.2s of wall time
+        _clock["t"] += 0.2
+
+    _clock = {"t": 1000.0}
+    import types
+    # stub module only inside pause_resume (patching global time.monotonic would freeze the event loop)
+    monkeypatch.setattr(pause_resume, "time", types.SimpleNamespace(monotonic=lambda: _clock["t"]))
+    # 1.0s budget at 0.2s/iteration -> ~5 iterations; tick-counting would take 10.
+    iterations = {"n": 0}
+    orig = slow_sleep
+
+    async def counting(d):
+        iterations["n"] += 1
+        await orig(d)
+
+    monkeypatch.setattr(pause_resume.asyncio, "sleep", counting)
+    assert await pause_resume.wait_for_resume(1.0) is False
+    assert iterations["n"] <= 6
+
+
+def test_player_latches_pause_cut_even_if_flag_cleared(monkeypatch):
+    """Callback sees pause -> paused_cut stays True after a fast Proceed."""
+    ap._pause_event.clear()
+    player = ap.NonBlockingAudioPlayer()
+    player.audio_queue = __import__("queue").Queue()
+    out = np.ones((16, 1), dtype=np.float32)
+    ap._pause_event.set()
+    try:
+        with pytest.raises(ap.sd.CallbackStop):
+            player._audio_callback(out, 16, None, None)
+    finally:
+        ap._pause_event.clear()  # Proceed before wait() returns
+    assert player.paused_cut is True
+    # a barge-in alone is not a pause
+    p2 = ap.NonBlockingAudioPlayer()
+    p2.audio_queue = __import__("queue").Queue()
+    ap._barge_in_event.set()
+    try:
+        with pytest.raises(ap.sd.CallbackStop):
+            p2._audio_callback(out, 16, None, None)
+    finally:
+        ap.reset_barge_in_event()
+    assert p2.paused_cut is False

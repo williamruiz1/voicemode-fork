@@ -11,6 +11,7 @@ removed, then replays the not-yet-heard remainder via a caller-supplied
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
@@ -18,14 +19,15 @@ from . import audio_player
 
 logger = logging.getLogger("voicemode.pause_resume")
 
-# Under Claude Code's 30-minute stdio idle timeout.
-DEFAULT_PAUSE_MAX_SECONDS = 1800.0
+# Comfortably under Claude Code's 30-minute (1800s) stdio MCP idle timeout, so
+# the "[PAUSED — timed out ...]" result returns before the host gives up.
+DEFAULT_PAUSE_MAX_SECONDS = 1500.0
 # A message can be paused again during the replay; bound the loop.
 MAX_REPLAYS = 5
 
 
 def pause_max_seconds() -> float:
-    """VOICEMODE_PAUSE_MAX_SECONDS, read at call time (default 1800)."""
+    """VOICEMODE_PAUSE_MAX_SECONDS, read at call time (default 1500)."""
     try:
         return float(os.environ.get("VOICEMODE_PAUSE_MAX_SECONDS", DEFAULT_PAUSE_MAX_SECONDS))
     except ValueError:
@@ -43,12 +45,11 @@ class PauseOutcome:
 
 async def wait_for_resume(max_seconds: float, poll: float = 0.1) -> bool:
     """Block until the pause flag clears. False if `max_seconds` elapsed first."""
-    waited = 0.0
+    deadline = time.monotonic() + max_seconds  # wall clock, not summed sleeps
     while audio_player.convomode_paused():
-        if waited >= max_seconds:
+        if time.monotonic() >= deadline:
             return False
         await asyncio.sleep(poll)
-        waited += poll
     return True
 
 
@@ -84,11 +85,10 @@ async def resume_after_pause(
     limit = pause_max_seconds() if max_seconds is None else max_seconds
     outcome = PauseOutcome(final_metrics=tts_metrics)
     current = tts_metrics
-    loop = asyncio.get_event_loop()
-    started = loop.time()
+    started = time.monotonic()
 
     for _ in range(MAX_REPLAYS):
-        remaining_budget = max(0.0, limit - (loop.time() - started))
+        remaining_budget = max(0.0, limit - (time.monotonic() - started))
         if not await wait_for_resume(remaining_budget):
             outcome.timed_out = True
             break
@@ -109,5 +109,5 @@ async def resume_after_pause(
         if not new_metrics.get("paused"):
             break
         current = new_metrics
-    outcome.paused_for_seconds = loop.time() - started
+    outcome.paused_for_seconds = time.monotonic() - started
     return outcome

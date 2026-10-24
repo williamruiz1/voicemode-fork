@@ -106,7 +106,7 @@ from voice_mode.core import (
 )
 from voice_mode.audio_player import NonBlockingAudioPlayer, SPEAKING_FLAG_PATH, convomode_paused, PAUSE_FLAG_PATH
 from voice_mode import audio_player
-from voice_mode.pause_resume import resume_after_pause
+from voice_mode.pause_resume import resume_after_pause, pause_max_seconds
 from voice_mode import barge_in
 from voice_mode.statistics_tracking import track_voice_interaction
 from voice_mode.utils import (
@@ -2513,6 +2513,9 @@ consult the MCP resources listed above.
                     pause_outcome = await resume_after_pause(
                         message, tts_metrics, _replay_remainder,
                         turn_end_signal_path=_turn_end_signal_path(),
+                        # The host's idle timer started with this call: spend only
+                        # what's left of the budget after the TTS already played.
+                        max_seconds=max(0.0, pause_max_seconds() - (time.perf_counter() - tts_start)),
                     )
                     if pause_outcome and pause_outcome.timed_out:
                         return (
