@@ -42,6 +42,9 @@ import pytest
 
 import voice_mode.barge_in as bi
 
+# Generous: returns as soon as the trigger fires; only CPU load from parallel agents ever needs the slack.
+_JOIN_TIMEOUT = 20.0
+
 
 def _make_chunk(value: int, n: int = bi.CHUNK_SAMPLES_MIC) -> np.ndarray:
     """A synthetic mono int16 mic chunk at a fixed amplitude, shaped like
@@ -133,7 +136,7 @@ class TestSileroEnergyFloorGate:
         QUIET = 200
         for _ in range(n_trigger):
             listener._audio_queue.put(_make_chunk(QUIET))
-        listener._thread.join(timeout=3.0)
+        listener._thread.join(timeout=_JOIN_TIMEOUT)
         result = listener.stop()
 
         assert result.triggered is True, (
@@ -152,7 +155,7 @@ class TestSileroEnergyFloorGate:
         listener._audio_queue.put(_make_chunk(QUIET))  # calibrate the floor low
         for _ in range(n_trigger):
             listener._audio_queue.put(_make_chunk(LOUD))
-        listener._thread.join(timeout=3.0)
+        listener._thread.join(timeout=_JOIN_TIMEOUT)
         result = listener.stop()
 
         assert result.triggered is True, (

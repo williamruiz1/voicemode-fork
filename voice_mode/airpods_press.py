@@ -162,8 +162,11 @@ def _on_press(origin: str, detail: str) -> Optional[str]:
       paused (any phase)        -> proceed
       phase listen              -> Send (turn-end.signal, source "airpods")
       otherwise (TTS / idle)    -> pause
-    Presses seen by two paths, or twice inside DEBOUNCE, count once for
-    pause/proceed; Send only collapses across different origins. Returns the
+    Any press within DEDUPE_SECONDS of the previous accepted one is the same
+    physical press (both MuteState names and the AVAudioApplication path can
+    report it) and is ignored, whatever its origin or action; genuine fast
+    double presses are further apart. A Send is only written while the phase
+    is still listen at write time, so none can outlive the listen. Returns the
     action taken or None. Never raises."""
     global _last_send
     phase = _phase
@@ -173,13 +176,17 @@ def _on_press(origin: str, detail: str) -> Optional[str]:
     with _send_lock:
         last_t, last_origin = _last_send
         recent = last_origin and now - last_t < DEDUPE_SECONDS
-        if recent and (last_origin != origin or action != "send"):
+        if recent:
             debug_log(f"phase={phase} {origin} {detail} -> ignored (debounce, last={last_origin})")
             return None
         _last_send = (now, origin)
     try:
         if action == "send":
-            _write_send_signal()
+            with _send_lock:
+                if _phase != PHASE_LISTEN:
+                    debug_log(f"phase={_phase} {origin} {detail} -> SEND dropped (listen already ended)")
+                    return None
+                _write_send_signal()
             logger.info("✓ AirPods press -> Send (turn-end.signal)")
         else:
             _run_floor(action)
@@ -460,7 +467,8 @@ def listening() -> Iterator[Optional[PressSender]]:
         try:
             yield sender
         finally:
-            _phase = PHASE_TTS
+            with _send_lock:  # a Send mid-write finishes before the phase flips
+                _phase = PHASE_TTS
             if sender is not None:
                 try:
                     sender.close()

@@ -111,10 +111,13 @@ def test_initial_sync_is_not_a_press(home, fake_app):
         assert sender.presses == 0
 
 
-def test_every_toggle_is_a_press(home, fake_app):
+def test_every_toggle_is_a_press(home, fake_app, monkeypatch):
+    t = [100.0]
+    monkeypatch.setattr(ap.time, "monotonic", lambda: t[0])
     with ap.listening() as sender:
         fake_app.press()
         _signal(home).unlink()  # listen consumed the Send
+        t[0] += ap.DEDUPE_SECONDS + 0.05  # presses < 300 ms apart are one press (B41)
         fake_app.press()
         assert _signal(home).exists()
         assert sender.presses == 2
@@ -534,3 +537,54 @@ def test_run_floor_flag_fallback(home, monkeypatch):
     flag = home / ".voicemode" / "pause.flag"
     assert _real_run_floor("pause") and flag.exists()
     assert _real_run_floor("proceed") and not flag.exists()
+
+
+# ---- B41: one physical press posted twice must write Send once -------------
+
+def test_same_origin_double_post_in_listen_sends_once(home, fake_lib):
+    with ap.session():
+        with ap.listening():
+            assert ap._on_press("darwin-notify", "private-name") == "send"
+            _signal(home).unlink()  # the listen consumed it
+            assert ap._on_press("darwin-notify", "legacy-name") is None
+            assert not _signal(home).exists()  # no stale second Send
+
+
+def test_genuine_fast_double_press_still_counts_twice(home, fake_lib, monkeypatch):
+    t = [100.0]
+    monkeypatch.setattr(ap.time, "monotonic", lambda: t[0])
+    with ap.session():
+        with ap.listening():
+            assert ap._on_press("darwin-notify", "a") == "send"
+            t[0] += ap.DEDUPE_SECONDS + 0.05
+            assert ap._on_press("darwin-notify", "b") == "send"
+
+
+def test_send_not_written_after_listen_ended(home, fake_lib):
+    with ap.session():
+        with ap.listening():
+            pass
+        # phase is back to tts: a late "send" decision must not leave a signal
+        monkey_action = ap._on_press
+        assert ap._phase == ap.PHASE_TTS
+        assert monkey_action("darwin-notify", "late") == "pause"
+        assert not _signal(home).exists()
+
+
+def test_send_decided_in_listen_but_written_after_end_is_dropped(home, fake_lib, monkeypatch):
+    real_write = ap._write_send_signal
+    calls = []
+    monkeypatch.setattr(ap, "_write_send_signal", lambda: calls.append(1) or real_write())
+    with ap.session():
+        with ap.listening():
+            pass
+        monkeypatch.setattr(ap, "_phase", ap.PHASE_LISTEN)  # decided as send...
+        orig = ap.os.path.exists
+        # ...but the listen ends between decision and write
+        def exists(p):
+            r = orig(p)
+            ap._phase = ap.PHASE_TTS
+            return r
+        monkeypatch.setattr(ap.os.path, "exists", exists)
+        assert ap._on_press("darwin-notify", "race") is None
+    assert calls == [] and not _signal(home).exists()
