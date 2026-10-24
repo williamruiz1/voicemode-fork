@@ -18,15 +18,26 @@ BLOCKED_COMMANDS = {
     "launchctl",
     "systemctl",
     "brew",
+    # Audio players: a test must never play sound through the real speakers.
+    "afplay",
+    "ffplay",
+    "say",
+    "aplay",
+    "paplay",
 }
 
 
-# sounddevice entry points that open the REAL input device. `query_devices` and
-# `default` are deliberately NOT listed -- reading device metadata is harmless
-# and plenty of code does it. `Stream` is full-duplex (it opens the input too):
-# with a Bluetooth default input, record_audio() and the VAD loop capture via
-# sd.Stream (F1), so leaving it out let tests record from the live mic.
-BLOCKED_AUDIO_CAPTURE = ("InputStream", "rec", "Stream")
+# sounddevice entry points that open a REAL audio device -- input, output or
+# both. `query_devices` and `default` are deliberately NOT listed -- reading
+# device metadata is harmless and plenty of code does it. `Stream` is
+# full-duplex: with a Bluetooth default input, record_audio() and the VAD loop
+# capture via sd.Stream (F1). Output matters too: unmocked chimes/TTS played
+# through the user's headphones mid-conversation.
+BLOCKED_AUDIO_CAPTURE = (
+    "InputStream", "OutputStream", "Stream",
+    "RawInputStream", "RawOutputStream", "RawStream",
+    "rec", "play", "playrec",
+)
 
 # The real sounddevice module, captured while conftest loads -- before test
 # modules are collected. Some test modules replace sys.modules["sounddevice"]
@@ -150,9 +161,9 @@ def block_real_microphone(monkeypatch, request):
 
     def _refuse(*args, **kwargs):
         raise RuntimeError(
-            "This test tried to open the REAL microphone via sounddevice. "
-            "Mock the recording function the code actually calls -- on this "
-            "branch that is record_audio_with_silence_detection, not just "
+            "This test tried to open the REAL microphone or speaker via "
+            "sounddevice. Mock the function the code actually calls -- for "
+            "recording that is record_audio_with_silence_detection, not just "
             "record_audio -- or mark the test @pytest.mark.real_microphone if "
             "it truly needs a device. See tests/conftest.py:block_real_microphone."
         )
@@ -162,6 +173,76 @@ def block_real_microphone(monkeypatch, request):
             if hasattr(sd, name):
                 monkeypatch.setattr(sd, name, _refuse)
                 request.node.mic_guard_armed = True
+        # Catch-all: every sounddevice stream class (and play/rec/playrec,
+        # which build one internally) opens PortAudio in _StreamBase.__init__,
+        # so this also covers a name held from before the patch above.
+        base = getattr(sd, "_StreamBase", None)
+        if isinstance(base, type):
+            monkeypatch.setattr(base, "__init__", _refuse)
+
+    # pydub's playback fallback goes through simpleaudio when it is installed.
+    try:
+        import simpleaudio
+        monkeypatch.setattr(simpleaudio, "play_buffer", _refuse)
+    except Exception:
+        pass
+
+    yield
+
+
+@pytest.fixture(autouse=True)
+def block_signals_to_foreign_processes(monkeypatch):
+    """Refuse to signal any process this test run did not start.
+
+    Service code stops a server by finding whatever listens on its port and
+    terminating it. Under the fake home no plist exists, so that fallback ran
+    against the REAL machine: tests/test_whisper_model_cli.py::
+    test_set_active_model terminated the live whisper-server on every full run
+    (launchd then restarted it mid-conversation). Signal 0 (liveness probes,
+    used by the conch) is still allowed.
+    """
+    import psutil
+
+    me = os.getpid()
+
+    def _ours(pid):
+        try:
+            proc = psutil.Process(pid)
+            while proc is not None:
+                if proc.pid == me:
+                    return True
+                proc = proc.parent()
+        except Exception:
+            pass
+        return False
+
+    def _refuse(pid, what):
+        raise PermissionError(
+            f"This test tried to {what} pid {pid}, a process it did not start "
+            "(a real service on this machine). Mock the process lookup. See "
+            "tests/conftest.py:block_signals_to_foreign_processes."
+        )
+
+    original_kill = os.kill
+
+    def _kill(pid, sig):
+        if sig != 0 and pid > 0 and not _ours(pid):
+            _refuse(pid, f"send signal {sig} to")
+        return original_kill(pid, sig)
+
+    monkeypatch.setattr(os, "kill", _kill)
+
+    for name in ("terminate", "kill", "send_signal", "suspend", "resume"):
+        original = getattr(psutil.Process, name)
+
+        def _make(original, name):
+            def _guarded(self, *args, **kwargs):
+                if not _ours(self.pid):
+                    _refuse(self.pid, name)
+                return original(self, *args, **kwargs)
+            return _guarded
+
+        monkeypatch.setattr(psutil.Process, name, _make(original, name))
 
     yield
 
