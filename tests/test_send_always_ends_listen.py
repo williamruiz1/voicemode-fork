@@ -182,15 +182,18 @@ class TestStalledStream:
 
     def test_stalled_stream_ends_itself_without_send(self, sim, monkeypatch):
         # A dead stream must not hold the mic (and the floor) until the 600s
-        # hold ceiling: it ends with end_reason=stream_stalled.
-        monkeypatch.setenv("VOICEMODE_STREAM_STALL_SECONDS", "0.6")
+        # hold ceiling: a held turn reopens it up to the recovery cap, then
+        # ends with end_reason=stream_stalled and the audio kept.
+        monkeypatch.setenv("VOICEMODE_STREAM_STALL_SECONDS", "0.3")
+        monkeypatch.setattr(C, "DEVICE_RECOVERY_DELAY_SECONDS", 0.05)
         (sim / "hold-mode").touch()
         _StallingStream.deliver = 10
         t, box = _listen_async(max_duration=30.0)
-        t.join(3.0)
+        t.join(6.0)
         assert not t.is_alive(), "stalled stream never ended the listen"
         assert box["stats"]["end_reason"] == "stream_stalled"
-        assert len(box["result"][0]) == 10 * CHUNK_SAMPLES
+        assert _StallingStream.opened == C.DEVICE_RECOVERY_MAX_ATTEMPTS
+        assert len(box["result"][0]) >= 10 * CHUNK_SAMPLES
 
     def test_not_held_stalled_stream_ends_itself(self, sim, monkeypatch):
         monkeypatch.setenv("VOICEMODE_STREAM_STALL_SECONDS", "0.6")
@@ -385,3 +388,95 @@ class TestFixedLengthFallback:
         audio = C.record_audio(1.0)
         assert len(audio) == 0
         assert len(calls) == C.DEVICE_RECOVERY_MAX_ATTEMPTS
+
+
+class _FirstOpenThenQuiet:
+    """Counts opens. The first open delivers `first` chunks then stalls; later
+    opens deliver `later` chunks (0 = stall again, -1 = keep delivering until
+    closed) then stall."""
+
+    opened = 0
+    first = 10
+    later = 0
+
+    def __init__(self, **kwargs):
+        self.callback = kwargs["callback"]
+        self.duplex = "device" in kwargs
+        _FirstOpenThenQuiet.opened += 1
+        self.n = _FirstOpenThenQuiet.first if _FirstOpenThenQuiet.opened == 1 else _FirstOpenThenQuiet.later
+        self._stop = threading.Event()
+
+    def __enter__(self):
+        def pump():
+            i = 0
+            while (self.n < 0 or i < self.n) and not self._stop.is_set():
+                i += 1
+                if self.duplex:
+                    self.callback(_chunk(), np.zeros((CHUNK_SAMPLES, 1), dtype=np.int16), CHUNK_SAMPLES, None, None)
+                else:
+                    self.callback(_chunk(), CHUNK_SAMPLES, None, None)
+                time.sleep(0.0005 if _FirstOpenThenQuiet.opened == 1 else 0.03)
+        threading.Thread(target=pump, daemon=True).start()
+        return self
+
+    def __exit__(self, *a):
+        self._stop.set()
+        return False
+
+
+@pytest.fixture
+def stall_sim(sim, monkeypatch):
+    monkeypatch.setattr(C.sd, "InputStream", _FirstOpenThenQuiet)
+    monkeypatch.setattr(C.sd, "Stream", _FirstOpenThenQuiet)
+    monkeypatch.setenv("VOICEMODE_STREAM_STALL_SECONDS", "0.3")
+    monkeypatch.setattr(C, "DEVICE_RECOVERY_DELAY_SECONDS", 0.05)
+    (sim / "hold-mode").touch()
+    _FirstOpenThenQuiet.opened = 0
+    _FirstOpenThenQuiet.first = 10
+    _FirstOpenThenQuiet.later = 0
+    return sim
+
+
+class TestHeldStallIsRecoverable:
+    """A held turn must not end mid-sentence because the stream went quiet for a
+    moment (AirPods deliver intermittently): reopen, keep audio, honor Send."""
+
+    @pytest.mark.parametrize("no_vad", [False, True], ids=["vad", "no_vad"])
+    def test_stall_reopens_stream_and_keeps_audio(self, stall_sim, no_vad):
+        _FirstOpenThenQuiet.later = -1  # audio resumes after the reopen
+        t, box = _listen_async(max_duration=30.0, disable_silence_detection=no_vad)
+        time.sleep(1.2)  # > stall window + reopen delay
+        assert t.is_alive(), f"held listen ended on a stall: {box['stats']}"
+        assert _FirstOpenThenQuiet.opened >= 2
+        _send_and_wait(stall_sim, t, box, after=0.0)
+        assert box["stats"]["end_reason"] == "send"
+        assert len(box["result"][0]) >= 10 * CHUNK_SAMPLES  # pre-stall audio preserved
+
+    @pytest.mark.parametrize("no_vad", [False, True], ids=["vad", "no_vad"])
+    def test_send_ends_promptly_after_reopen(self, stall_sim, no_vad):
+        t, box = _listen_async(max_duration=30.0, disable_silence_detection=no_vad)
+        time.sleep(0.5)  # stream stalled at ~0.3s, reopened by now or in flight
+        sent = time.monotonic()
+        (stall_sim / "turn-end.signal").touch()
+        t.join(SEND_DEADLINE_S)
+        assert not t.is_alive()
+        assert box["stats"]["end_reason"] == "send"
+        assert len(box["result"][0]) >= 10 * CHUNK_SAMPLES
+        assert not (stall_sim / "turn-end.signal").exists()
+
+    @pytest.mark.parametrize("no_vad", [False, True], ids=["vad", "no_vad"])
+    def test_cap_exhausted_ends_stream_stalled_keeping_audio(self, stall_sim, no_vad):
+        t, box = _listen_async(max_duration=30.0, disable_silence_detection=no_vad)
+        t.join(8.0)
+        assert not t.is_alive()
+        assert box["stats"]["end_reason"] == "stream_stalled"
+        assert _FirstOpenThenQuiet.opened == C.DEVICE_RECOVERY_MAX_ATTEMPTS
+        assert len(box["result"][0]) >= 10 * CHUNK_SAMPLES
+
+    def test_not_held_stall_still_ends_after_one_window(self, stall_sim):
+        (stall_sim / "hold-mode").unlink()
+        t, box = _listen_async(max_duration=30.0)
+        t.join(3.0)
+        assert not t.is_alive()
+        assert box["stats"]["end_reason"] == "stream_stalled"
+        assert _FirstOpenThenQuiet.opened == 1
