@@ -106,6 +106,7 @@ from voice_mode.core import (
 )
 from voice_mode.audio_player import NonBlockingAudioPlayer, SPEAKING_FLAG_PATH, convomode_paused, PAUSE_FLAG_PATH
 from voice_mode import audio_player
+from voice_mode.pause_resume import resume_after_pause
 from voice_mode import barge_in
 from voice_mode.statistics_tracking import track_voice_interaction
 from voice_mode.utils import (
@@ -2493,6 +2494,35 @@ consult the MCP resources listed above.
                         barge_in_result = barge_in_listener.stop()
                         if barge_in_result.triggered:
                             logger.info("🗣️ Natural mode: William spoke over the agent — treating it as the next turn")
+
+                # Pause cut the speech: don't listen; wait for Proceed, then
+                # play the not-yet-heard remainder (voice_mode/pause_resume.py).
+                if not should_skip_tts and tts_metrics and tts_metrics.get('paused'):
+                    async def _replay_remainder(text):
+                        _ok, _m, _c = await text_to_speech_with_failover(
+                            message=text,
+                            voice=voice,
+                            model=tts_model,
+                            instructions=tts_instructions,
+                            audio_format=audio_format,
+                            initial_provider=tts_provider,
+                            speed=speed,
+                            ref_text=resolved_ref_text,
+                        )
+                        return _m
+                    pause_outcome = await resume_after_pause(
+                        message, tts_metrics, _replay_remainder,
+                        turn_end_signal_path=_turn_end_signal_path(),
+                    )
+                    if pause_outcome and pause_outcome.timed_out:
+                        return (
+                            f"[PAUSED — timed out after {pause_outcome.paused_for_seconds:.0f}s "
+                            f"waiting for Proceed. Speech was cut mid-message and the rest was not "
+                            f"played; no listen was started.]"
+                        )
+                    if pause_outcome and pause_outcome.final_metrics is not None:
+                        tts_metrics = dict(pause_outcome.final_metrics)
+                        tts_metrics['truncated'] = False  # not a barge-in: nothing to report as talked-over
 
                 # Add TTS sub-metrics
                 if tts_metrics:

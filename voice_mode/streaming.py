@@ -64,6 +64,9 @@ class StreamMetrics:
     # voice_mode/truncation.py's module docstring for why a better-than-
     # sentence-boundary split isn't available.
     truncated: bool = False
+    # True when the cut was a convomode Pause (not a barge-in): the caller
+    # waits for Proceed, then replays undelivered_text (voice_mode/pause_resume.py).
+    paused: bool = False
     delivered_text: Optional[str] = None
     undelivered_text: Optional[str] = None
     delivered_fraction: Optional[float] = None       # 0.0-1.0, ESTIMATED
@@ -252,6 +255,49 @@ class AudioStreamPlayer:
         logger.debug("Audio stream stopped")
 
 
+
+_PAUSE_WRITE_SLICE_SECONDS = 0.1
+
+
+def _write_interruptible(stream, samples, sample_rate: int) -> int:
+    """stream.write() in ~100ms slices, stopping at once if convomode is paused.
+
+    Returns the number of samples actually written (== len(samples) unless a
+    Pause cut it short), so a Pause lands within ~100ms instead of after the
+    whole decoded buffer has played.
+    """
+    step = max(1, int(sample_rate * _PAUSE_WRITE_SLICE_SECONDS))
+    written = 0
+    while written < len(samples):
+        if audio_player.convomode_paused():
+            break
+        piece = samples[written:written + step]
+        stream.write(piece)
+        written += len(piece)
+    return written
+
+
+def _mark_buffered_pause(metrics, text: str, stream, samples_written: int, sample_rate: int) -> None:
+    """Record a Pause cut on the buffered path, with the same delivered /
+    undelivered split the PCM path computes."""
+    metrics.truncated = True
+    metrics.paused = True
+    elapsed = samples_written / float(sample_rate)
+    metrics.elapsed_audio_seconds = round(elapsed, 3)
+    latency = float(getattr(stream, "latency", 0.0) or 0.0)
+    try:
+        estimate = estimate_truncation(text, max(0.0, elapsed - latency))
+        metrics.delivered_text = estimate.delivered_text
+        metrics.undelivered_text = estimate.undelivered_text
+        metrics.delivered_fraction = estimate.delivered_fraction
+        metrics.estimated_total_seconds = estimate.estimated_total_seconds
+        metrics.truncation_confidence = estimate.confidence
+        metrics.truncation_basis = f"{estimate.basis} (Pause cut after {elapsed:.2f}s of decoded audio)"
+    except Exception as e:
+        logger.error(f"pause truncation estimate failed: {e}")
+        metrics.undelivered_text = text  # unknown split: replay everything
+
+
 async def stream_pcm_audio(
     text: str,
     openai_client,
@@ -340,6 +386,18 @@ async def stream_pcm_audio(
                 # also refuse to honor a stale/leaked trigger when natural mode
                 # isn't currently armed -- a barge-in can only be genuine while
                 # the concurrent mic listener that raises it is actually running.
+                # Convomode Pause: same cut, but no new turn is implied, so it is
+                # flagged separately (the caller waits for Proceed and replays
+                # the rest). This path never looked at the pause flag before, so
+                # Pause let streamed (Kokoro/pcm) speech play to the end.
+                if audio_player.convomode_paused():
+                    logger.info(
+                        f"⏸ Pause: halting streamed TTS after {bytes_received} bytes "
+                        f"({chunk_count} chunks) written to the output stream"
+                    )
+                    metrics.truncated = True
+                    metrics.paused = True
+                    break
                 if audio_player.barge_in_triggered() and barge_in.natural_mode_enabled():
                     logger.info(
                         f"🛑 Barge-in: halting streamed TTS after {bytes_received} bytes "
@@ -411,7 +469,13 @@ async def stream_pcm_audio(
             # audio he actually heard without talking over it, rather than
             # compounding that known lag into the "delivered" estimate.
             elapsed_audio_seconds = bytes_received / (SAMPLE_RATE * 2)
-            interruption_lead_seconds = BARGE_IN_TRIGGER_MS / 1000.0
+            # A Pause has no detector lag to subtract (the flag is polled at 50ms).
+            # Instead, subtract the output latency: audio already handed to
+            # PortAudio but dropped by abort() was never heard.
+            interruption_lead_seconds = (
+                float(getattr(stream, "latency", 0.0) or 0.0) if metrics.paused
+                else BARGE_IN_TRIGGER_MS / 1000.0
+            )
             effective_seconds = max(0.0, elapsed_audio_seconds - interruption_lead_seconds)
             metrics.elapsed_audio_seconds = round(elapsed_audio_seconds, 3)
 
@@ -597,6 +661,8 @@ async def stream_with_buffering(
     audio_started = False
     stream = None
     speaking_marked = False
+    samples_written = 0
+    pause_cut = False
 
     try:
         # Setup sounddevice stream
@@ -622,6 +688,9 @@ async def stream_with_buffering(
             
             # Stream chunks as they arrive
             async for chunk in response.iter_bytes(chunk_size=STREAM_CHUNK_SIZE):
+                if audio_player.convomode_paused():
+                    pause_cut = True
+                    break
                 if chunk:
                     # Track first chunk for TTFA
                     if first_chunk_time is None:
@@ -667,9 +736,13 @@ async def stream_with_buffering(
                             logger.info(f"Buffered streaming started - TTFA: {metrics.ttfa:.3f}s")
 
                             # Play audio
-                            stream.write(samples)
-                            audio_player.write_reference_audio(samples, sample_rate)
-                            metrics.chunks_played += len(samples) // 1024
+                            n = _write_interruptible(stream, samples, sample_rate)
+                            samples_written += n
+                            audio_player.write_reference_audio(samples[:n], sample_rate)
+                            metrics.chunks_played += n // 1024
+                            if n < len(samples):
+                                pause_cut = True
+                                break
 
                             # Reset buffer for next batch
                             buffer = io.BytesIO()
@@ -678,8 +751,8 @@ async def stream_with_buffering(
                             # Not enough valid data yet
                             buffer.seek(0, io.SEEK_END)
         
-        # Process any remaining data
-        if buffer.tell() > 0:
+        # Process any remaining data (not if Pause already cut playback)
+        if buffer.tell() > 0 and not pause_cut:
             buffer.seek(0)
             try:
                 audio = AudioSegment.from_file(buffer, format=_pydub_format(format))
@@ -710,21 +783,32 @@ async def stream_with_buffering(
                 if not audio_started:
                     metrics.ttfa = time.perf_counter() - start_time
 
-                stream.write(samples)
-                audio_player.write_reference_audio(samples, sample_rate)
-                metrics.chunks_played += len(samples) // 1024
+                n = _write_interruptible(stream, samples, sample_rate)
+                samples_written += n
+                audio_player.write_reference_audio(samples[:n], sample_rate)
+                metrics.chunks_played += n // 1024
+                if n < len(samples):
+                    pause_cut = True
 
                 # Belt-and-braces drain in addition to the silence padding above.
                 # Sleep for the reported output latency plus a small safety margin
                 # so that even if a future change removes the silence pad, the
                 # tail still plays through on systems where stream.stop() drains
                 # correctly.
-                drain_secs = (stream.latency or 0.0) + 0.3
-                await asyncio.sleep(drain_secs)
+                if not pause_cut:
+                    drain_secs = (stream.latency or 0.0) + 0.3
+                    await asyncio.sleep(drain_secs)
 
             except Exception as e:
                 logger.error(f"Failed to decode final buffer: {e}")
         
+        if pause_cut:
+            try:
+                stream.abort()
+            except Exception:
+                pass
+            _mark_buffered_pause(metrics, text, stream, samples_written, sample_rate)
+
         metrics.generation_time = time.perf_counter() - start_time
         metrics.playback_time = metrics.generation_time  # Approximate
         
