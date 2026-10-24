@@ -1104,6 +1104,146 @@ def append_window_ms() -> int:
     return max(0, APPEND_WINDOW_MS)
 
 
+# ==================== HOLD-OPEN PUSH-TO-TALK ==========
+# Three signal files under ~/.voicemode, resolved at CALL time (expanduser) so a
+# hotkey can flip them live and tests can point HOME at a temp dir:
+#   turn-end.signal  SEND -- ends the listen now (pre-existing, honored always).
+#   hold-open.signal per-turn HOLD -- once seen during a listen, silence never
+#                    ends it; removed by the listen on every exit.
+#   hold-mode        persistent HOLD MODE -- every listen is held until SEND;
+#                    never removed here.
+# While held, the ceiling is VOICEMODE_HOLD_MAX_SECONDS (default 600) instead of
+# listen_duration_max. Absence of both hold files = byte-for-byte prior behavior.
+
+HOLD_OPEN_STALE_SECONDS = 15 * 60
+DEFAULT_HOLD_MAX_SECONDS = 600.0
+
+
+def _turn_end_signal_path() -> str:
+    return os.path.expanduser("~/.voicemode/turn-end.signal")
+
+
+def _hold_open_signal_path() -> str:
+    return os.path.expanduser("~/.voicemode/hold-open.signal")
+
+
+def _hold_mode_path() -> str:
+    return os.path.expanduser("~/.voicemode/hold-mode")
+
+
+def hold_active() -> bool:
+    """True while hold mode is on or the per-turn hold signal is present.
+    Fail-safe: any error reads as not held (the normal VAD stop applies)."""
+    try:
+        return os.path.exists(_hold_mode_path()) or os.path.exists(_hold_open_signal_path())
+    except Exception:
+        return False
+
+
+def hold_max_seconds() -> float:
+    """Ceiling for a held listen, read from VOICEMODE_HOLD_MAX_SECONDS at call
+    time. Missing, unparseable, or non-positive -> DEFAULT_HOLD_MAX_SECONDS."""
+    try:
+        value = float(os.getenv("VOICEMODE_HOLD_MAX_SECONDS", str(DEFAULT_HOLD_MAX_SECONDS)))
+    except (TypeError, ValueError):
+        return DEFAULT_HOLD_MAX_SECONDS
+    return value if value > 0 else DEFAULT_HOLD_MAX_SECONDS
+
+
+def _clear_stale_hold_open() -> None:
+    """On listen entry, drop a hold-open.signal left over from a crashed turn
+    (mtime older than HOLD_OPEN_STALE_SECONDS). A fresh one is kept: the user
+    may press hold during TTS playback, before the listen starts."""
+    path = _hold_open_signal_path()
+    try:
+        if time.time() - os.path.getmtime(path) > HOLD_OPEN_STALE_SECONDS:
+            os.remove(path)
+            logger.info("Removed stale hold-open signal")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.debug(f"stale hold-open check failed (ignored): {e}")
+
+
+def _clear_hold_open() -> None:
+    """The per-turn hold ends with the turn. Never touches hold-mode."""
+    try:
+        os.remove(_hold_open_signal_path())
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.debug(f"hold-open cleanup failed (ignored): {e}")
+
+
+def _record_held_until_send(fallback_max_duration: float) -> Tuple[np.ndarray, bool]:
+    """Held listen without VAD (disable_silence_detection, or webrtcvad missing):
+    stream the mic until turn-end.signal (after MIN_RECORDING_DURATION) or the
+    hold ceiling. Plain record_audio() never checks signals, so Send could not
+    end it. Returns (audio, True) like the fixed-duration path, or (empty, False)
+    when nothing was captured."""
+    import queue
+
+    ceiling = hold_max_seconds()
+    logger.info(f"🎤 Held listen (no VAD): recording until Send (max {ceiling:.0f}s)...")
+    chunk_samples = int(SAMPLE_RATE * VAD_CHUNK_DURATION_MS / 1000)
+    audio_queue = queue.Queue()
+
+    def _callback(indata, frames, time_info, status):
+        audio_queue.put(indata.copy())
+
+    def _duplex_callback(indata, outdata, frames, time_info, status):
+        outdata.fill(0)
+        _callback(indata, frames, time_info, status)
+
+    turn_end = _turn_end_signal_path()
+    try:
+        if os.path.exists(turn_end):
+            os.remove(turn_end)
+    except Exception:
+        pass
+
+    chunks = []
+    recorded = 0.0
+    try:
+        if _bluetooth_input_active():
+            stream_ctx = sd.Stream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
+                                   device=_duplex_device_pair(), callback=_duplex_callback,
+                                   blocksize=chunk_samples)
+        else:
+            stream_ctx = sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
+                                        callback=_callback, blocksize=chunk_samples)
+        started = time.monotonic()
+        with stream_ctx:
+            # Wall-clock backstop: a stream that stops delivering never
+            # advances `recorded`, and a held listen must still end.
+            while recorded < ceiling and time.monotonic() - started < ceiling + 1.0:
+                try:
+                    if os.path.exists(turn_end) and recorded >= MIN_RECORDING_DURATION:
+                        logger.info("✓ Manual turn-end signal received — stopping held recording")
+                        try:
+                            os.remove(turn_end)
+                        except Exception:
+                            pass
+                        break
+                except Exception:
+                    pass
+                try:
+                    chunk = audio_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                flat = chunk.flatten()
+                chunks.append(flat)
+                recorded += len(flat) / SAMPLE_RATE
+    except Exception as e:
+        logger.error(f"Held recording failed: {e} - falling back to fixed duration recording")
+        return (record_audio(fallback_max_duration), True)
+
+    if not chunks:
+        return (np.array([], dtype=np.int16), False)
+    logger.info(f"✓ Held recording ended after {recorded:.1f}s")
+    return (np.concatenate(chunks), True)
+
+
 def _normalize_phrase(text: Optional[str]) -> str:
     """Lowercase, strip punctuation/extra spaces for whole-utterance matching."""
     if not text:
@@ -1222,7 +1362,18 @@ class StepAwayTracker:
         return False
 
 
-def record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, yield_check: Optional[Callable[[], bool]] = None, yield_state: Optional[dict] = None, pre_roll: Optional[np.ndarray] = None, pause_check: Optional[Callable[[], bool]] = None, step_away_state: Optional[dict] = None, checkin_callback: Optional[Callable[[], None]] = None, append_window_override_ms: Optional[int] = None, step_away_enabled_override: Optional[bool] = None, supersede_check: Optional[Callable[[], bool]] = None) -> Tuple[np.ndarray, bool]:
+def record_audio_with_silence_detection(*args, **kwargs) -> Tuple[np.ndarray, bool]:
+    """Hold-open bookkeeping around _record_audio_with_silence_detection (which
+    has the full signature and docs): clear a stale hold-open.signal on entry,
+    and always remove hold-open.signal when the listen ends, however it ends."""
+    _clear_stale_hold_open()
+    try:
+        return _record_audio_with_silence_detection(*args, **kwargs)
+    finally:
+        _clear_hold_open()
+
+
+def _record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, yield_check: Optional[Callable[[], bool]] = None, yield_state: Optional[dict] = None, pre_roll: Optional[np.ndarray] = None, pause_check: Optional[Callable[[], bool]] = None, step_away_state: Optional[dict] = None, checkin_callback: Optional[Callable[[], None]] = None, append_window_override_ms: Optional[int] = None, step_away_enabled_override: Optional[bool] = None, supersede_check: Optional[Callable[[], bool]] = None) -> Tuple[np.ndarray, bool]:
     """Record audio from microphone with automatic silence detection.
 
     Uses WebRTC VAD to detect when the user stops speaking and automatically
@@ -1302,14 +1453,20 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
     
     if not VAD_AVAILABLE:
         logger.warning("webrtcvad not available, falling back to fixed duration recording")
+        if hold_active():
+            return _record_held_until_send(max_duration)
         # For fallback, assume speech is present since we can't detect
         return (record_audio(max_duration), True)
-    
+
     if DISABLE_SILENCE_DETECTION or disable_silence_detection:
         if disable_silence_detection:
             logger.info("Silence detection disabled for this interaction by request")
         else:
             logger.info("Silence detection disabled globally via VOICEMODE_DISABLE_SILENCE_DETECTION")
+        # Held: fixed-length record_audio() never checks signals, so Send
+        # could not end it. Stream until Send instead.
+        if hold_active():
+            return _record_held_until_send(max_duration)
         # For fallback, assume speech is present since we can't detect
         return (record_audio(max_duration), True)
     
@@ -1457,14 +1614,32 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                 # driving surface (Apple Shortcut → SSH → `touch`) drops this file to end
                 # the listen window IMMEDIATELY, no VAD needed. Cleaned up on each entry so
                 # a stale signal can't pre-end the next turn.
-                _turn_end_signal = os.path.expanduser("~/.voicemode/turn-end.signal")
+                _turn_end_signal = _turn_end_signal_path()
                 try:
                     if os.path.exists(_turn_end_signal):
                         os.remove(_turn_end_signal)
                 except Exception:
                     pass
 
-                while recording_duration < _step_away.effective_max() and not stop_recording:
+                # Hold-open push-to-talk: latched -- once hold-mode or
+                # hold-open.signal is seen, silence can no longer end this
+                # listen; only Send (turn-end.signal) or the hold ceiling can.
+                _held = hold_active()
+                _hold_max = hold_max_seconds()
+                _listen_started = time.monotonic()
+                if _held:
+                    logger.info(f"✋ Held listen: silence will not end the turn (max {_hold_max:.0f}s)")
+
+                while recording_duration < (_hold_max if _held else _step_away.effective_max()) and not stop_recording:
+                    if not _held and hold_active():
+                        _held = True
+                        logger.info(f"✋ Hold engaged at {recording_duration:.1f}s: silence will not end the turn (max {_hold_max:.0f}s)")
+                    # Wall-clock backstop for a held listen: a stream that stops
+                    # delivering never advances recording_duration.
+                    if _held and time.monotonic() - _listen_started >= _hold_max + 1.0:
+                        logger.warning("Held listen hit its wall-clock ceiling - stopping")
+                        break
+
                     # Graceful step-away (founder-os#11655): while IDLE and paused,
                     # extend patience (effective_max above) and speak ONE check-in.
                     # Fully inert unless step-away is enabled AND convomode is paused.
@@ -1482,9 +1657,13 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
 
                     # Honor a manual turn-end signal first (push-to-talk). If William
                     # tapped his "done" Shortcut, end the recording now (only after the
-                    # min duration so a too-fast tap can't return empty audio).
+                    # min duration so a too-fast tap can't return empty audio). The
+                    # signal stays on disk until the floor is reached, so an early
+                    # press is deferred, never dropped. Held turns use only the tiny
+                    # global floor: listen_duration_min must not delay a Send.
+                    _turn_end_floor = MIN_RECORDING_DURATION if _held else max(MIN_RECORDING_DURATION, min_duration)
                     try:
-                        if os.path.exists(_turn_end_signal) and recording_duration >= max(MIN_RECORDING_DURATION, min_duration):
+                        if os.path.exists(_turn_end_signal) and recording_duration >= _turn_end_floor:
                             logger.info("✓ Manual turn-end signal received — stopping recording")
                             try:
                                 os.remove(_turn_end_signal)
@@ -1552,7 +1731,10 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                     # actual idle-listening before a yield request is honored. This
                     # grace applies ONLY to a request (yield_check) — supersession
                     # (supersede_check, above) is a fact and always bypasses it.
-                    if (yield_check is not None and not speech_detected
+                    # Not while held: the user is holding the key to speak, so an
+                    # idle mic is not an abandoned one. (Supersession above, a
+                    # fact rather than a request, still applies.)
+                    if (yield_check is not None and not speech_detected and not _held
                             and recording_duration >= CONCH_YIELD_GRACE_SECONDS):
                         try:
                             if yield_check():
@@ -1605,11 +1787,11 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                                 logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: speech_prob={endpoint_state.speech_prob:.3f}, "
                                             f"speech_started={endpoint_state.speech_started}, endpointed={endpoint_state.endpointed}")
 
-                            if endpoint_state.endpointed:
+                            if endpoint_state.endpointed and not _held:
                                 # Use the larger of MIN_RECORDING_DURATION (global) or
                                 # min_duration (parameter) -- same floor as the
                                 # webrtcvad path, so a too-early endpoint can't return
-                                # a clipped recording.
+                                # a clipped recording. Never while held.
                                 effective_min_duration = max(MIN_RECORDING_DURATION, min_duration)
                                 if recording_duration >= effective_min_duration:
                                     logger.info(f"✓ Endpoint detected after {recording_duration:.1f}s of recording (Silero)")
@@ -1678,7 +1860,10 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                                     # silence threshold by the append window. _append_ms=0
                                     # (default) → identical to prior behavior.
                                     _silence_stop_threshold = SILENCE_THRESHOLD_MS + _append_ms
-                                    if recording_duration >= effective_min_duration and silence_duration_ms >= _silence_stop_threshold:
+                                    # Never while held (hold-open push-to-talk).
+                                    if (recording_duration >= effective_min_duration
+                                            and silence_duration_ms >= _silence_stop_threshold
+                                            and not _held):
                                         logger.info(f"✓ Silence threshold reached after {recording_duration:.1f}s of recording")
                                         if VAD_DEBUG:
                                             logger.info(f"[VAD_DEBUG] STOP: silence_duration={silence_duration_ms}ms >= threshold={_silence_stop_threshold}ms")
