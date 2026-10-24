@@ -18,6 +18,7 @@ sys.modules.setdefault("webrtcvad", MagicMock())
 from voice_mode import airpods_press as ap
 
 _real_ensure_opted_in = ap._ensure_opted_in
+_real_run_floor = ap._run_floor
 
 
 class FakeApp:
@@ -50,6 +51,20 @@ class FakeApp:
     def press(self):
         self.muted = not self.muted
         return self.handler(self.muted)
+
+
+floor_calls = []
+
+
+@pytest.fixture(autouse=True)
+def isolate_darwin_notify(monkeypatch):
+    floor_calls.clear()
+    """Existing tests exercise the AVAudioApplication path only; the real
+    Darwin watcher is off unless a test turns it on. Reset the dedupe state."""
+    monkeypatch.setenv(ap.DARWIN_ENV_VAR, "0")
+    monkeypatch.setattr(ap, "_last_send", (0.0, ""))
+    monkeypatch.setattr(ap, "_phase", ap.PHASE_TTS)
+    monkeypatch.setattr(ap, "_run_floor", lambda cmd: floor_calls.append(cmd) or True)
 
 
 @pytest.fixture(autouse=True)
@@ -105,11 +120,12 @@ def test_every_toggle_is_a_press(home, fake_app):
         assert sender.presses == 2
 
 
-def test_press_ignored_while_paused(home, fake_app):
+def test_press_while_paused_proceeds_not_send(home, fake_app):
     (home / ".voicemode" / "pause.flag").touch()
     with ap.listening():
         fake_app.press()
         assert not _signal(home).exists()
+        assert floor_calls == ["proceed"]
 
 
 def test_unregisters_and_resets_mute_after_listen(home, fake_app):
@@ -234,13 +250,13 @@ def test_debug_log_records_register_calls_and_unregister(home, fake_app):
     text = _debug_log(home).read_text()
     assert "registered ok=True initial_muted=False opted_in=True" in text
     assert "handler muted=False last=False closing=False -> ignored (initial sync / no change)" in text
-    assert "handler muted=True last=False -> SEND (turn-end.signal)" in text
+    assert "phase=listen paused=False avaudioapplication handler muted=True last=False -> SEND" in text
     assert "-> ignored (reset)" in text  # close() resets mute via the handler
     assert "unregistered (presses=1, reset_mute=True)" in text
     assert "thread=" in text and "pid=" in text
 
 
-def test_debug_log_records_paused_and_skips(home, fake_app, monkeypatch):
+def test_debug_log_records_paused_proceed_and_skips(home, fake_app, monkeypatch):
     (home / ".voicemode" / "pause.flag").touch()
     with ap.listening():
         fake_app.press()
@@ -248,7 +264,7 @@ def test_debug_log_records_paused_and_skips(home, fake_app, monkeypatch):
     with ap.listening():
         pass
     text = _debug_log(home).read_text()
-    assert "-> ignored (paused)" in text
+    assert "phase=listen paused=True avaudioapplication" in text and "-> PROCEED" in text
     assert "register skipped: VOICEMODE_AIRPODS_PRESS_SEND is off" in text
 
 
@@ -296,3 +312,225 @@ def test_opt_in_failure_is_fail_open(home, fake_app, monkeypatch):
         fake_app.press()
     assert _signal(home).exists()
     assert "opted_in=False" in _debug_log(home).read_text()
+
+
+# ---- Darwin notification fallback ------------------------------------------
+
+class FakeLib:
+    """Stands in for libSystem: notify_check reports the posts queued per token."""
+
+    def __init__(self, register_status=0):
+        self.register_status = register_status
+        self.pending = {}  # token -> count of unseen posts
+        self.names = {}
+        self.cancelled = []
+        self._next = 10
+        self.first_check = set()
+
+    def notify_register_check(self, name, tok_ref):
+        if self.register_status:
+            return self.register_status
+        tok = self._next
+        self._next += 1
+        tok_ref._obj.value = tok
+        self.names[name.decode()] = tok
+        self.pending[tok] = 0
+        return 0
+
+    def notify_check(self, tok, flag_ref):
+        if tok not in self.first_check:  # real notify_check reports True once at first
+            self.first_check.add(tok)
+            flag_ref._obj.value = 1
+            return 0
+        flag_ref._obj.value = 1 if self.pending[tok] else 0
+        self.pending[tok] = 0
+        return 0
+
+    def notify_get_state(self, tok, st_ref):
+        st_ref._obj.value = 1
+        return 0
+
+    def notify_cancel(self, tok):
+        self.cancelled.append(tok)
+        return 0
+
+    def post(self, name):
+        self.pending[self.names[name]] += 1
+
+
+def _wait(cond, timeout=2.0):
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return cond()
+
+
+@pytest.fixture
+def fake_lib(home, monkeypatch):
+    lib = FakeLib()
+    monkeypatch.setenv(ap.DARWIN_ENV_VAR, "1")
+    monkeypatch.setattr(ap, "_load_libsystem", lambda: lib)
+    monkeypatch.setattr(ap, "_load_app", lambda: None)  # darwin path alone
+    return lib
+
+
+def test_darwin_post_writes_airpods_source(home, fake_lib):
+    with ap.listening():
+        assert not _signal(home).exists()  # priming check is not a press
+        fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+        assert _wait(lambda: _signal(home).exists())
+    assert _signal(home).read_text().strip() == "airpods"
+
+
+def test_darwin_both_names_are_watched(home, fake_lib):
+    with ap.listening():
+        assert set(fake_lib.names) == set(ap.DARWIN_NOTIFY_NAMES)
+        fake_lib.post(ap.DARWIN_NOTIFY_NAMES[1])
+        assert _wait(lambda: _signal(home).exists())
+
+
+def test_darwin_paused_during_listen_proceeds_not_send(home, fake_lib):
+    (home / ".voicemode" / "pause.flag").touch()
+    with ap.listening():
+        fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+        assert _wait(lambda: floor_calls == ["proceed"])
+        assert not _signal(home).exists()
+
+
+def test_darwin_unsubscribes_when_listen_ends(home, fake_lib):
+    with ap.listening():
+        pass
+    assert sorted(fake_lib.cancelled) == sorted(fake_lib.names.values())
+
+
+def test_darwin_post_after_listen_is_ignored(home, fake_lib):
+    with ap.listening():
+        pass
+    fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+    import time; time.sleep(0.2)
+    assert not _signal(home).exists()
+
+
+def test_darwin_disabled_by_env(home, fake_lib, monkeypatch):
+    monkeypatch.setenv(ap.DARWIN_ENV_VAR, "0")
+    with ap.listening():
+        assert fake_lib.names == {}
+
+
+def test_darwin_default_on(monkeypatch):
+    monkeypatch.delenv(ap.DARWIN_ENV_VAR, raising=False)
+    assert ap.darwin_enabled() is True
+
+
+def test_darwin_fail_open_when_register_fails(home, monkeypatch):
+    monkeypatch.setenv(ap.DARWIN_ENV_VAR, "1")
+    monkeypatch.setattr(ap, "_load_libsystem", lambda: FakeLib(register_status=1))
+    monkeypatch.setattr(ap, "_load_app", lambda: None)
+    with ap.listening() as sender:
+        assert sender is None  # listen proceeds
+
+
+def test_darwin_fail_open_without_libsystem(home, monkeypatch):
+    monkeypatch.setenv(ap.DARWIN_ENV_VAR, "1")
+    monkeypatch.setattr(ap, "_load_libsystem", lambda: None)
+    monkeypatch.setattr(ap, "_load_app", lambda: None)
+    with ap.listening():
+        pass
+
+
+def test_press_seen_by_both_paths_counts_once(home, fake_lib, fake_app, monkeypatch):
+    monkeypatch.setattr(ap, "_load_app", lambda: fake_app)
+    with ap.listening():
+        fake_app.press()
+        assert _signal(home).exists()
+        _signal(home).unlink()  # listen consumed the Send
+        fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+        import time; time.sleep(0.3)
+        assert not _signal(home).exists()  # duplicate collapsed
+
+
+def test_darwin_post_is_logged_with_source(home, fake_lib):
+    with ap.listening():
+        fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+        assert _wait(lambda: _signal(home).exists())
+    log = (home / ".voicemode" / "logs" / "airpods.log").read_text()
+    assert "darwin-notify" in log and "SEND" in log
+
+
+def test_live_libsystem_subscription_smoke():
+    """Real libSystem: registration succeeds and state is readable (no press)."""
+    import sys
+    if sys.platform != "darwin":
+        pytest.skip("macOS only")
+    lib = ap._load_libsystem()
+    w = ap.DarwinNotifyWatcher(lib)
+    try:
+        assert w.active
+    finally:
+        w.close()
+
+
+# ---- Phases: press = Send (listen) / pause (tts, idle) / proceed (paused) ---
+
+def test_press_during_tts_pauses(home, fake_lib):
+    with ap.session():
+        fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+        assert _wait(lambda: floor_calls == ["pause"])
+        assert not _signal(home).exists()
+
+
+def test_press_while_paused_during_tts_proceeds(home, fake_lib):
+    (home / ".voicemode" / "pause.flag").touch()
+    with ap.session():
+        fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+        assert _wait(lambda: floor_calls == ["proceed"])
+
+
+def test_press_during_listen_sends_not_pause(home, fake_lib):
+    with ap.session():
+        with ap.listening():
+            fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+            assert _wait(lambda: _signal(home).exists())
+        assert floor_calls == []
+
+
+def test_phase_returns_to_tts_after_listen_within_session(home, fake_lib):
+    with ap.session():
+        with ap.listening():
+            assert ap._phase == ap.PHASE_LISTEN
+        assert ap._phase == ap.PHASE_TTS
+        fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+        assert _wait(lambda: floor_calls == ["pause"])
+
+
+def test_watcher_lives_across_whole_session_and_closes_once(home, fake_lib):
+    with ap.session():
+        with ap.listening():
+            pass
+        assert fake_lib.cancelled == []  # still subscribed after the listen ends
+    assert sorted(fake_lib.cancelled) == sorted(fake_lib.names.values())
+
+
+def test_pause_debounced_within_300ms(home, fake_lib):
+    with ap.session():
+        ap._on_press("darwin-notify", "a")
+        ap._on_press("darwin-notify", "b")
+    assert floor_calls == ["pause"]
+
+
+def test_decisions_logged_with_phase(home, fake_lib):
+    with ap.session():
+        fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+        assert _wait(lambda: floor_calls)
+    log = (home / ".voicemode" / "logs" / "airpods.log").read_text()
+    assert "phase=tts" in log and "PAUSE" in log
+
+
+def test_run_floor_flag_fallback(home, monkeypatch):
+    monkeypatch.setattr(ap, "_floor_script", str(home / "missing.py"))
+    flag = home / ".voicemode" / "pause.flag"
+    assert _real_run_floor("pause") and flag.exists()
+    assert _real_run_floor("proceed") and not flag.exists()

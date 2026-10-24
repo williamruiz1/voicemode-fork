@@ -28,6 +28,18 @@ Details:
     is added once and kept.
   * Every registration, handler call and unregister is appended to
     ``~/.voicemode/logs/airpods.log`` (size-capped) for diagnosis.
+  * Fallback (Darwin notification): audioaccessoryd also posts
+    ``com.apple.private.restrict-post.audioaccessoryd.MuteState`` (older macOS:
+    ``com.apple.audioaccessoryd.MuteState``) on every stem press in call mode.
+    It needs no bundle and no mic permission. While a listen is open a small
+    thread watches both names via libSystem ``notify_register_check`` /
+    ``notify_check`` (every 50 ms) and treats a post as Send, source
+    "airpods". A press seen by both paths within 300 ms counts once. Gated by
+    VOICEMODE_AIRPODS_DARWIN_NOTIFY (default on); fail-open.
+  * Phases: the Darwin watcher is held by ``session()`` for the whole converse
+    call. One press means Send while a listen is open, pause while the agent is
+    speaking or idle (``convomode-floor.py pause``), and proceed whenever
+    convomode is paused. Decisions are logged to airpods.log with the phase.
   * Gated by VOICEMODE_AIRPODS_PRESS_SEND (default on). Fails open: without
     PyObjC's AVFAudio bindings (``pip install 'voice-mode[airpods]'``), on
     non-macOS, or on any error, the listen proceeds exactly as before.
@@ -45,16 +57,30 @@ from typing import Iterator, Optional
 logger = logging.getLogger("voicemode")
 
 ENV_VAR = "VOICEMODE_AIRPODS_PRESS_SEND"
+DARWIN_ENV_VAR = "VOICEMODE_AIRPODS_DARWIN_NOTIFY"
+DARWIN_NOTIFY_NAMES = (
+    "com.apple.private.restrict-post.audioaccessoryd.MuteState",
+    "com.apple.audioaccessoryd.MuteState",
+)
+DARWIN_POLL_SECONDS = 0.05
+DEDUPE_SECONDS = 0.3
 SEND_SOURCE = "airpods"
 DEBUG_LOG_MAX_BYTES = 512 * 1024  # airpods.log rotates to airpods.log.1 past this
 
 _debug_lock = threading.Lock()
 _opt_in_lock = threading.Lock()
 _opt_in_observer = None  # kept for the process's life once opted in
+_send_lock = threading.Lock()
+_last_send = (0.0, "")  # (monotonic time, origin) of the last emitted Send
 
 
 def enabled() -> bool:
     value = os.getenv(ENV_VAR, "").strip().lower()
+    return value in ("true", "1", "yes", "on") if value else True
+
+
+def darwin_enabled() -> bool:
+    value = os.getenv(DARWIN_ENV_VAR, "").strip().lower()
     return value in ("true", "1", "yes", "on") if value else True
 
 
@@ -100,6 +126,70 @@ def _write_send_signal() -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(SEND_SOURCE + "\n")
     os.replace(tmp, path)
+
+
+PHASE_TTS = "tts"        # agent speaking, or idle between listens
+PHASE_LISTEN = "listen"  # mic open
+_phase = PHASE_TTS
+_floor_script = os.path.expanduser("~/.local/bin/founder-os/convomode-floor.py")
+
+
+def _run_floor(command: str) -> bool:
+    """`convomode-floor.py pause|proceed` (also maintains pause.flag). Falls
+    back to touching/removing pause.flag if the script is unavailable. Never raises."""
+    try:
+        if os.path.exists(_floor_script):
+            import subprocess
+            r = subprocess.run([_floor_script, command], capture_output=True, timeout=10)
+            if r.returncode == 0:
+                return True
+            debug_log(f"floor {command} rc={r.returncode} {r.stderr[-200:]!r}; using flag fallback")
+        flag = _pause_flag_path()
+        if command == "pause":
+            os.makedirs(os.path.dirname(flag), exist_ok=True)
+            open(flag, "a").close()
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(flag)
+        return True
+    except Exception as e:
+        debug_log(f"floor {command} failed: {e!r}")
+        return False
+
+
+def _on_press(origin: str, detail: str) -> Optional[str]:
+    """One stem press. Decision by state (Q4-A):
+      paused (any phase)        -> proceed
+      phase listen              -> Send (turn-end.signal, source "airpods")
+      otherwise (TTS / idle)    -> pause
+    Presses seen by two paths, or twice inside DEBOUNCE, count once for
+    pause/proceed; Send only collapses across different origins. Returns the
+    action taken or None. Never raises."""
+    global _last_send
+    phase = _phase
+    paused = os.path.exists(_pause_flag_path())
+    action = "proceed" if paused else ("send" if phase == PHASE_LISTEN else "pause")
+    now = time.monotonic()
+    with _send_lock:
+        last_t, last_origin = _last_send
+        recent = last_origin and now - last_t < DEDUPE_SECONDS
+        if recent and (last_origin != origin or action != "send"):
+            debug_log(f"phase={phase} {origin} {detail} -> ignored (debounce, last={last_origin})")
+            return None
+        _last_send = (now, origin)
+    try:
+        if action == "send":
+            _write_send_signal()
+            logger.info("✓ AirPods press -> Send (turn-end.signal)")
+        else:
+            _run_floor(action)
+            logger.info(f"✓ AirPods press -> {action}")
+        debug_log(f"phase={phase} paused={paused} {origin} {detail} -> {action.upper()}")
+        return action
+    except Exception as e:
+        debug_log(f"phase={phase} {origin} {detail} -> {action} failed: {e!r}")
+        logger.warning(f"AirPods press: {action} failed: {e}")
+        return None
 
 
 def _ensure_opted_in() -> bool:
@@ -169,17 +259,7 @@ class PressSender:
             debug_log(f"handler muted={muted} last={last} closing={closing} -> ignored "
                       f"({'reset' if closing else 'initial sync / no change'})")
             return True  # initial sync / our own reset: not a press
-        if os.path.exists(_pause_flag_path()):
-            debug_log(f"handler muted={muted} last={last} -> ignored (paused)")
-            logger.info("AirPods press ignored: convomode is paused")
-            return True
-        try:
-            _write_send_signal()
-            debug_log(f"handler muted={muted} last={last} -> SEND (turn-end.signal)")
-            logger.info("✓ AirPods press -> Send (turn-end.signal)")
-        except Exception as e:
-            debug_log(f"handler muted={muted} last={last} -> write failed: {e!r}")
-            logger.warning(f"AirPods press: could not write turn-end.signal: {e}")
+        _on_press("avaudioapplication", f"handler muted={muted} last={last}")
         return True  # never mute capture
 
     def close(self) -> None:
@@ -231,19 +311,158 @@ def register() -> Optional[PressSender]:
     return sender
 
 
-@contextlib.contextmanager
-def listening() -> Iterator[Optional[PressSender]]:
-    """Hold the press handler for the duration of one listen. Never raises."""
-    sender = None
-    try:
-        sender = register()
-    except Exception as e:
-        logger.debug(f"AirPods press: register crashed (ignored): {e}")
-    try:
-        yield sender
-    finally:
-        if sender is not None:
+class DarwinNotifyWatcher:
+    """Watches the audioaccessoryd MuteState Darwin notifications for one
+    listen. ``notify_check`` reports a post since the previous check, so a
+    polling thread needs no run loop or ctypes block. Names that fail to
+    register are skipped; if none register the watcher is not started."""
+
+    def __init__(self, lib, names=DARWIN_NOTIFY_NAMES, poll=DARWIN_POLL_SECONDS):
+        self._lib = lib
+        self._poll = poll
+        self._stop = threading.Event()
+        self._tokens = []  # (name, token)
+        self._thread = None
+        self.posts = 0
+        import ctypes
+        self._ctypes = ctypes
+        for name in names:
+            token = ctypes.c_int(-1)
+            status = lib.notify_register_check(name.encode(), ctypes.byref(token))
+            if status != 0:
+                debug_log(f"darwin-notify: register {name} failed status={status}")
+                continue
+            self._prime(token.value)  # first check always reports True; swallow it
+            self._tokens.append((name, token.value))
+            state = ctypes.c_uint64(0)
+            lib.notify_get_state(token.value, ctypes.byref(state))
+            debug_log(f"darwin-notify: registered {name} state={state.value}")
+
+    def _check(self, token) -> bool:
+        flag = self._ctypes.c_int(0)
+        if self._lib.notify_check(token, self._ctypes.byref(flag)) != 0:
+            return False
+        return bool(flag.value)
+
+    def _prime(self, token) -> None:
+        self._check(token)
+
+    @property
+    def active(self) -> bool:
+        return bool(self._tokens)
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="airpods-darwin-notify", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._poll):
+            for name, token in self._tokens:
+                try:
+                    if self._check(token):
+                        self.posts += 1
+                        _on_press("darwin-notify", f"post {name}")
+                except Exception as e:
+                    debug_log(f"darwin-notify: poll error {e!r}")
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        for _, token in self._tokens:
             try:
-                sender.close()
+                self._lib.notify_cancel(token)
             except Exception:
                 pass
+        debug_log(f"darwin-notify: unsubscribed (posts={self.posts})")
+        self._tokens = []
+
+
+def _load_libsystem():
+    try:
+        import ctypes
+        import sys
+        if sys.platform != "darwin":
+            return None
+        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        lib.notify_register_check.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+        lib.notify_check.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+        lib.notify_get_state.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+        lib.notify_cancel.argtypes = [ctypes.c_int]
+        return lib
+    except Exception as e:
+        debug_log(f"darwin-notify: libSystem unavailable: {e!r}")
+        return None
+
+
+def register_darwin_notify() -> Optional[DarwinNotifyWatcher]:
+    """Start the Darwin-notification watcher; None if disabled/unavailable."""
+    if not darwin_enabled():
+        debug_log(f"darwin-notify skipped: {DARWIN_ENV_VAR} is off")
+        return None
+    lib = _load_libsystem()
+    if lib is None:
+        return None
+    watcher = DarwinNotifyWatcher(lib)
+    if not watcher.active:
+        return None
+    watcher.start()
+    return watcher
+
+
+_session_lock = threading.Lock()
+_session_count = 0
+_session_watcher: Optional[DarwinNotifyWatcher] = None
+
+
+@contextlib.contextmanager
+def session() -> Iterator[None]:
+    """Hold the Darwin-notification watcher for a whole converse call (TTS +
+    listen). Re-entrant; the watcher lives until the outermost exit. Outside a
+    listen the phase is "tts" and a press toggles pause. Never raises."""
+    global _session_count, _session_watcher, _phase
+    with _session_lock:
+        if _session_count == 0:
+            _phase = PHASE_TTS
+            try:
+                _session_watcher = register_darwin_notify()
+            except Exception as e:
+                logger.debug(f"AirPods press: darwin-notify crashed (ignored): {e}")
+                _session_watcher = None
+        _session_count += 1
+    try:
+        yield
+    finally:
+        with _session_lock:
+            _session_count -= 1
+            if _session_count == 0:
+                watcher, _session_watcher = _session_watcher, None
+                _phase = PHASE_TTS
+                if watcher is not None:
+                    try:
+                        watcher.close()
+                    except Exception:
+                        pass
+
+
+@contextlib.contextmanager
+def listening() -> Iterator[Optional[PressSender]]:
+    """One listen: phase "listen" (press = Send) with the AVAudioApplication
+    handler held. Opens its own session if converse didn't. Never raises."""
+    global _phase
+    with session():
+        sender = None
+        try:
+            sender = register()
+        except Exception as e:
+            logger.debug(f"AirPods press: register crashed (ignored): {e}")
+        _phase = PHASE_LISTEN
+        try:
+            yield sender
+        finally:
+            _phase = PHASE_TTS
+            if sender is not None:
+                try:
+                    sender.close()
+                except Exception:
+                    pass

@@ -2593,6 +2593,10 @@ consult the MCP resources listed above.
     success = False
     conch = Conch(agent_name="converse")  # Named for event logging
 
+    # AirPods press watcher for the whole call (TTS + listen); closed in finally.
+    _press_session = airpods_press.session()
+    _press_session.__enter__()
+
     try:
         # Try to acquire conch atomically (no race condition)
         # skip_conch=true bypasses coordination entirely: don't acquire, don't
@@ -3619,6 +3623,8 @@ consult the MCP resources listed above.
         return result
 
     finally:
+        _press_session.__exit__(None, None, None)
+
         # Drop any yield request we wrote while waiting (own-pid guarded no-op
         # if we never requested or another waiter's request is newer).
         Conch.clear_yield_request(owner=conch.owner)
