@@ -137,7 +137,7 @@ class TestSilenceDetection:
             result, speech_detected = record_audio_with_silence_detection(max_duration=5.0)
             
             # Should fall back to regular recording
-            mock_record.assert_called_once_with(5.0)
+            mock_record.assert_called_once_with(5.0, honor_send=True)
             assert np.array_equal(result, np.array([1, 2, 3]))
             assert speech_detected  # Should assume speech when disabled
     
@@ -151,7 +151,7 @@ class TestSilenceDetection:
             result, speech_detected = record_audio_with_silence_detection(max_duration=5.0)
             
             # Should fall back to regular recording
-            mock_record.assert_called_once_with(5.0)
+            mock_record.assert_called_once_with(5.0, honor_send=True)
             assert np.array_equal(result, np.array([1, 2, 3]))
             assert speech_detected  # Should assume speech when VAD unavailable
     
@@ -230,7 +230,7 @@ class TestSilenceDetection:
             )
             
             # Should fall back to regular recording, ignoring min_duration
-            mock_record.assert_called_once_with(5.0)
+            mock_record.assert_called_once_with(5.0, honor_send=True)
             assert np.array_equal(result, np.array([1, 2, 3]))
             assert speech_detected  # Should assume speech when disabled
 
