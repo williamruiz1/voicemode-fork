@@ -2591,7 +2591,7 @@ consult the MCP resources listed above.
                     # (vibedispatcher#132). Refreshed every poll so the request
                     # stays fresh; an idle holder yields within seconds.
                     if CONCH_YIELD_ENABLED:
-                        Conch.request_yield("converse")
+                        Conch.request_yield("converse", owner=conch.owner)
                     await asyncio.sleep(CONCH_CHECK_INTERVAL)
                     waited += CONCH_CHECK_INTERVAL
 
@@ -2600,7 +2600,7 @@ consult the MCP resources listed above.
                     # NEVER mid-utterance (see _preempt_conch_after_tts_grace).
                     await _preempt_conch_after_tts_grace(conch)
 
-                Conch.clear_yield_request()
+                Conch.clear_yield_request(owner=conch.owner)
 
                 if event_logger:
                     event_logger.log_event("CONCH_WAIT_END", {
@@ -2900,7 +2900,7 @@ consult the MCP resources listed above.
                 # Only wired when we actually hold the conch (skip_conch never yields).
                 yield_state = {"yielded": False}
                 listen_yield_check = (
-                    Conch.is_wanted
+                    functools.partial(Conch.is_wanted, owner=conch.owner)
                     if (CONCH_ENABLED and CONCH_YIELD_ENABLED and conch._acquired)
                     else None
                 )
@@ -3578,7 +3578,7 @@ consult the MCP resources listed above.
     finally:
         # Drop any yield request we wrote while waiting (own-pid guarded no-op
         # if we never requested or another waiter's request is newer).
-        Conch.clear_yield_request()
+        Conch.clear_yield_request(owner=conch.owner)
 
         # Release the conch to signal voice conversation has ended
         if CONCH_ENABLED and conch._acquired:

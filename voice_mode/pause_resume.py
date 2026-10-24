@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
 from . import audio_player
+from . import client_identity
 
 logger = logging.getLogger("voicemode.pause_resume")
 
@@ -71,11 +72,18 @@ def floor_holder_pid() -> Optional[int]:
 
 def we_hold_floor() -> Optional[bool]:
     """True/False when a holder is recorded (is it this session?); None if the
-    floor has no holder or the state is unreadable."""
+    floor has no holder or the state is unreadable.
+
+    Under the shared HTTP daemon this process is no session's child, so the
+    session is the bound MCP client (client_identity); with no client bound
+    there the answer is unknown (None), never a guess from the daemon's pid."""
     holder = floor_holder_pid()
     if holder is None:
         return None
-    return holder in _ancestor_pids()
+    client_pid = client_identity.current_client_pid()
+    if client_pid is None and client_identity.SHARED_MODE:
+        return None
+    return holder in _ancestor_pids(client_pid)
 
 
 def floor_handed_off(held_at_start: bool) -> bool:
