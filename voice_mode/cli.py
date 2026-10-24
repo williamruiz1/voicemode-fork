@@ -2100,6 +2100,18 @@ def converse(message_args, message, wait, skip_stt, duration, min_duration, voic
     asyncio.run(run_conversation())
 
 
+def _init_event_logging():
+    """Same event-log + FFmpeg setup the stdio server does in server.main()."""
+    from pathlib import Path
+    from . import config
+    from .utils import initialize_event_logger
+    from .utils.ffmpeg_check import check_ffmpeg, check_ffprobe
+
+    config.FFMPEG_AVAILABLE = check_ffmpeg()[0] and check_ffprobe()[0]
+    if config.EVENT_LOG_ENABLED:
+        initialize_event_logger(log_dir=Path(config.EVENT_LOG_DIR), enabled=True)
+
+
 # Serve command - HTTP/SSE server for remote access
 @voice_mode_main_cli.command()
 @click.help_option('-h', '--help')
@@ -2122,9 +2134,26 @@ def converse(message_args, message, wait, skip_stt, duration, min_duration, voic
               help='Require a secret path segment for access (e.g., --secret=my-uuid)')
 @click.option('--token', default=None,
               help='Require Bearer token authentication via Authorization header')
+@click.option('--stateless', is_flag=True, default=False,
+              help='Stateless streamable HTTP (no MCP session state), so clients '
+                   'survive a server restart without re-initializing')
+@click.option('--idle-exit', type=float, default=None,
+              help='Exit after this many seconds with no tool call running '
+                   '(default: $VOICEMODE_DAEMON_IDLE_EXIT_SECONDS, else never)')
+@click.option('--launchd-socket', default=None,
+              help='Serve on the listening socket launchd passes under this '
+                   'Sockets key (socket activation) instead of binding --host/--port')
+@click.option('--log-file', default=None,
+              help='Also log to this size-capped, rotating file (5 MB x 3). '
+                   '--daemon defaults it to ~/.voicemode/logs/daemon.log')
+@click.option('--daemon', 'daemon_mode', is_flag=True, default=False,
+              help='Shared local daemon for every Claude Code session: implies '
+                   '--stateless and idle exit after $VOICEMODE_DAEMON_IDLE_EXIT_SECONDS '
+                   '(default 2700)')
 def serve(host: str, port: int, transport: str, log_level: str, allow_anthropic: bool | None,
           allow_tailscale: bool | None, allow_ip: tuple, allow_local: bool | None,
-          secret: str | None, token: str | None):
+          secret: str | None, token: str | None, stateless: bool, idle_exit: float | None,
+          launchd_socket: str | None, log_file: str | None, daemon_mode: bool):
     """Start VoiceMode as an HTTP/SSE server for remote access.
 
     This enables Claude Code, Claude Desktop, Claude Cowork, or other MCP
@@ -2171,6 +2200,8 @@ def serve(host: str, port: int, transport: str, log_level: str, allow_anthropic:
     import logging
     from .server import mcp
     from .config import setup_logging
+    from . import client_identity
+    from .daemon import DEFAULT_IDLE_EXIT_SECONDS, ClientIdentityMiddleware, IdleExit
     from .serve_middleware import (
         AccessLogMiddleware,
         IPAllowlistMiddleware,
@@ -2305,8 +2336,35 @@ def serve(host: str, port: int, transport: str, log_level: str, allow_anthropic:
     click.echo("Press Ctrl+C to stop the server")
     click.echo()
 
+    # One process now serves several sessions: tool calls carry their
+    # client's identity instead of this process's pid (conch, floor).
+    client_identity.SHARED_MODE = True
+    if daemon_mode:
+        stateless = True
+        if log_file is None:
+            log_file = os.path.expanduser("~/.voicemode/logs/daemon.log")
+    if log_file:
+        # launchd output goes to /dev/null (it never rotates a file), so the
+        # daemon caps its own log. uvicorn's loggers propagate here too
+        # (log_config=None below).
+        from logging.handlers import RotatingFileHandler
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        file_handler = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=2)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        logging.getLogger().addHandler(file_handler)
+    if idle_exit is None:
+        env_idle = os.environ.get("VOICEMODE_DAEMON_IDLE_EXIT_SECONDS", "").strip()
+        if env_idle:
+            idle_exit = float(env_idle)
+        else:
+            idle_exit = DEFAULT_IDLE_EXIT_SECONDS if daemon_mode else 0.0
+    idle = IdleExit(idle_exit) if idle_exit and idle_exit > 0 else None
+    mcp.add_middleware(ClientIdentityMiddleware(idle))
+    _init_event_logging()
+
     # Create the app with the selected transport (fastmcp 2.14+ API)
-    app = mcp.http_app(transport=transport, path=endpoint_path)
+    app = mcp.http_app(transport=transport, path=endpoint_path,
+                       stateless_http=True if stateless else None)
 
     # Note: Middleware is applied in reverse order (last added = first executed)
     # Add token auth middleware (checked after IP allowlist)
@@ -2326,16 +2384,44 @@ def serve(host: str, port: int, transport: str, log_level: str, allow_anthropic:
 
         # Disable uvicorn's access logging - we use our own AccessLogMiddleware
         # which shows X-Forwarded-For headers
-        uvicorn.run(
+        server = uvicorn.Server(uvicorn.Config(
             app,
             host=host,
             port=port,
             log_level=log_level.lower(),
             access_log=False,  # Disable uvicorn access log, use our middleware instead
-        )
+            log_config=None if log_file else uvicorn.config.LOGGING_CONFIG,
+        ))
+        sockets = None
+        if launchd_socket:
+            from .daemon import launchd_sockets
+            sockets = launchd_sockets(launchd_socket)
+            logger.info(f"Serving on {len(sockets)} launchd socket(s) '{launchd_socket}'")
+
+        async def _serve():
+            if idle:
+                click.echo(f"Idle exit after {idle.seconds:.0f}s without a tool call")
+                logger.info(f"Idle exit after {idle.seconds:.0f}s without a tool call")
+
+                def _stop():
+                    server.should_exit = True
+                watcher = asyncio.ensure_future(idle.watch(_stop))
+            try:
+                await server.serve(sockets=sockets)
+            finally:
+                if idle:
+                    watcher.cancel()
+
+        asyncio.run(_serve())
+        if idle and idle.is_idle():
+            # Exit 0 so launchd treats it as a clean stop and waits for the
+            # next connection; skip interpreter teardown (audio/device threads).
+            logging.shutdown()
+            os._exit(0)
     except KeyboardInterrupt:
         click.echo("\nServer stopped")
     except Exception as e:
+        logger.exception(f"Error starting server: {e}")
         click.echo(f"Error starting server: {e}", err=True)
         raise click.Abort()
 
