@@ -29,6 +29,7 @@ from .utils import (
     update_latest_symlinks
 )
 from .audio_player import NonBlockingAudioPlayer
+from . import audio_player as audio_player_mod
 
 logger = logging.getLogger("voicemode")
 
@@ -321,6 +322,7 @@ async def text_to_speech(
                 # elapsed_audio_seconds is an ESTIMATE, never exact.
                 if stream_metrics.truncated:
                     metrics['truncated'] = True
+                    metrics['paused'] = stream_metrics.paused
                     metrics['delivered_text'] = stream_metrics.delivered_text
                     metrics['undelivered_text'] = stream_metrics.undelivered_text
                     metrics['delivered_fraction'] = stream_metrics.delivered_fraction
@@ -467,7 +469,11 @@ async def text_to_speech(
                         player = NonBlockingAudioPlayer()
                         player.play(samples_with_buffer, audio.frame_rate, blocking=False)
                         player.wait()
-                        
+                        # Pause cuts the callback; the cut point isn't tracked on
+                        # this path, so converse replays the whole message.
+                        if audio_player_mod.convomode_paused():
+                            metrics['paused'] = True
+
                         playback_end = time.perf_counter()
                         metrics['playback'] = playback_end - playback_start
 
