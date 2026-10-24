@@ -74,6 +74,12 @@ silero = [
     # runs (degraded, SILERO_AVAILABLE=False) fine without this installed.
     "onnxruntime>=1.17",
 ]
+airpods = [
+    # AirPods stem press = Send (voice_mode/airpods_press.py): PyObjC bindings for
+    # AVAudioApplication's input-mute handler (macOS 14+). OPTIONAL — without it
+    # the feature is silently off and listens behave exactly as before.
+    "pyobjc-framework-AVFoundation>=10.0; sys_platform == 'darwin'",
+]
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-material[imaging]>=9.0.0",

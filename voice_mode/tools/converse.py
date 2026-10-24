@@ -108,6 +108,7 @@ from voice_mode.core import (
 )
 from voice_mode.audio_player import NonBlockingAudioPlayer, SPEAKING_FLAG_PATH, convomode_paused, PAUSE_FLAG_PATH
 from voice_mode import audio_player
+from voice_mode import airpods_press
 from voice_mode.pause_resume import resume_after_pause, pause_max_seconds, we_hold_floor
 from voice_mode import barge_in
 from voice_mode.statistics_tracking import track_voice_interaction
@@ -1582,7 +1583,9 @@ def record_audio_with_silence_detection(*args, listen_stats: Optional[dict] = No
     _write_listening_state(stats["started_at"], stats["held"])
     result = None
     try:
-        result = _record_audio_with_silence_detection(*args, listen_stats=stats, **kwargs)
+        # AirPods stem press = Send while the mic is open (no-op if unavailable).
+        with airpods_press.listening():
+            result = _record_audio_with_silence_detection(*args, listen_stats=stats, **kwargs)
         return result
     finally:
         samples = len(result[0]) if result is not None else 0
