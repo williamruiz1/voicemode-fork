@@ -23,8 +23,21 @@ BLOCKED_COMMANDS = {
 
 # sounddevice entry points that open the REAL input device. `query_devices` and
 # `default` are deliberately NOT listed -- reading device metadata is harmless
-# and plenty of code does it.
-BLOCKED_AUDIO_CAPTURE = ("InputStream", "rec")
+# and plenty of code does it. `Stream` is full-duplex (it opens the input too):
+# with a Bluetooth default input, record_audio() and the VAD loop capture via
+# sd.Stream (F1), so leaving it out let tests record from the live mic.
+BLOCKED_AUDIO_CAPTURE = ("InputStream", "rec", "Stream")
+
+# The real sounddevice module, captured while conftest loads -- before test
+# modules are collected. Some test modules replace sys.modules["sounddevice"]
+# with a MagicMock at import time (e.g. test_min_duration_integration.py), so
+# a later `import sounddevice` inside the fixture returns that mock while
+# voice_mode.tools.converse still holds the real module. Guarding only the mock
+# left the real device open to every test in a full run.
+try:
+    import sounddevice as _REAL_SOUNDDEVICE
+except Exception:
+    _REAL_SOUNDDEVICE = None
 
 
 def _safe_subprocess_run(original_run):
@@ -129,9 +142,8 @@ def block_real_microphone(monkeypatch, request):
         yield
         return
 
-    try:
-        import sounddevice as sd
-    except Exception:
+    targets = [m for m in (_REAL_SOUNDDEVICE, sys.modules.get("sounddevice")) if m is not None]
+    if not targets:
         # No audio backend available -- nothing to guard.
         yield
         return
@@ -145,10 +157,11 @@ def block_real_microphone(monkeypatch, request):
             "it truly needs a device. See tests/conftest.py:block_real_microphone."
         )
 
-    for name in BLOCKED_AUDIO_CAPTURE:
-        if hasattr(sd, name):
-            monkeypatch.setattr(sd, name, _refuse)
-            request.node.mic_guard_armed = True
+    for sd in {id(m): m for m in targets}.values():
+        for name in BLOCKED_AUDIO_CAPTURE:
+            if hasattr(sd, name):
+                monkeypatch.setattr(sd, name, _refuse)
+                request.node.mic_guard_armed = True
 
     yield
 
