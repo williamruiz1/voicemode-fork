@@ -9,6 +9,26 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 
+# Point HOME at a throwaway directory for the whole session, BEFORE any
+# voice_mode module is imported. Many modules resolve ~/.voicemode paths at
+# import time (config.BASE_DIR/LOGS_DIR/AUDIO_DIR, conversation_logger,
+# audio_player.SPEAKING_FLAG_PATH, ...), so the per-test isolate_home_directory
+# patch below came too late for them: a full run appended to the real
+# exchange and barge-in logs, repointed the real audio/latest*.wav symlinks
+# and deleted the live speaking.flag. Child processes (multiprocessing
+# spawn) inherit it too. The per-test fixture still gives each test its own home.
+_REAL_HOME = os.environ.get("HOME")
+_SESSION_HOME = tempfile.mkdtemp(prefix="voicemode-test-home-")
+os.environ["HOME"] = _SESSION_HOME
+
+
+def pytest_sessionfinish(session, exitstatus):
+    import shutil
+    shutil.rmtree(_SESSION_HOME, ignore_errors=True)
+    if _REAL_HOME is not None:
+        os.environ["HOME"] = _REAL_HOME
+
+
 # Add voice_mode to path for testing
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
