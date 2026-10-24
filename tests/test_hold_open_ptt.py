@@ -348,7 +348,7 @@ class TestHeldWithoutVad:
         audio, speech = record_audio_with_silence_detection(
             max_duration=2.0, disable_silence_detection=True)
 
-        fixed.assert_called_once_with(2.0)
+        fixed.assert_called_once_with(2.0, honor_send=True)
         assert speech is True
 
     def test_held_no_vad_ceiling(self, sim, monkeypatch):
@@ -523,8 +523,7 @@ class TestEndReason:
     def test_device_error(self, sim, monkeypatch):
         class _BrokenStream(_FakeInputStream):
             def __init__(self, **kw):
-                # Not one of the "recoverable" strings: those retry the open
-                # recursively (0.5s each) with no attempt cap.
+                # Not one of the "recoverable" strings, so no reopen attempts.
                 raise RuntimeError("stream open failed")
         C.sd.InputStream = _BrokenStream
         monkeypatch.setattr(C, "record_audio", MagicMock(return_value=np.zeros(10, dtype=np.int16)))
