@@ -276,6 +276,9 @@ class NonBlockingAudioPlayer:
         self.stream: Optional[sd.OutputStream] = None
         self.playback_complete = threading.Event()
         self.playback_error: Optional[Exception] = None
+        # Latched by the callback when a convomode pause cut this playback, so a
+        # fast Proceed (flag gone before wait() returns) can't hide the cut.
+        self.paused_cut = False
 
     def _audio_callback(self, outdata, frames, time_info, status):
         """Callback function called by sounddevice for each audio buffer.
@@ -295,6 +298,8 @@ class NonBlockingAudioPlayer:
         # see trigger_barge_in() above — via a separate event (a barge-in
         # implies a new turn is starting; a manual pause does not).
         if _pause_event.is_set() or _barge_in_event.is_set():
+            if _pause_event.is_set():
+                self.paused_cut = True
             outdata[:] = 0
             self.playback_complete.set()
             raise sd.CallbackStop()
@@ -362,6 +367,7 @@ class NonBlockingAudioPlayer:
         # Reset state
         self.playback_complete.clear()
         self.playback_error = None
+        self.paused_cut = False
 
         # Ensure samples are float32
         if samples.dtype != np.float32:

@@ -108,7 +108,7 @@ from voice_mode.core import (
 )
 from voice_mode.audio_player import NonBlockingAudioPlayer, SPEAKING_FLAG_PATH, convomode_paused, PAUSE_FLAG_PATH
 from voice_mode import audio_player
-from voice_mode.pause_resume import resume_after_pause
+from voice_mode.pause_resume import resume_after_pause, pause_max_seconds, we_hold_floor
 from voice_mode import barge_in
 from voice_mode.statistics_tracking import track_voice_interaction
 from voice_mode.utils import (
@@ -2640,6 +2640,7 @@ consult the MCP resources listed above.
             async with audio_operation_lock:
                 # Speak the message
                 tts_start = time.perf_counter()
+                _held_floor_at_start = we_hold_floor() is True
                 barge_in_result = None  # set below only when natural mode actually armed a listener
                 # Clear any barge-in flag left set by a prior turn before we
                 # speak, so a stale trigger (e.g. from a previous natural-mode
@@ -2704,7 +2705,17 @@ consult the MCP resources listed above.
                     pause_outcome = await resume_after_pause(
                         message, tts_metrics, _replay_remainder,
                         turn_end_signal_path=_turn_end_signal_path(),
+                        held_floor_at_start=_held_floor_at_start,
+                        # The host's idle timer started with this call: spend only
+                        # what's left of the budget after the TTS already played.
+                        max_seconds=max(0.0, pause_max_seconds() - (time.perf_counter() - tts_start)),
                     )
+                    if pause_outcome and pause_outcome.handed_off:
+                        return (
+                            f"[FLOOR HANDED OFF — not delivered: {pause_outcome.undelivered_text}] "
+                            f"The floor moved to another session mid-message; the rest was not "
+                            f"played and no listen was started."
+                        )
                     if pause_outcome and pause_outcome.timed_out:
                         return (
                             f"[PAUSED — timed out after {pause_outcome.paused_for_seconds:.0f}s "

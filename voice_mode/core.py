@@ -471,7 +471,7 @@ async def text_to_speech(
                         player.wait()
                         # Pause cuts the callback; the cut point isn't tracked on
                         # this path, so converse replays the whole message.
-                        if audio_player_mod.convomode_paused():
+                        if player.paused_cut or audio_player_mod.convomode_paused():
                             metrics['paused'] = True
 
                         playback_end = time.perf_counter()

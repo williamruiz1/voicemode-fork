@@ -179,3 +179,126 @@ class TestResumeAfterPause:
     async def test_not_paused_is_noop(self):
         assert await pause_resume.resume_after_pause(TEXT, {"truncated": True}, None) is None
         assert await pause_resume.resume_after_pause(TEXT, None, None) is None
+
+
+# --- pause cap on wall clock + default under host idle timeout; latch on fast Proceed ---
+
+def test_default_pause_cap_under_host_idle_timeout(monkeypatch):
+    monkeypatch.delenv("VOICEMODE_PAUSE_MAX_SECONDS", raising=False)
+    assert pause_resume.pause_max_seconds() == 1500.0
+    assert pause_resume.pause_max_seconds() < 1800.0
+
+
+@pytest.mark.asyncio
+async def test_wait_for_resume_uses_wall_clock(monkeypatch):
+    """Slow sleeps (loop lag) must not stretch the cap: it's wall time, not 0.1s ticks."""
+    _PAUSED["on"] = True
+    real_sleep = pause_resume.asyncio.sleep
+
+    async def slow_sleep(d):
+        await real_sleep(0.05)
+        # pretend each "0.1s" sleep really took 0.2s of wall time
+        _clock["t"] += 0.2
+
+    _clock = {"t": 1000.0}
+    import types
+    # stub module only inside pause_resume (patching global time.monotonic would freeze the event loop)
+    monkeypatch.setattr(pause_resume, "time", types.SimpleNamespace(monotonic=lambda: _clock["t"]))
+    # 1.0s budget at 0.2s/iteration -> ~5 iterations; tick-counting would take 10.
+    iterations = {"n": 0}
+    orig = slow_sleep
+
+    async def counting(d):
+        iterations["n"] += 1
+        await orig(d)
+
+    monkeypatch.setattr(pause_resume.asyncio, "sleep", counting)
+    assert await pause_resume.wait_for_resume(1.0) is False
+    assert iterations["n"] <= 6
+
+
+def test_player_latches_pause_cut_even_if_flag_cleared(monkeypatch):
+    """Callback sees pause -> paused_cut stays True after a fast Proceed."""
+    ap._pause_event.clear()
+    player = ap.NonBlockingAudioPlayer()
+    player.audio_queue = __import__("queue").Queue()
+    out = np.ones((16, 1), dtype=np.float32)
+    ap._pause_event.set()
+    try:
+        with pytest.raises(ap.sd.CallbackStop):
+            player._audio_callback(out, 16, None, None)
+    finally:
+        ap._pause_event.clear()  # Proceed before wait() returns
+    assert player.paused_cut is True
+    # a barge-in alone is not a pause
+    p2 = ap.NonBlockingAudioPlayer()
+    p2.audio_queue = __import__("queue").Queue()
+    ap._barge_in_event.set()
+    try:
+        with pytest.raises(ap.sd.CallbackStop):
+            p2._audio_callback(out, 16, None, None)
+    finally:
+        ap.reset_barge_in_event()
+    assert p2.paused_cut is False
+
+
+# --- floor handed off during the pause: no replay, no listen ---
+
+def _write_floor(tmp_path, monkeypatch, holder_pid):
+    import json
+    f = tmp_path / "floor-queue.json"
+    f.write_text(json.dumps({"floor_holder": None if holder_pid is None else
+                             {"agent": "x", "pid": holder_pid}, "queue": []}))
+    monkeypatch.setattr(pause_resume, "FLOOR_QUEUE_PATH", str(f))
+
+
+@pytest.mark.asyncio
+async def test_handed_off_floor_skips_replay(tmp_path, monkeypatch):
+    import os
+    _write_floor(tmp_path, monkeypatch, os.getpid() + 999999)  # someone else
+    replayed = []
+
+    async def replay(t):
+        replayed.append(t)
+        return {}
+
+    out = await pause_resume.resume_after_pause(
+        "a b c", {"paused": True, "undelivered_text": "b c"}, replay, held_floor_at_start=True)
+    assert out.handed_off and out.undelivered_text == "b c" and not out.replayed
+    assert replayed == []
+
+
+@pytest.mark.asyncio
+async def test_still_holding_floor_replays(tmp_path, monkeypatch):
+    import os
+    _write_floor(tmp_path, monkeypatch, os.getpid())  # we hold it
+    replayed = []
+
+    async def replay(t):
+        replayed.append(t)
+        return {"paused": False}
+
+    out = await pause_resume.resume_after_pause(
+        "a b c", {"paused": True, "undelivered_text": "b c"}, replay, held_floor_at_start=True)
+    assert not out.handed_off and replayed == ["b c"]
+
+
+@pytest.mark.asyncio
+async def test_never_held_floor_or_free_floor_replays(tmp_path, monkeypatch):
+    import os
+    async def replay(t):
+        return {"paused": False}
+    # not a floor-managed session: someone else holds, but we never did -> replay
+    _write_floor(tmp_path, monkeypatch, os.getpid() + 999999)
+    out = await pause_resume.resume_after_pause("m", {"paused": True, "undelivered_text": "m"}, replay, held_floor_at_start=False)
+    assert out.replayed and not out.handed_off
+    # floor free / unreadable -> fail open
+    _write_floor(tmp_path, monkeypatch, None)
+    out = await pause_resume.resume_after_pause("m", {"paused": True, "undelivered_text": "m"}, replay, held_floor_at_start=True)
+    assert out.replayed and not out.handed_off
+
+
+def test_ancestor_chain_includes_self_and_parent():
+    import os
+    chain = pause_resume._ancestor_pids()
+    assert os.getpid() in chain and os.getppid() in chain
