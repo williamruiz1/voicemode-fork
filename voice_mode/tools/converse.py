@@ -5,6 +5,7 @@ import functools
 import json
 import logging
 import os
+import threading
 import time
 import traceback
 from typing import Callable, Optional, Literal, Tuple, Dict, Union
@@ -13,6 +14,7 @@ from datetime import datetime
 
 import numpy as np
 import sounddevice as sd
+from scipy import signal  # module level: a cold import inside the listen loop stalled Send >1s
 from scipy.io.wavfile import write
 from pydub import AudioSegment
 from openai import AsyncOpenAI
@@ -907,11 +909,12 @@ def _duplex_device_pair():
     return (in_dev, None)
 
 
-def _record_audio_duplex(samples_to_record: int) -> np.ndarray:
+def _record_audio_duplex(samples_to_record: int, honor_send: bool = False) -> np.ndarray:
     """Fixed-length capture over a full-duplex stream whose output is silence.
 
     Used instead of sd.rec() when the input is a Bluetooth headset — see
     _bluetooth_input_active. Returns an (n, 1) int16 array like sd.rec would.
+    honor_send: stop early (keeping what was captured) on turn-end.signal.
     """
     import time as _time
     captured = []
@@ -931,6 +934,10 @@ def _record_audio_duplex(samples_to_record: int) -> np.ndarray:
     with sd.Stream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
                    device=device, callback=_callback):
         while remaining[0] > 0 and _time.monotonic() < deadline:
+            if honor_send and _send_pending():
+                logger.info("✓ Manual turn-end signal received — stopping fixed-length recording")
+                _consume_send()
+                break
             sd.sleep(50)
     if not captured:
         return np.zeros((0, 1), dtype=np.int16)
@@ -938,8 +945,13 @@ def _record_audio_duplex(samples_to_record: int) -> np.ndarray:
     return data[:samples_to_record].reshape(-1, 1)
 
 
-def record_audio(duration: float) -> np.ndarray:
-    """Record audio from microphone"""
+def record_audio(duration: float, honor_send: bool = False, _attempt: int = 0) -> np.ndarray:
+    """Record audio from microphone.
+
+    honor_send: end early on turn-end.signal, returning what was captured --
+    set by every listen path that falls back here, so Send still ends the
+    listen. Device-error retries are capped at DEVICE_RECOVERY_MAX_ATTEMPTS.
+    """
     logger.info(f"🎤 Recording audio for {duration}s...")
     if DEBUG:
         try:
@@ -963,7 +975,7 @@ def record_audio(duration: float) -> np.ndarray:
         if _bluetooth_input_active():
             # F1 (founder-os#13215): BT headsets need a full-duplex open to
             # hold HFP for the listen window; input-only reads dead silence.
-            recording = _record_audio_duplex(samples_to_record)
+            recording = _record_audio_duplex(samples_to_record, honor_send=honor_send)
         else:
             recording = sd.rec(
                 samples_to_record,
@@ -971,7 +983,23 @@ def record_audio(duration: float) -> np.ndarray:
                 channels=CHANNELS,
                 dtype=np.int16
             )
-            sd.wait()
+            if honor_send:
+                # Poll instead of sd.wait(), which blocks until the full
+                # duration has been captured and never sees Send.
+                started = time.monotonic()
+                while True:
+                    elapsed = time.monotonic() - started
+                    if _send_pending():
+                        logger.info("✓ Manual turn-end signal received — stopping fixed-length recording")
+                        _consume_send()
+                        recording = recording[:min(samples_to_record, int(elapsed * SAMPLE_RATE))]
+                        break
+                    if elapsed >= duration + 0.25:
+                        break
+                    time.sleep(SEND_POLL_SECONDS)
+                sd.stop()
+            else:
+                sd.wait()
         
         flattened = recording.flatten()
         logger.info(f"✓ Recorded {len(flattened)} samples")
@@ -990,9 +1018,12 @@ def record_audio(duration: float) -> np.ndarray:
         
         # Check if this is a device error that might be recoverable
         error_str = str(e).lower()
-        if any(err in error_str for err in ['device unavailable', 'device disconnected', 
-                                             'invalid device', 'unanticipated host error',
-                                             'portaudio error']):
+        recoverable = any(err in error_str for err in ['device unavailable', 'device disconnected',
+                                                        'invalid device', 'unanticipated host error',
+                                                        'portaudio error'])
+        if recoverable and _attempt + 1 >= DEVICE_RECOVERY_MAX_ATTEMPTS:
+            logger.error(f"Audio device still failing after {DEVICE_RECOVERY_MAX_ATTEMPTS} attempts - giving up")
+        elif recoverable:
             logger.info("Audio device error detected - attempting to reinitialize audio system")
             
             # Try to reinitialize sounddevice
@@ -1015,13 +1046,17 @@ def record_audio(duration: float) -> np.ndarray:
                 except:
                     logger.info("Audio system reinitialized - retrying with new default device")
                 
-                # Wait a moment for the system to stabilize
-                import time as time_module
-                time_module.sleep(0.5)
-                
+                # Wait a moment for the system to stabilize (Send ends it)
+                if honor_send and _sleep_unless_send(DEVICE_RECOVERY_DELAY_SECONDS):
+                    logger.info("✓ Manual turn-end signal received during device recovery")
+                    _consume_send()
+                    return np.array([], dtype=np.int16)
+                if not honor_send:
+                    time.sleep(DEVICE_RECOVERY_DELAY_SECONDS)
+
                 # Try recording again with the new device (recursive call)
                 logger.info("Retrying recording with new audio device...")
-                return record_audio(duration)
+                return record_audio(duration, honor_send=honor_send, _attempt=_attempt + 1)
                 
             except Exception as reinit_error:
                 logger.error(f"Failed to reinitialize audio: {reinit_error}")
@@ -1120,9 +1155,73 @@ def append_window_ms() -> int:
 HOLD_OPEN_STALE_SECONDS = 15 * 60
 DEFAULT_HOLD_MAX_SECONDS = 600.0
 
+# Send must end a listen within ~0.5s in every recorder state (B17). A stream
+# that stops delivering callbacks never advances the audio clock, so Send's
+# floor and the stall watchdog are measured on the wall clock; device-error
+# recovery is capped and its waits poll Send.
+DEVICE_RECOVERY_MAX_ATTEMPTS = 3      # stream opens per listen before giving up
+DEVICE_RECOVERY_DELAY_SECONDS = 0.5   # settle time after reinitializing PortAudio
+DEFAULT_STREAM_STALL_SECONDS = 5.0
+SEND_POLL_SECONDS = 0.05
+
 
 def _turn_end_signal_path() -> str:
     return os.path.expanduser("~/.voicemode/turn-end.signal")
+
+
+def _send_pending() -> bool:
+    try:
+        return os.path.exists(_turn_end_signal_path())
+    except Exception:
+        return False
+
+
+def _consume_send() -> None:
+    try:
+        os.remove(_turn_end_signal_path())
+    except Exception:
+        pass
+
+
+def _clear_stale_send() -> None:
+    """Listen entry: a Send left from an earlier turn must not pre-end this one."""
+    if _send_pending():
+        _consume_send()
+
+
+def _run_checkin(callback: Callable[[], None]) -> None:
+    try:
+        callback()
+    except Exception:
+        pass
+
+
+def _sleep_unless_send(seconds: float) -> bool:
+    """Sleep up to `seconds`, polling Send. True = Send arrived (not consumed)."""
+    deadline = time.monotonic() + seconds
+    while True:
+        if _send_pending():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(SEND_POLL_SECONDS, remaining))
+
+
+class _StreamStalled(Exception):
+    """A held listen's input stream went quiet. Raised inside the listen loop so
+    the device-recovery path reopens the stream (audio kept, Send preserved)."""
+
+
+def stream_stall_seconds() -> float:
+    """How long a listen tolerates an input stream that delivers nothing before
+    ending with end_reason=stream_stalled. VOICEMODE_STREAM_STALL_SECONDS;
+    missing, unparseable, or non-positive -> DEFAULT_STREAM_STALL_SECONDS."""
+    try:
+        value = float(os.getenv("VOICEMODE_STREAM_STALL_SECONDS", str(DEFAULT_STREAM_STALL_SECONDS)))
+    except (TypeError, ValueError):
+        return DEFAULT_STREAM_STALL_SECONDS
+    return value if value > 0 else DEFAULT_STREAM_STALL_SECONDS
 
 
 def _hold_open_signal_path() -> str:
@@ -1278,43 +1377,72 @@ def _record_held_until_send(fallback_max_duration: float, listen_stats: Optional
 
     chunks = []
     recorded = 0.0
+    loop_done = False
+    started = time.monotonic()
+    stall_s = stream_stall_seconds()
+    attempt = 0
     try:
-        if _bluetooth_input_active():
-            stream_ctx = sd.Stream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
-                                   device=_duplex_device_pair(), callback=_duplex_callback,
-                                   blocksize=chunk_samples)
-        else:
-            stream_ctx = sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
-                                        callback=_callback, blocksize=chunk_samples)
-        started = time.monotonic()
-        with stream_ctx:
-            # Wall-clock backstop: a stream that stops delivering never
-            # advances `recorded`, and a held listen must still end.
-            while recorded < ceiling and time.monotonic() - started < ceiling + 1.0:
-                try:
-                    if os.path.exists(turn_end) and recorded >= MIN_RECORDING_DURATION:
+        while True:
+            if _bluetooth_input_active():
+                stream_ctx = sd.Stream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
+                                       device=_duplex_device_pair(), callback=_duplex_callback,
+                                       blocksize=chunk_samples)
+            else:
+                stream_ctx = sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
+                                            callback=_callback, blocksize=chunk_samples)
+            stalled = False
+            with stream_ctx:
+                last_audio_at = time.monotonic()
+                # Wall-clock backstop: a stream that stops delivering never
+                # advances `recorded`, and a held listen must still end.
+                while recorded < ceiling and time.monotonic() - started < ceiling + 1.0:
+                    now = time.monotonic()
+                    # Send's floor is wall time: a stalled stream never advances
+                    # `recorded`, which deferred Send forever (B17).
+                    if os.path.exists(turn_end) and max(recorded, now - started) >= MIN_RECORDING_DURATION:
                         logger.info("✓ Manual turn-end signal received — stopping held recording")
-                        try:
-                            os.remove(turn_end)
-                        except Exception:
-                            pass
+                        _consume_send()
                         stats["end_reason"] = "send"
                         stats["chunks_drained"] = _drain_delivered_audio(audio_queue, chunks)
                         break
-                except Exception:
-                    pass
-                try:
-                    chunk = audio_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                flat = chunk.flatten()
-                chunks.append(flat)
-                stats["chunks_processed"] += 1
-                recorded += len(flat) / SAMPLE_RATE
+                    if now - last_audio_at >= stall_s:
+                        stalled = True
+                        break
+                    try:
+                        chunk = audio_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    last_audio_at = time.monotonic()
+                    flat = chunk.flatten()
+                    chunks.append(flat)
+                    stats["chunks_processed"] += 1
+                    recorded += len(flat) / SAMPLE_RATE
+            if stalled and attempt + 1 < DEVICE_RECOVERY_MAX_ATTEMPTS:
+                # A stall on a held turn is a recoverable device error (AirPods
+                # can deliver audio intermittently): reopen with the captured
+                # audio and Send state intact; end only once the cap is hit.
+                attempt += 1
+                logger.warning(f"Input stream delivered nothing for {stall_s:.1f}s - reopening held listen "
+                               f"(attempt {attempt + 1}/{DEVICE_RECOVERY_MAX_ATTEMPTS})")
+                if _sleep_unless_send(DEVICE_RECOVERY_DELAY_SECONDS):
+                    logger.info("✓ Manual turn-end signal received during stream reopen — stopping held recording")
+                    _consume_send()
+                    stats["end_reason"] = "send"
+                    break
+                continue
+            if stalled:
+                logger.warning(f"Input stream delivered nothing for {stall_s:.1f}s - ending held listen")
+                stats["end_reason"] = "stream_stalled"
+            break
+        loop_done = True
     except Exception as e:
+        if not loop_done:  # a close failure after the loop keeps its end_reason
+            stats["end_reason"] = "device_error"
+        if chunks:
+            logger.error(f"Held recording failed: {e} - returning the {recorded:.1f}s captured")
+            return (np.concatenate(chunks), True)
         logger.error(f"Held recording failed: {e} - falling back to fixed duration recording")
-        stats["end_reason"] = "device_error"
-        return (record_audio(fallback_max_duration), True)
+        return (record_audio(fallback_max_duration, honor_send=True), True)
 
     if not chunks:
         return (np.array([], dtype=np.int16), False)
@@ -1466,7 +1594,7 @@ def record_audio_with_silence_detection(*args, listen_stats: Optional[dict] = No
         _clear_listening_state()
 
 
-def _record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, yield_check: Optional[Callable[[], bool]] = None, yield_state: Optional[dict] = None, pre_roll: Optional[np.ndarray] = None, pause_check: Optional[Callable[[], bool]] = None, step_away_state: Optional[dict] = None, checkin_callback: Optional[Callable[[], None]] = None, append_window_override_ms: Optional[int] = None, step_away_enabled_override: Optional[bool] = None, supersede_check: Optional[Callable[[], bool]] = None, listen_stats: Optional[dict] = None) -> Tuple[np.ndarray, bool]:
+def _record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, yield_check: Optional[Callable[[], bool]] = None, yield_state: Optional[dict] = None, pre_roll: Optional[np.ndarray] = None, pause_check: Optional[Callable[[], bool]] = None, step_away_state: Optional[dict] = None, checkin_callback: Optional[Callable[[], None]] = None, append_window_override_ms: Optional[int] = None, step_away_enabled_override: Optional[bool] = None, supersede_check: Optional[Callable[[], bool]] = None, listen_stats: Optional[dict] = None, _device_attempt: int = 0, _listen_t0: Optional[float] = None) -> Tuple[np.ndarray, bool]:
     """Record audio from microphone with automatic silence detection.
 
     Uses WebRTC VAD to detect when the user stops speaking and automatically
@@ -1526,6 +1654,10 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
             None → resolved from env flag / flag file. Default resolves to OFF.
         listen_stats: Optional dict filled out-of-band with ``end_reason``,
             ``held`` and chunk counters (see record_audio_with_silence_detection).
+        _device_attempt, _listen_t0: internal -- device-error recovery reopens
+            the stream by recursing with the attempt number and the original
+            listen start, so the attempt cap, the hold ceiling and Send's
+            wall-clock floor span the whole listen, not one stream.
 
     Returns:
         Tuple of (audio_data, speech_detected):
@@ -1535,6 +1667,7 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
 
     logger.info(f"record_audio_with_silence_detection called - VAD_AVAILABLE={VAD_AVAILABLE}, DISABLE_SILENCE_DETECTION={DISABLE_SILENCE_DETECTION}, min_duration={min_duration}")
     stats = listen_stats if listen_stats is not None else {}
+    _t0 = _listen_t0 if _listen_t0 is not None else time.monotonic()
 
     # --- founder-os#11655: resolve pause/step-away/append config (all inert by default) ---
     _append_ms = append_window_override_ms if append_window_override_ms is not None else append_window_ms()
@@ -1553,7 +1686,8 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
             return _record_held_until_send(max_duration, stats)
         # For fallback, assume speech is present since we can't detect
         stats["end_reason"] = "max_duration"
-        return (record_audio(max_duration), True)
+        _clear_stale_send()
+        return (record_audio(max_duration, honor_send=True), True)
 
     if DISABLE_SILENCE_DETECTION or disable_silence_detection:
         if disable_silence_detection:
@@ -1566,7 +1700,8 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
             return _record_held_until_send(max_duration, stats)
         # For fallback, assume speech is present since we can't detect
         stats["end_reason"] = "max_duration"
-        return (record_audio(max_duration), True)
+        _clear_stale_send()
+        return (record_audio(max_duration, honor_send=True), True)
     
     logger.info(f"🎤 Recording with silence detection (max {max_duration}s)...")
     
@@ -1687,6 +1822,7 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
             outdata.fill(0)
             audio_callback(indata, frames, time, status)
 
+        _loop_end_reason = None  # set once the listen loop has ended
         try:
             # Create continuous stream (full-duplex on BT input, input-only
             # otherwise). Construction opens the PortAudio stream, so it stays
@@ -1712,20 +1848,20 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                 # Manual turn-end signal (push-to-talk "I'm done"). A reachable-while-
                 # driving surface (Apple Shortcut → SSH → `touch`) drops this file to end
                 # the listen window IMMEDIATELY, no VAD needed. Cleaned up on each entry so
-                # a stale signal can't pre-end the next turn.
+                # a stale signal can't pre-end the next turn -- but not when reopening
+                # after a device error: a Send pressed then belongs to THIS listen.
                 _turn_end_signal = _turn_end_signal_path()
-                try:
-                    if os.path.exists(_turn_end_signal):
-                        os.remove(_turn_end_signal)
-                except Exception:
-                    pass
+                if _device_attempt == 0:
+                    _clear_stale_send()
 
                 # Hold-open push-to-talk: latched -- once hold-mode or
                 # hold-open.signal is seen, silence can no longer end this
                 # listen; only Send (turn-end.signal) or the hold ceiling can.
                 _held = hold_active()
                 _hold_max = hold_max_seconds()
-                _listen_started = time.monotonic()
+                _listen_started = _t0
+                _stall_s = stream_stall_seconds()
+                _last_audio_at = time.monotonic()
                 _end_reason = None  # RECORDING_END diagnostics; see listen_stats
                 stats["chunks_processed"] = 0
                 if _held:
@@ -1754,10 +1890,11 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                             _paused_now = False
                         if _step_away.observe(_paused_now, recording_duration, speech_detected) and checkin_callback is not None:
                             logger.info("⏸️ step-away: speaking one 'still there?' check-in")
-                            try:
-                                checkin_callback()
-                            except Exception:
-                                pass
+                            # Off the loop thread: the check-in speaks TTS and
+                            # waits on it (up to 20s), and the loop must keep
+                            # polling Send meanwhile (B17).
+                            threading.Thread(target=_run_checkin, args=(checkin_callback,),
+                                             daemon=True, name="step-away-checkin").start()
 
                     # Honor a manual turn-end signal first (push-to-talk). If William
                     # tapped his "done" Shortcut, end the recording now (only after the
@@ -1765,9 +1902,13 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                     # signal stays on disk until the floor is reached, so an early
                     # press is deferred, never dropped. Held turns use only the tiny
                     # global floor: listen_duration_min must not delay a Send.
+                    # The floor is measured on the wall clock as well as the audio
+                    # clock: a stream that stops delivering never advances
+                    # recording_duration, which deferred Send forever (B17).
                     _turn_end_floor = MIN_RECORDING_DURATION if _held else max(MIN_RECORDING_DURATION, min_duration)
+                    _now = time.monotonic()
                     try:
-                        if os.path.exists(_turn_end_signal) and recording_duration >= _turn_end_floor:
+                        if os.path.exists(_turn_end_signal) and max(recording_duration, _now - _listen_started) >= _turn_end_floor:
                             logger.info("✓ Manual turn-end signal received — stopping recording")
                             try:
                                 os.remove(_turn_end_signal)
@@ -1780,6 +1921,21 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                             break
                     except Exception:
                         pass
+
+                    # Stall watchdog: an input stream that delivers nothing (e.g.
+                    # CoreAudio dropped the IOProc on an AirPods route change)
+                    # must not hold the mic -- and the floor -- until the ceiling.
+                    if _now - _last_audio_at >= _stall_s:
+                        if _held and _device_attempt + 1 < DEVICE_RECOVERY_MAX_ATTEMPTS:
+                            # AirPods can deliver audio intermittently: a held turn
+                            # must not end mid-sentence on a stall. Reopen the stream
+                            # via device recovery (captured audio carries as pre-roll,
+                            # Send/hold state preserved); end only once the cap is hit.
+                            logger.warning(f"Input stream delivered nothing for {_stall_s:.1f}s - reopening held listen")
+                            raise _StreamStalled(f"input stream stalled for {_stall_s:.1f}s")
+                        logger.warning(f"Input stream delivered nothing for {_stall_s:.1f}s - ending listen")
+                        _end_reason = "stream_stalled"
+                        break
 
                     # In-place supersession (conch fail-closed, PR #12): checked
                     # FIRST and UNCONDITIONALLY (no grace floor, no config gate).
@@ -1857,6 +2013,7 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                     try:
                         # Get audio chunk from queue with timeout
                         chunk = audio_queue.get(timeout=0.1)
+                        _last_audio_at = time.monotonic()
                         
                         # Check for error sentinel
                         if chunk is None:
@@ -1871,7 +2028,6 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                         
                         # For VAD, we need to downsample from 24kHz to 16kHz
                         # Use scipy's resample for proper downsampling
-                        from scipy import signal
                         # Calculate the number of samples we need after resampling
                         resampled_length = int(len(chunk_flat) * vad_sample_rate / SAMPLE_RATE)
                         vad_chunk = signal.resample(chunk_flat, resampled_length)
@@ -2003,6 +2159,7 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                         _end_reason = "max_duration" if speech_detected else "no_speech"
                 stats["end_reason"] = _end_reason
                 stats["held"] = _held
+                _loop_end_reason = _end_reason
 
             # Publish step-away signals out-of-band (founder-os#11655) so the
             # async caller can speak a graceful ending / prepend a resume recap.
@@ -2036,17 +2193,43 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                 return (np.array([]), False)
                 
         except Exception as e:
+            if _loop_end_reason is not None:
+                # The listen already ended (Send, silence, ...) and only closing
+                # the stream failed: deliver it. Retrying would reopen the mic
+                # after a consumed Send.
+                logger.warning(f"Audio stream close failed after the listen ended ({_loop_end_reason}): {e}")
+                if chunks:
+                    return (np.concatenate(chunks), speech_detected)
+                return (np.array([]), False)
             logger.error(f"Recording with VAD failed: {e}")
-            stats["end_reason"] = "device_error"
+            _stalled = isinstance(e, _StreamStalled)
+            stats["end_reason"] = "stream_stalled" if _stalled else "device_error"
             
             # Import here to avoid circular imports
             from voice_mode.utils.audio_diagnostics import get_audio_error_help
             
             # Check if this is a device error that might be recoverable
             error_str = str(e).lower()
-            if any(err in error_str for err in ['device unavailable', 'device disconnected', 
+            if _stalled or any(err in error_str for err in ['device unavailable', 'device disconnected', 
                                                  'invalid device', 'unanticipated host error',
                                                  'portaudio error']):
+                # Audio captured before the failure survives the reopen (as
+                # pre-roll) or the give-up. Idle silence on a non-held listen
+                # is dropped: as pre-roll it would read as speech already begun.
+                _keep_audio = bool(chunks) and (speech_detected or bool(stats.get("held")))
+                _captured = np.concatenate(chunks) if _keep_audio else None
+
+                def _captured_result():
+                    if _captured is not None and len(_captured) > 0:
+                        return (_captured, True)
+                    return (np.array([], dtype=np.int16), False)
+
+                if _device_attempt + 1 >= DEVICE_RECOVERY_MAX_ATTEMPTS:
+                    # The device is gone: end the listen with what we have
+                    # instead of retrying forever (B17).
+                    logger.error(f"Audio device still failing after {DEVICE_RECOVERY_MAX_ATTEMPTS} attempts - ending listen")
+                    return _captured_result()
+
                 logger.info("Audio device error detected - attempting to reinitialize audio system")
                 
                 # Try to reinitialize sounddevice
@@ -2069,21 +2252,29 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                     except:
                         logger.info("Audio system reinitialized - retrying with new default device")
                     
-                    # Wait a moment for the system to stabilize
-                    import time as time_module
-                    time_module.sleep(0.5)
+                    # Wait a moment for the system to stabilize -- Send ends it
+                    if _sleep_unless_send(DEVICE_RECOVERY_DELAY_SECONDS):
+                        logger.info("✓ Manual turn-end signal received during device recovery — stopping recording")
+                        _consume_send()
+                        stats["end_reason"] = "send"
+                        return _captured_result()
                     
-                    # Try recording again with the new device (recursive call in sync context)
-                    logger.info("Retrying recording with new audio device...")
-                    return record_audio_with_silence_detection(
+                    # Retry with the new device. Recurse into the inner function
+                    # (not the public wrapper, which would reset the listen's
+                    # bookkeeping and clear a per-turn hold mid-listen).
+                    logger.info(f"Retrying recording with new audio device (attempt {_device_attempt + 2}/{DEVICE_RECOVERY_MAX_ATTEMPTS})...")
+                    return _record_audio_with_silence_detection(
                         max_duration, disable_silence_detection, min_duration, vad_aggressiveness,
-                        yield_check=yield_check, yield_state=yield_state, pre_roll=pre_roll,
+                        yield_check=yield_check, yield_state=yield_state,
+                        pre_roll=_captured if _captured is not None else pre_roll,
                         pause_check=pause_check, step_away_state=step_away_state,
                         checkin_callback=checkin_callback,
                         append_window_override_ms=append_window_override_ms,
                         step_away_enabled_override=step_away_enabled_override,
                         supersede_check=supersede_check,
                         listen_stats=stats,
+                        _device_attempt=_device_attempt + 1,
+                        _listen_t0=_t0,
                     )
                     
                 except Exception as reinit_error:
@@ -2096,7 +2287,7 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
             
             logger.info("Falling back to fixed duration recording")
             # For fallback, assume speech is present since we can't detect
-            return (record_audio(max_duration), True)
+            return (record_audio(max_duration, honor_send=True), True)
             
         finally:
             # Restore stdio
@@ -2111,7 +2302,7 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
         logger.error(f"VAD initialization failed: {e}")
         logger.info("Falling back to fixed duration recording")
         # For fallback, assume speech is present since we can't detect
-        return (record_audio(max_duration), True)
+        return (record_audio(max_duration, honor_send=True), True)
 
 @mcp.tool()
 async def converse(
@@ -2738,6 +2929,7 @@ consult the MCP resources listed above.
                 step_away_state = {}
                 _sa_on = step_away_enabled()
                 _sa_loop = asyncio.get_event_loop()
+                _sa_futs = []
 
                 def _stepaway_checkin():
                     try:
@@ -2745,6 +2937,7 @@ consult the MCP resources listed above.
                             play_system_audio("still-there", fallback_text="Still there?"),
                             _sa_loop,
                         )
+                        _sa_futs.append(fut)
                         fut.result(timeout=20)
                     except Exception as _e:
                         logger.debug(f"step-away check-in failed (ignored): {_e}")
@@ -2759,9 +2952,15 @@ consult the MCP resources listed above.
 
                 record_start = time.perf_counter()
                 logger.debug(f"About to call record_audio_with_silence_detection with duration={listen_duration_max}, disable_silence_detection={disable_silence_detection}, min_duration={listen_duration_min}, vad_aggressiveness={vad_aggressiveness}, natural_mode_barge_in={natural_mode_barge_in}")
-                audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                    None, _record_call
-                )
+                try:
+                    audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
+                        None, _record_call
+                    )
+                finally:
+                    # Send/silence ended the listen: a still-playing "Still there?"
+                    # check-in must not talk over the next turn.
+                    for _f in _sa_futs:
+                        _f.cancel()
                 timings['record'] = time.perf_counter() - record_start
 
                 # Log recording end (with end_reason / hold / starvation diagnostics)
