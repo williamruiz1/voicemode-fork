@@ -215,6 +215,11 @@ def sim_env(monkeypatch):
     monkeypatch.setattr(C, "sd", fake_sd)
     monkeypatch.setattr(C, "VAD_AVAILABLE", True)
     monkeypatch.setattr(C, "DISABLE_SILENCE_DETECTION", False)
+    # These tests drive the webrtcvad path with a fake VAD: a real
+    # VOICEMODE_ENDPOINTING in the environment switched them to Silero, which
+    # never hears speech in random noise.
+    monkeypatch.setattr(C, "ENDPOINTING_ENABLED", False)
+    monkeypatch.setattr(C, "_bluetooth_input_active", lambda: False)
     fake_webrtc = MagicMock()
     fake_webrtc.Vad = _FakeVad
     monkeypatch.setattr(C, "webrtcvad", fake_webrtc)

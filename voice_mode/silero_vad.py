@@ -287,6 +287,12 @@ class Endpointer:
         self._above_ms = 0.0
         self._below_ms = 0.0
 
+    def restart_silence_clock(self) -> None:
+        """Forget trailing silence but keep speech_started: a paused listen
+        (B43) resumes the same turn with a fresh endpoint timer."""
+        self._below_ms = 0.0
+        self._above_ms = 0.0
+
     def update(self, frame_int16_or_float: np.ndarray) -> EndpointState:
         frame_ms = _frame_duration_ms(frame_int16_or_float, self.sample_rate)
         prob = self._vad.prob(frame_int16_or_float)
