@@ -2413,16 +2413,23 @@ def serve(host: str, port: int, transport: str, log_level: str, allow_anthropic:
                     watcher.cancel()
 
         asyncio.run(_serve())
-        if idle and idle.is_idle():
+        if daemon_mode or (idle and idle.is_idle()):
             # Exit 0 so launchd treats it as a clean stop and waits for the
-            # next connection; skip interpreter teardown (audio/device threads).
+            # next connection; skip interpreter teardown (audio/device threads
+            # can hang it and launchd would see a stuck job).
             logging.shutdown()
             os._exit(0)
     except KeyboardInterrupt:
         click.echo("\nServer stopped")
+        if daemon_mode:
+            logging.shutdown()
+            os._exit(0)
     except Exception as e:
         logger.exception(f"Error starting server: {e}")
         click.echo(f"Error starting server: {e}", err=True)
+        if daemon_mode:
+            logging.shutdown()
+            os._exit(1)
         raise click.Abort()
 
 

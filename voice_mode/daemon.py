@@ -69,8 +69,40 @@ class IdleExit:
 class ClientIdentityMiddleware(Middleware):
     """Bind each tool call to its client session and record activity."""
 
-    def __init__(self, idle: Optional[IdleExit] = None):
+    def __init__(self, idle: Optional[IdleExit] = None, poll: float = 1.0):
         self.idle = idle
+        self.poll = poll
+
+    async def _run_until_client_gone(self, identity, call_next, context):
+        """Run the call, cancelling it if its client process dies mid-call.
+
+        A tab killed mid-converse would otherwise leave its call running in
+        this long-lived daemon, holding the conch for the whole listen. The
+        client's pid is watched (not the socket via request.is_disconnected(),
+        which would race the MCP transport's own receive loop). Clients whose
+        pid is unknown (anon identity) cannot be watched; the conch's
+        timestamp expiry is their backstop.
+        """
+        if identity is None or identity.pid is None:
+            return await call_next(context)
+        task = asyncio.ensure_future(call_next(context))
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=self.poll)
+                if done:
+                    return task.result()
+                if client_identity.owner_is_dead(identity.owner):
+                    logger.warning(f"Client {identity.owner} died mid-call; cancelling its tool call")
+                    task.cancel()
+                    try:
+                        await task
+                    except BaseException:
+                        pass
+                    raise asyncio.CancelledError()
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+            raise
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
         identity = None
@@ -81,11 +113,12 @@ class ClientIdentityMiddleware(Middleware):
         if identity is None:
             logger.warning("Tool call from an unidentified client; conch/floor "
                            "checks treat its identity as unknown")
+            identity = client_identity.anon_identity()
         token = client_identity.bind(identity)
         if self.idle:
             self.idle.begin()
         try:
-            return await call_next(context)
+            return await self._run_until_client_gone(identity, call_next, context)
         finally:
             if self.idle:
                 self.idle.end()

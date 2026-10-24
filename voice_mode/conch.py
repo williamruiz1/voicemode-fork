@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
-from voice_mode.client_identity import current_owner, record_owner
+from voice_mode.client_identity import current_owner, owner_is_dead, record_owner
 
 logger = logging.getLogger("voicemode.conch")
 
@@ -376,8 +376,22 @@ class Conch:
         except (json.JSONDecodeError, OSError):
             return
 
-        # Fast-fail on dead holder -- no need to wait for timestamp expiry.
+        # Shared daemon: the record pid is the live daemon, but the CLIENT that
+        # owns the call may be dead (tab killed mid-call). Treat that as a dead
+        # holder; the orphaned call is also cancelled by the daemon middleware.
         pid = data.get("pid")
+        if owner_is_dead(data.get("owner")):
+            try:
+                self.LOCK_FILE.unlink()
+            except OSError:
+                pass
+            _log_conch_event("CONCH_DEAD_OWNER_CLEARED", {
+                "stale_owner": data.get("owner"),
+                "stale_agent": data.get("agent", "unknown"),
+            })
+            return
+
+        # Fast-fail on dead holder -- no need to wait for timestamp expiry.
         if pid is not None:
             try:
                 os.kill(pid, 0)
@@ -564,6 +578,10 @@ class Conch:
             # os.kill would address a process group, not a process.)
             return cls.STATE_UNREADABLE, None
 
+        if owner_is_dead(data.get("owner")):
+            # Shared daemon: the owning client is gone (its call is orphaned).
+            return cls.STATE_FREE, data
+
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -674,6 +692,8 @@ class Conch:
 
             # Check if process is alive (signal 0 doesn't actually send a signal)
             os.kill(pid, 0)
+            if owner_is_dead(data.get("owner")):
+                return False
 
             # Check if lock is stale based on timestamp
             lock_expiry = _get_lock_expiry()

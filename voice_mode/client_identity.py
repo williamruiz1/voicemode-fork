@@ -27,6 +27,7 @@ import logging
 import os
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
@@ -53,6 +54,39 @@ SHARED_MODE = False
 
 def owner_for_pid(pid: int) -> str:
     return f"pid:{int(pid)}"
+
+
+def anon_identity() -> ClientIdentity:
+    """Per-request identity for a client whose pid could not be resolved.
+
+    Unique per request so a yield request from an unidentified client stays
+    visible to the holder (the daemon's own pid would equal the holder's
+    token and be ignored). pid is None, so the floor still answers unknown.
+    """
+    return ClientIdentity(f"anon:{uuid.uuid4().hex}", None)
+
+
+def owner_is_dead(owner: Optional[str]) -> bool:
+    """True when `owner` is a "pid:<N>" token whose process is gone.
+
+    Anything else (anon tokens, unparseable, alive, unsignalable) is not
+    provably dead, so False.
+    """
+    if not isinstance(owner, str) or not owner.startswith("pid:"):
+        return False
+    try:
+        pid = int(owner[4:])
+    except ValueError:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def bind(identity: Optional[ClientIdentity]) -> contextvars.Token:
@@ -91,8 +125,11 @@ def record_owner(data: dict) -> Optional[str]:
 
 # ---- Resolving the client behind a loopback TCP connection ----
 
-_PEER_CACHE_TTL = 30.0
-_peer_cache: dict[int, tuple[int, float]] = {}
+# Short: a client port can be reused by another process once the first
+# connection closes, so a long TTL could misattribute it. The cache also
+# re-checks that the cached pid is alive before trusting it.
+_PEER_CACHE_TTL = 2.0
+_peer_cache: dict[tuple[int, int], tuple[int, float]] = {}
 
 
 def _lsof_peer_pid(client_port: int, server_port: int) -> Optional[int]:
@@ -122,12 +159,14 @@ def _lsof_peer_pid(client_port: int, server_port: int) -> Optional[int]:
 
 def peer_pid(client_port: int, server_port: int) -> Optional[int]:
     now = time.monotonic()
-    hit = _peer_cache.get(client_port)
-    if hit and now - hit[1] < _PEER_CACHE_TTL:
+    key = (client_port, server_port)
+    hit = _peer_cache.get(key)
+    if hit and now - hit[1] < _PEER_CACHE_TTL and not owner_is_dead(owner_for_pid(hit[0])):
         return hit[0]
+    _peer_cache.pop(key, None)
     pid = _lsof_peer_pid(client_port, server_port)
     if pid:
-        _peer_cache[client_port] = (pid, now)
+        _peer_cache[key] = (pid, now)
     return pid
 
 

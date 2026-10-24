@@ -8,6 +8,7 @@ running.
 """
 
 import asyncio
+import atexit
 import json
 import os
 import subprocess
@@ -20,6 +21,12 @@ from voice_mode import client_identity
 from voice_mode.client_identity import ClientIdentity, owner_for_pid
 from voice_mode.conch import Conch
 from voice_mode.daemon import ClientIdentityMiddleware, IdleExit
+
+
+# Real, live client pids: a record whose owner pid is dead now counts as stale.
+_LIVE = [subprocess.Popen(["sleep", "600"]) for _ in range(3)]
+PID_A, PID_B, PID_C = (p.pid for p in _LIVE)
+atexit.register(lambda: [p.kill() for p in _LIVE])
 
 
 def _as(pid):
@@ -71,12 +78,29 @@ class TestIdentifyRequest:
 
         def fake_lookup(client_port, server_port):
             calls.append((client_port, server_port))
-            return 3131
+            return PID_A
         monkeypatch.setattr(client_identity, "_lsof_peer_pid", fake_lookup)
         req = self._request()
-        assert client_identity.identify_request(req) == ClientIdentity("pid:3131", 3131)
-        assert client_identity.identify_request(req).pid == 3131
-        assert calls == [(50123, 8765)]
+        assert client_identity.identify_request(req) == ClientIdentity(f"pid:{PID_A}", PID_A)
+        assert client_identity.identify_request(req).pid == PID_A
+        assert len(calls) == 1 and calls[0] == (50123, 8765)
+
+    def test_peer_cache_is_keyed_by_both_ports_and_expires(self, monkeypatch):
+        answers = iter([PID_A, PID_B, PID_C])
+        monkeypatch.setattr(client_identity, "_lsof_peer_pid", lambda c, s: next(answers))
+        assert client_identity.peer_pid(50123, 8765) == PID_A
+        assert client_identity.peer_pid(50123, 9999) == PID_B  # other server port
+        clock = [client_identity.time.monotonic() + client_identity._PEER_CACHE_TTL + 1]
+        monkeypatch.setattr(client_identity.time, "monotonic", lambda: clock[0])
+        assert client_identity.peer_pid(50123, 8765) == PID_C  # port reuse after TTL
+
+    def test_cached_peer_that_died_is_re_resolved(self, monkeypatch):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        answers = iter([dead.pid, 777])
+        monkeypatch.setattr(client_identity, "_lsof_peer_pid", lambda c, s: next(answers))
+        assert client_identity.peer_pid(50124, 8765) == dead.pid
+        assert client_identity.peer_pid(50124, 8765) == 777
 
     def test_non_loopback_is_unidentified(self, monkeypatch):
         monkeypatch.setattr(client_identity, "_lsof_peer_pid", lambda *a: 1)
@@ -94,16 +118,16 @@ class TestIdentifyRequest:
 
 class TestConchAcrossClientsInOneProcess:
     def test_second_client_is_refused_and_can_ask_for_yield(self):
-        t = _as(1001)
+        t = _as(PID_A)
         try:
             a = Conch(agent_name="a")
             assert a.try_acquire()
         finally:
             client_identity.unbind(t)
         record = json.loads(Conch.LOCK_FILE.read_text())
-        assert record["owner"] == "pid:1001" and record["pid"] == os.getpid()
+        assert record["owner"] == f"pid:{PID_A}" and record["pid"] == os.getpid()
 
-        t = _as(2002)
+        t = _as(PID_B)
         try:
             b = Conch(agent_name="b")
             assert not b.try_acquire()
@@ -126,13 +150,13 @@ class TestConchAcrossClientsInOneProcess:
         a.release()
 
     def test_preempt_by_another_client_supersedes_holder(self):
-        t = _as(1001)
+        t = _as(PID_A)
         try:
             a = Conch(agent_name="a")
             assert a.try_acquire()
         finally:
             client_identity.unbind(t)
-        t = _as(2002)
+        t = _as(PID_B)
         try:
             b = Conch(agent_name="b")
             assert b.preempt_acquire()
@@ -174,13 +198,13 @@ class TestFloorIdentity:
         from voice_mode import pause_resume
         monkeypatch.setattr(pause_resume, "_ancestor_pids", lambda pid=None, limit=12: {pid})
         monkeypatch.setattr(client_identity, "SHARED_MODE", True)
-        floor(1001)
-        t = _as(1001)
+        floor(PID_A)
+        t = _as(PID_A)
         try:
             assert pause_resume.we_hold_floor() is True
         finally:
             client_identity.unbind(t)
-        t = _as(2002)
+        t = _as(PID_B)
         try:
             assert pause_resume.we_hold_floor() is False
             assert pause_resume.floor_handed_off(True) is True
@@ -190,7 +214,7 @@ class TestFloorIdentity:
     def test_shared_mode_without_client_is_unknown_not_handed_off(self, floor, monkeypatch):
         from voice_mode import pause_resume
         monkeypatch.setattr(client_identity, "SHARED_MODE", True)
-        floor(1001)
+        floor(PID_A)
         assert pause_resume.we_hold_floor() is None
         assert pause_resume.floor_handed_off(True) is False
 
@@ -260,17 +284,90 @@ class TestMiddleware:
         assert idle.in_flight == 0
         assert client_identity.current() is None
 
-    def test_unidentified_client_binds_unknown(self):
+    def test_unidentified_client_gets_unique_anon_owner_and_unknown_floor(self):
         mw = ClientIdentityMiddleware()
-        seen = {}
+        seen = []
 
         async def call_next(ctx):
-            seen["ident"] = client_identity.current()
+            seen.append((client_identity.current_owner(), client_identity.current_client_pid()))
             return "ok"
 
         with patch("voice_mode.daemon.get_http_request", side_effect=RuntimeError):
             asyncio.run(mw.on_call_tool(MagicMock(), call_next))
-        assert seen["ident"] is None
+            asyncio.run(mw.on_call_tool(MagicMock(), call_next))
+        assert all(o.startswith("anon:") and pid is None for o, pid in seen)
+        assert seen[0][0] != seen[1][0]
+        assert seen[0][0] != owner_for_pid(os.getpid())
+
+    def test_client_death_mid_call_cancels_the_call_and_frees_the_conch(self, tmp_path, monkeypatch):
+        import signal
+        import time
+        monkeypatch.setattr(Conch, "LOCK_FILE", tmp_path / "conch")
+        victim = subprocess.Popen(["sleep", "60"])
+        request = SimpleNamespace(
+            headers={client_identity.CLIENT_PID_HEADER: str(victim.pid)}, scope={})
+        mw = ClientIdentityMiddleware(poll=0.1)
+        state = {}
+
+        async def call_next(ctx):
+            conch = Conch(agent_name="victim")
+            assert conch.try_acquire()
+            state["conch"] = conch
+            try:
+                await asyncio.sleep(60)  # a long listen
+            finally:
+                conch.release()
+                state["released"] = True
+
+        async def scenario():
+            with patch("voice_mode.daemon.get_http_request", return_value=request):
+                call = asyncio.ensure_future(mw.on_call_tool(MagicMock(), call_next))
+                await asyncio.sleep(0.3)
+                assert Conch.read_lock_state()[0] == Conch.STATE_HELD
+                # While the client lives, another client cannot take the conch.
+                tok = _as(os.getpid() + 1)
+                try:
+                    assert not Conch(agent_name="other").try_acquire()
+                finally:
+                    client_identity.unbind(tok)
+                victim.send_signal(signal.SIGKILL)
+                victim.wait()
+                t0 = time.monotonic()
+                with pytest.raises(asyncio.CancelledError):
+                    await call
+                tok = _as(os.getpid() + 1)
+                try:
+                    other = Conch(agent_name="other")
+                    assert other.try_acquire()
+                    other.release()
+                finally:
+                    client_identity.unbind(tok)
+                return time.monotonic() - t0
+
+        elapsed = asyncio.run(scenario())
+        assert state.get("released") is True
+        assert elapsed < 3
+
+    def test_dead_owner_record_is_stale_even_though_daemon_pid_is_alive(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Conch, "LOCK_FILE", tmp_path / "conch")
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        (tmp_path / "conch").write_text(json.dumps({
+            "pid": os.getpid(), "owner": owner_for_pid(dead.pid), "agent": "x",
+            "acquired": "2999-01-01T00:00:00"}))
+        assert Conch.read_lock_state()[0] == Conch.STATE_FREE
+        assert not Conch.is_active()
+        tok = _as(os.getpid() + 1)
+        try:
+            c = Conch(agent_name="new")
+            assert c.try_acquire()
+            c.release()
+        finally:
+            client_identity.unbind(tok)
+
+    def test_anon_owner_is_never_judged_dead(self):
+        assert not client_identity.owner_is_dead("anon:abc")
+        assert not client_identity.owner_is_dead(owner_for_pid(os.getpid()))
 
 
 class TestServeDaemonFlag:
@@ -289,10 +386,17 @@ class TestServeDaemonFlag:
         async def serve(sockets=None):
             return None
         server.return_value.serve = serve
+        exits = []
+
+        def fake_exit(code):
+            exits.append(code)
+            raise SystemExit(code)
+        monkeypatch.setattr(os, "_exit", fake_exit)
         with patch("uvicorn.Server", server), patch("uvicorn.Config"), \
                 patch("voice_mode.cli._init_event_logging"):
             result = CliRunner().invoke(voice_mode_main_cli, ["serve", "--daemon", "--port", "1"])
         assert result.exit_code == 0, result.output
+        assert exits == [0]  # F6: hard exit even though the idle watcher never fired
         assert http_app.call_args.kwargs["stateless_http"] is True
         assert len(added) == 1 and isinstance(added[0], ClientIdentityMiddleware)
         assert added[0].idle.seconds == 2700
