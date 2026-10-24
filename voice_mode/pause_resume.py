@@ -10,7 +10,9 @@ removed, then replays the not-yet-heard remainder via a caller-supplied
 
 import asyncio
 import logging
+import json
 import os
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
@@ -34,11 +36,61 @@ def pause_max_seconds() -> float:
         return DEFAULT_PAUSE_MAX_SECONDS
 
 
+FLOOR_QUEUE_PATH = os.path.expanduser("~/.voicemode/floor-queue.json")
+
+
+def _ancestor_pids(pid: Optional[int] = None, limit: int = 12) -> set:
+    """This process plus its parent chain (the MCP server is a child of the
+    Claude session whose pid the floor queue keys on)."""
+    pid = pid or os.getpid()
+    chain = set()
+    for _ in range(limit):
+        if pid <= 1 or pid in chain:
+            break
+        chain.add(pid)
+        try:
+            out = subprocess.run(["/bin/ps", "-o", "ppid=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=2).stdout.strip()
+            pid = int(out)
+        except Exception:
+            break
+    return chain
+
+
+def floor_holder_pid() -> Optional[int]:
+    """pid of the current floor holder from floor-queue.json, or None if the
+    floor is free / the file is missing or unreadable (fail-open)."""
+    try:
+        with open(FLOOR_QUEUE_PATH) as fh:
+            holder = json.load(fh).get("floor_holder")
+        pid = int((holder or {}).get("pid") or 0)
+        return pid or None
+    except Exception:
+        return None
+
+
+def we_hold_floor() -> Optional[bool]:
+    """True/False when a holder is recorded (is it this session?); None if the
+    floor has no holder or the state is unreadable."""
+    holder = floor_holder_pid()
+    if holder is None:
+        return None
+    return holder in _ancestor_pids()
+
+
+def floor_handed_off(held_at_start: bool) -> bool:
+    """True only if this session held the floor when it started speaking and a
+    DIFFERENT holder is recorded now (a jump/advance displaced it)."""
+    return bool(held_at_start) and we_hold_floor() is False
+
+
 @dataclass
 class PauseOutcome:
     timed_out: bool = False
     replayed: bool = False
     skipped_by_send: bool = False
+    handed_off: bool = False
+    undelivered_text: str = ""
     paused_for_seconds: float = 0.0
     final_metrics: Optional[dict] = field(default=None)
 
@@ -72,6 +124,7 @@ async def resume_after_pause(
     replay: Callable[[str], Awaitable[Optional[dict]]],
     turn_end_signal_path: Optional[str] = None,
     max_seconds: Optional[float] = None,
+    held_floor_at_start: bool = False,
 ) -> Optional[PauseOutcome]:
     """Handle a playback cut by pause. Returns None if playback wasn't paused.
 
@@ -98,6 +151,12 @@ async def resume_after_pause(
         remaining = current.get("undelivered_text")
         if remaining is None:
             remaining = message  # unknown split: replay all rather than lose any
+        # A floor jump/advance pulses pause.flag to cut the displaced holder; the
+        # flag clearing then is NOT a Proceed. Don't talk over the new holder.
+        if floor_handed_off(held_floor_at_start):
+            outcome.handed_off = True
+            outcome.undelivered_text = remaining
+            break
         if not remaining.strip():
             break
         logger.info("Pause cleared; replaying the not-yet-heard remainder")

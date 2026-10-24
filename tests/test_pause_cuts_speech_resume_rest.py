@@ -240,3 +240,65 @@ def test_player_latches_pause_cut_even_if_flag_cleared(monkeypatch):
     finally:
         ap.reset_barge_in_event()
     assert p2.paused_cut is False
+
+
+# --- floor handed off during the pause: no replay, no listen ---
+
+def _write_floor(tmp_path, monkeypatch, holder_pid):
+    import json
+    f = tmp_path / "floor-queue.json"
+    f.write_text(json.dumps({"floor_holder": None if holder_pid is None else
+                             {"agent": "x", "pid": holder_pid}, "queue": []}))
+    monkeypatch.setattr(pause_resume, "FLOOR_QUEUE_PATH", str(f))
+
+
+@pytest.mark.asyncio
+async def test_handed_off_floor_skips_replay(tmp_path, monkeypatch):
+    import os
+    _write_floor(tmp_path, monkeypatch, os.getpid() + 999999)  # someone else
+    replayed = []
+
+    async def replay(t):
+        replayed.append(t)
+        return {}
+
+    out = await pause_resume.resume_after_pause(
+        "a b c", {"paused": True, "undelivered_text": "b c"}, replay, held_floor_at_start=True)
+    assert out.handed_off and out.undelivered_text == "b c" and not out.replayed
+    assert replayed == []
+
+
+@pytest.mark.asyncio
+async def test_still_holding_floor_replays(tmp_path, monkeypatch):
+    import os
+    _write_floor(tmp_path, monkeypatch, os.getpid())  # we hold it
+    replayed = []
+
+    async def replay(t):
+        replayed.append(t)
+        return {"paused": False}
+
+    out = await pause_resume.resume_after_pause(
+        "a b c", {"paused": True, "undelivered_text": "b c"}, replay, held_floor_at_start=True)
+    assert not out.handed_off and replayed == ["b c"]
+
+
+@pytest.mark.asyncio
+async def test_never_held_floor_or_free_floor_replays(tmp_path, monkeypatch):
+    import os
+    async def replay(t):
+        return {"paused": False}
+    # not a floor-managed session: someone else holds, but we never did -> replay
+    _write_floor(tmp_path, monkeypatch, os.getpid() + 999999)
+    out = await pause_resume.resume_after_pause("m", {"paused": True, "undelivered_text": "m"}, replay, held_floor_at_start=False)
+    assert out.replayed and not out.handed_off
+    # floor free / unreadable -> fail open
+    _write_floor(tmp_path, monkeypatch, None)
+    out = await pause_resume.resume_after_pause("m", {"paused": True, "undelivered_text": "m"}, replay, held_floor_at_start=True)
+    assert out.replayed and not out.handed_off
+
+
+def test_ancestor_chain_includes_self_and_parent():
+    import os
+    chain = pause_resume._ancestor_pids()
+    assert os.getpid() in chain and os.getppid() in chain
