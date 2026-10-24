@@ -552,7 +552,7 @@ class TestRecordingEndEventData:
                          "chunks_delivered": 70, "chunks_processed": 66, "chunks_drained": 4})
         assert data == {
             "duration": 2.5, "samples": 48000, "audio_seconds": 2.0, "wall_seconds": 2.4,
-            "end_reason": "send", "held": True,
+            "end_reason": "send", "held": True, "send_source": "unknown",
             "chunks_delivered": 70, "chunks_processed": 66, "chunks_drained": 4,
         }
         assert starved is False

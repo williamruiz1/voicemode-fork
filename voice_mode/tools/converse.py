@@ -1177,17 +1177,59 @@ def _send_pending() -> bool:
         return False
 
 
-def _consume_send() -> None:
+# Which control pressed Send (B32): writers put a one-line tag in the signal
+# file ("widget", "hotkey", "airpods", "script"); an empty file (older writers,
+# a bare `touch`) reads as "unknown". The listen that consumes it reports the
+# tag as RECORDING_END's ``send_source``.
+SEND_SOURCE_UNKNOWN = "unknown"
+_SEND_SOURCE_MAX_LEN = 32
+_send_source_lock = threading.Lock()
+_last_send_source: Optional[str] = None
+
+
+def _read_send_source(path: str) -> str:
+    """The signal file's first line as a short [a-z0-9._-] tag, else "unknown"."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            first = f.read(256).splitlines()
+    except Exception:
+        return SEND_SOURCE_UNKNOWN
+    tag = first[0].strip().lower() if first else ""
+    tag = "".join(c for c in tag if c.isalnum() or c in "._-")[:_SEND_SOURCE_MAX_LEN]
+    return tag or SEND_SOURCE_UNKNOWN
+
+
+def _consume_send() -> str:
+    """Delete turn-end.signal, returning (and remembering for this listen's
+    RECORDING_END) which control wrote it."""
+    global _last_send_source
+    path = _turn_end_signal_path()
+    source = _read_send_source(path)
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+    with _send_source_lock:
+        _last_send_source = source
+    logger.info(f"✓ Send source: {source}")
+    return source
+
+
+def _take_send_source() -> Optional[str]:
+    """Return and clear the source of the last consumed Send (None if none)."""
+    global _last_send_source
+    with _send_source_lock:
+        source, _last_send_source = _last_send_source, None
+    return source
+
+
+def _clear_stale_send() -> None:
+    """Listen entry: a Send left from an earlier turn must not pre-end this one.
+    Its source is discarded, not reported -- it ended nothing."""
     try:
         os.remove(_turn_end_signal_path())
     except Exception:
         pass
-
-
-def _clear_stale_send() -> None:
-    """Listen entry: a Send left from an earlier turn must not pre-end this one."""
-    if _send_pending():
-        _consume_send()
 
 
 def _run_checkin(callback: Callable[[], None]) -> None:
@@ -1339,6 +1381,8 @@ def recording_end_event_data(duration: float, samples: int, listen_stats: Option
         "end_reason": stats.get("end_reason", "other"),
         "held": bool(stats.get("held", False)),
     }
+    if "send_source" in stats or data["end_reason"] == "send":
+        data["send_source"] = stats.get("send_source") or SEND_SOURCE_UNKNOWN
     for key in ("chunks_delivered", "chunks_processed", "chunks_drained"):
         if key in stats:
             data[key] = stats[key]
@@ -1370,11 +1414,7 @@ def _record_held_until_send(fallback_max_duration: float, listen_stats: Optional
         _callback(indata, frames, time_info, status)
 
     turn_end = _turn_end_signal_path()
-    try:
-        if os.path.exists(turn_end):
-            os.remove(turn_end)
-    except Exception:
-        pass
+    _clear_stale_send()
 
     chunks = []
     recorded = 0.0
@@ -1581,6 +1621,7 @@ def record_audio_with_silence_detection(*args, listen_stats: Optional[dict] = No
     stats["held"] = hold_active()
     stats["started_at"] = time.time()
     _write_listening_state(stats["started_at"], stats["held"])
+    _take_send_source()  # a Send consumed outside any listen is not this one's
     result = None
     try:
         # AirPods stem press = Send while the mic is open (no-op if unavailable).
@@ -1593,6 +1634,9 @@ def record_audio_with_silence_detection(*args, listen_stats: Optional[dict] = No
         stats["samples"] = samples
         stats["audio_seconds"] = samples / SAMPLE_RATE
         stats["wall_seconds"] = time.monotonic() - started
+        _send_source = _take_send_source()
+        if _send_source is not None:
+            stats["send_source"] = _send_source
         _clear_hold_open()
         _clear_listening_state()
 
@@ -1913,10 +1957,7 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                     try:
                         if os.path.exists(_turn_end_signal) and max(recording_duration, _now - _listen_started) >= _turn_end_floor:
                             logger.info("✓ Manual turn-end signal received — stopping recording")
-                            try:
-                                os.remove(_turn_end_signal)
-                            except Exception:
-                                pass
+                            _consume_send()
                             _end_reason = "send"
                             stats["chunks_drained"] = _drain_delivered_audio(audio_queue, chunks)
                             stop_recording = True
@@ -2981,6 +3022,8 @@ consult the MCP resources listed above.
                 _rec_end, _starved = recording_end_event_data(timings['record'], len(audio_data), listen_stats)
                 if event_logger:
                     event_logger.log_event(event_logger.RECORDING_END, _rec_end)
+                if "send_source" in _rec_end:
+                    logger.info(f"Recording ended by Send from: {_rec_end['send_source']}")
                 if _starved:
                     logger.warning(f"⚠️ Input starved: {_rec_end['audio_seconds']:.2f}s of audio in "
                                    f"{_rec_end['wall_seconds']:.2f}s of listening")
