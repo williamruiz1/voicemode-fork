@@ -28,6 +28,9 @@ import sounddevice as sd
 import voice_mode.audio_player as ap
 import voice_mode.barge_in as bi
 
+# Generous: returns as soon as the trigger fires; only CPU load from parallel agents ever needs the slack.
+_JOIN_TIMEOUT = 20.0
+
 
 def _make_chunk(value: int = 5000, n: int = bi.CHUNK_SAMPLES_MIC) -> np.ndarray:
     """A synthetic mono int16 mic chunk, shaped like sounddevice's callback
@@ -92,7 +95,7 @@ class TestSileroDecisionRouting:
         )
         for _ in range(n_chunks):
             listener._audio_queue.put(_make_chunk())
-        listener._thread.join(timeout=3.0)
+        listener._thread.join(timeout=_JOIN_TIMEOUT)
         result = listener.stop()
 
         assert result.triggered is True
@@ -120,7 +123,7 @@ class TestSileroDecisionRouting:
         )
         for _ in range(n_chunks):
             listener._audio_queue.put(_make_chunk())
-        listener._thread.join(timeout=3.0)
+        listener._thread.join(timeout=_JOIN_TIMEOUT)
         listener.stop()
 
         mock_webrtcvad.Vad.return_value.is_speech.assert_not_called()
@@ -196,7 +199,7 @@ class TestFallbackToWebrtcvadWhenSileroUnavailable:
         n_chunks = (bi.BARGE_IN_TRIGGER_MS // bi.CHUNK_MS) + 3
         for _ in range(n_chunks):
             listener._audio_queue.put(_make_chunk())
-        listener._thread.join(timeout=3.0)
+        listener._thread.join(timeout=_JOIN_TIMEOUT)
         result = listener.stop()
         assert result.triggered is True
         assert triggered_calls == [True]
@@ -332,7 +335,7 @@ class TestTruncateIsARealCancelNotANoOp:
         try:
             for _ in range(n_chunks):
                 listener._audio_queue.put(_make_chunk())
-            listener._thread.join(timeout=3.0)
+            listener._thread.join(timeout=_JOIN_TIMEOUT)
             result = listener.stop()
 
             assert result.triggered is True

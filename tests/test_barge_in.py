@@ -17,6 +17,9 @@ import pytest
 
 import voice_mode.barge_in as bi
 
+# Generous: returns as soon as the trigger fires; only CPU load from parallel agents ever needs the slack.
+_JOIN_TIMEOUT = 20.0
+
 
 @pytest.fixture(autouse=True)
 def _force_webrtcvad_path(monkeypatch):
@@ -151,7 +154,7 @@ class TestBargeInListenerStateMachine:
         for _ in range(n_chunks):
             listener._audio_queue.put(_make_chunk())
 
-        listener._thread.join(timeout=3.0)
+        listener._thread.join(timeout=_JOIN_TIMEOUT)
         assert not listener._thread.is_alive(), "watcher thread should have stopped itself on trigger"
 
         result = listener.stop()
@@ -294,7 +297,7 @@ class TestBargeInLifecycleEvents:
             n_chunks = (bi.BARGE_IN_TRIGGER_MS // bi.CHUNK_MS) + 3
             for _ in range(n_chunks):
                 listener._audio_queue.put(_make_chunk())
-            listener._thread.join(timeout=3.0)
+            listener._thread.join(timeout=_JOIN_TIMEOUT)
             listener.stop()
 
         assert len(calls) == 1
@@ -321,7 +324,7 @@ class TestEnergyMarginGate:
         n_chunks = (bi.BARGE_IN_TRIGGER_MS // bi.CHUNK_MS) + 3
         for _ in range(n_chunks):
             listener._audio_queue.put(_make_chunk())
-        listener._thread.join(timeout=3.0)
+        listener._thread.join(timeout=_JOIN_TIMEOUT)
         result = listener.stop()
         assert result.triggered is True  # unchanged from the no-gate state machine test
 
@@ -359,7 +362,7 @@ class TestEnergyMarginGate:
         n_chunks = (bi.BARGE_IN_TRIGGER_MS // bi.CHUNK_MS) + 5
         for _ in range(n_chunks):
             listener._audio_queue.put(_make_chunk(value=20000))
-        listener._thread.join(timeout=3.0)
+        listener._thread.join(timeout=_JOIN_TIMEOUT)
         result = listener.stop()
         assert result.triggered is True
         assert triggered_calls == [True]
