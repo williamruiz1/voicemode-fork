@@ -53,6 +53,14 @@ class FakeApp:
 
 
 @pytest.fixture(autouse=True)
+def isolate_darwin_notify(monkeypatch):
+    """Existing tests exercise the AVAudioApplication path only; the real
+    Darwin watcher is off unless a test turns it on. Reset the dedupe state."""
+    monkeypatch.setenv(ap.DARWIN_ENV_VAR, "0")
+    monkeypatch.setattr(ap, "_last_send", (0.0, ""))
+
+
+@pytest.fixture(autouse=True)
 def opt_in_calls(monkeypatch):
     """Never touch the real NSNotificationCenter; record opt-in attempts."""
     calls = []
@@ -296,3 +304,162 @@ def test_opt_in_failure_is_fail_open(home, fake_app, monkeypatch):
         fake_app.press()
     assert _signal(home).exists()
     assert "opted_in=False" in _debug_log(home).read_text()
+
+
+# ---- Darwin notification fallback ------------------------------------------
+
+class FakeLib:
+    """Stands in for libSystem: notify_check reports the posts queued per token."""
+
+    def __init__(self, register_status=0):
+        self.register_status = register_status
+        self.pending = {}  # token -> count of unseen posts
+        self.names = {}
+        self.cancelled = []
+        self._next = 10
+        self.first_check = set()
+
+    def notify_register_check(self, name, tok_ref):
+        if self.register_status:
+            return self.register_status
+        tok = self._next
+        self._next += 1
+        tok_ref._obj.value = tok
+        self.names[name.decode()] = tok
+        self.pending[tok] = 0
+        return 0
+
+    def notify_check(self, tok, flag_ref):
+        if tok not in self.first_check:  # real notify_check reports True once at first
+            self.first_check.add(tok)
+            flag_ref._obj.value = 1
+            return 0
+        flag_ref._obj.value = 1 if self.pending[tok] else 0
+        self.pending[tok] = 0
+        return 0
+
+    def notify_get_state(self, tok, st_ref):
+        st_ref._obj.value = 1
+        return 0
+
+    def notify_cancel(self, tok):
+        self.cancelled.append(tok)
+        return 0
+
+    def post(self, name):
+        self.pending[self.names[name]] += 1
+
+
+def _wait(cond, timeout=2.0):
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return cond()
+
+
+@pytest.fixture
+def fake_lib(home, monkeypatch):
+    lib = FakeLib()
+    monkeypatch.setenv(ap.DARWIN_ENV_VAR, "1")
+    monkeypatch.setattr(ap, "_load_libsystem", lambda: lib)
+    monkeypatch.setattr(ap, "_load_app", lambda: None)  # darwin path alone
+    return lib
+
+
+def test_darwin_post_writes_airpods_source(home, fake_lib):
+    with ap.listening():
+        assert not _signal(home).exists()  # priming check is not a press
+        fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+        assert _wait(lambda: _signal(home).exists())
+    assert _signal(home).read_text().strip() == "airpods"
+
+
+def test_darwin_both_names_are_watched(home, fake_lib):
+    with ap.listening():
+        assert set(fake_lib.names) == set(ap.DARWIN_NOTIFY_NAMES)
+        fake_lib.post(ap.DARWIN_NOTIFY_NAMES[1])
+        assert _wait(lambda: _signal(home).exists())
+
+
+def test_darwin_ignored_while_paused(home, fake_lib):
+    (home / ".voicemode" / "pause.flag").touch()
+    with ap.listening():
+        fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+        import time; time.sleep(0.3)
+        assert not _signal(home).exists()
+
+
+def test_darwin_unsubscribes_when_listen_ends(home, fake_lib):
+    with ap.listening():
+        pass
+    assert sorted(fake_lib.cancelled) == sorted(fake_lib.names.values())
+
+
+def test_darwin_post_after_listen_is_ignored(home, fake_lib):
+    with ap.listening():
+        pass
+    fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+    import time; time.sleep(0.2)
+    assert not _signal(home).exists()
+
+
+def test_darwin_disabled_by_env(home, fake_lib, monkeypatch):
+    monkeypatch.setenv(ap.DARWIN_ENV_VAR, "0")
+    with ap.listening():
+        assert fake_lib.names == {}
+
+
+def test_darwin_default_on(monkeypatch):
+    monkeypatch.delenv(ap.DARWIN_ENV_VAR, raising=False)
+    assert ap.darwin_enabled() is True
+
+
+def test_darwin_fail_open_when_register_fails(home, monkeypatch):
+    monkeypatch.setenv(ap.DARWIN_ENV_VAR, "1")
+    monkeypatch.setattr(ap, "_load_libsystem", lambda: FakeLib(register_status=1))
+    monkeypatch.setattr(ap, "_load_app", lambda: None)
+    with ap.listening() as sender:
+        assert sender is None  # listen proceeds
+
+
+def test_darwin_fail_open_without_libsystem(home, monkeypatch):
+    monkeypatch.setenv(ap.DARWIN_ENV_VAR, "1")
+    monkeypatch.setattr(ap, "_load_libsystem", lambda: None)
+    monkeypatch.setattr(ap, "_load_app", lambda: None)
+    with ap.listening():
+        pass
+
+
+def test_press_seen_by_both_paths_counts_once(home, fake_lib, fake_app, monkeypatch):
+    monkeypatch.setattr(ap, "_load_app", lambda: fake_app)
+    with ap.listening():
+        fake_app.press()
+        assert _signal(home).exists()
+        _signal(home).unlink()  # listen consumed the Send
+        fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+        import time; time.sleep(0.3)
+        assert not _signal(home).exists()  # duplicate collapsed
+
+
+def test_darwin_post_is_logged_with_source(home, fake_lib):
+    with ap.listening():
+        fake_lib.post(ap.DARWIN_NOTIFY_NAMES[0])
+        assert _wait(lambda: _signal(home).exists())
+    log = (home / ".voicemode" / "logs" / "airpods.log").read_text()
+    assert "darwin-notify" in log and "SEND" in log
+
+
+def test_live_libsystem_subscription_smoke():
+    """Real libSystem: registration succeeds and state is readable (no press)."""
+    import sys
+    if sys.platform != "darwin":
+        pytest.skip("macOS only")
+    lib = ap._load_libsystem()
+    w = ap.DarwinNotifyWatcher(lib)
+    try:
+        assert w.active
+    finally:
+        w.close()
