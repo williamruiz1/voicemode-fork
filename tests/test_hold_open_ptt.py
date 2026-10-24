@@ -161,9 +161,10 @@ class TestHeldVadLoop:
         audio, speech = record_audio_with_silence_detection(max_duration=30.0)
 
         assert speech is True
-        # Kept recording through 4x the silence threshold, stopped near Send.
+        # Kept recording through 4x the silence threshold. (No upper bound:
+        # on Send every chunk the fake mic already delivered is kept, and the
+        # fake mic runs ahead of the loop.)
         assert _seconds(audio) >= SEND_AT * CHUNK_S - 0.05
-        assert _seconds(audio) < SEND_AT * CHUNK_S + 1.0
         assert not (sim / "turn-end.signal").exists()      # consumed
         assert not (sim / "hold-open.signal").exists()     # per-turn hold cleared
         assert (sim / "hold-mode").exists()                # persistent mode kept
@@ -247,7 +248,9 @@ class TestHeldVadLoop:
 
         # Held: listen_duration_min (20s) does not delay Send; only the tiny
         # MIN_RECORDING_DURATION floor applies.
-        assert C.MIN_RECORDING_DURATION - 2 * CHUNK_S <= _seconds(audio) <= C.MIN_RECORDING_DURATION + 0.5
+        # Ended right after the floor -- nowhere near the 20s listen_duration_min
+        # (the upper slack covers delivered-but-unprocessed audio kept on Send).
+        assert C.MIN_RECORDING_DURATION - 2 * CHUNK_S <= _seconds(audio) < 5.0
         assert speech is True
 
     def test_held_yield_request_ignored(self, sim, monkeypatch):
@@ -324,7 +327,7 @@ class TestHeldWithoutVad:
             max_duration=30.0, disable_silence_detection=True)
 
         assert speech is True
-        assert SEND_AT * CHUNK_S - 0.05 <= _seconds(audio) < SEND_AT * CHUNK_S + 1.0
+        assert _seconds(audio) >= SEND_AT * CHUNK_S - 0.05
         assert not (sim / "turn-end.signal").exists()
         assert (sim / "hold-mode").exists()
 
@@ -376,3 +379,197 @@ class TestHelpers:
         (home / "hold-mode").unlink()
         (home / "hold-open.signal").touch()
         assert C.hold_active() is True
+
+
+# --------------------------------------------------------------------------- #
+# Send keeps delivered audio; listening.json; RECORDING_END diagnostics       #
+# --------------------------------------------------------------------------- #
+
+class _SlowVad(_FakeVad):
+    """A consumer that falls behind the mic (CPU-starved server): each
+    processed chunk costs 5ms while the fake mic delivers one per 0.5ms."""
+
+    def is_speech(self, chunk_bytes, rate):
+        time.sleep(0.005)
+        return super().is_speech(chunk_bytes, rate)
+
+
+class TestSendKeepsDeliveredAudio:
+    def _run(self, sim, monkeypatch):
+        monkeypatch.setattr(C.webrtcvad, "Vad", _SlowVad)
+        (sim / "hold-mode").touch()
+        stats = {}
+        _FakeVad.on_processed = _touch_at(sim / "turn-end.signal", 40)
+        audio, _ = record_audio_with_silence_detection(max_duration=30.0, listen_stats=stats)
+        return audio, stats
+
+    def test_backlog_is_kept_on_send(self, sim, monkeypatch):
+        audio, stats = self._run(sim, monkeypatch)
+        assert stats["end_reason"] == "send"
+        assert stats["chunks_drained"] > 0
+        assert stats["chunks_delivered"] > stats["chunks_processed"]
+        # Every chunk the mic delivered before Send is in the result.
+        assert len(audio) >= (stats["chunks_processed"] + stats["chunks_drained"]) * CHUNK_SAMPLES
+
+    def test_without_drain_the_backlog_is_lost(self, sim, monkeypatch):
+        """On/off control for the test above: with the drain disabled, a slow
+        consumer returns only what it processed -- the pre-fix behavior."""
+        monkeypatch.setattr(C, "_drain_delivered_audio", lambda q, chunks: 0)
+        audio, stats = self._run(sim, monkeypatch)
+        assert stats["chunks_delivered"] > stats["chunks_processed"]
+        assert len(audio) == stats["chunks_processed"] * CHUNK_SAMPLES
+
+
+class TestListeningState:
+    def _state(self, sim):
+        import json
+        path = sim / "listening.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def test_written_while_listening_and_removed_after(self, sim):
+        seen = []
+        (sim / "hold-mode").touch()
+
+        def on_processed(n):
+            if n == 5:
+                seen.append(self._state(sim))
+            if n == 20:
+                (sim / "turn-end.signal").touch()
+        _FakeVad.on_processed = on_processed
+        before = time.time()
+
+        record_audio_with_silence_detection(max_duration=30.0)
+
+        state = seen[0]
+        assert state["held"] is True
+        assert state["pid"] == os.getpid()
+        assert before - 1 <= state["started_at"] <= time.time()
+        assert not (sim / "listening.json").exists()
+
+    def test_held_flips_true_when_hold_open_appears(self, sim):
+        seen = {}
+        _FakeInputStream.script = _speech_then_silence(SPEECH_N)
+
+        def on_processed(n):
+            if n == 3:
+                seen["before"] = self._state(sim)
+                (sim / "hold-open.signal").touch()
+            if n == 10:
+                seen["after"] = self._state(sim)
+            if n == 30:
+                (sim / "turn-end.signal").touch()
+        _FakeVad.on_processed = on_processed
+
+        record_audio_with_silence_detection(max_duration=30.0)
+
+        assert seen["before"]["held"] is False
+        assert seen["after"]["held"] is True
+        assert seen["after"]["started_at"] == seen["before"]["started_at"]
+        assert not (sim / "listening.json").exists()
+
+    def test_removed_when_recording_raises(self, sim, monkeypatch):
+        monkeypatch.setattr(C, "_record_audio_with_silence_detection",
+                            MagicMock(side_effect=RuntimeError("boom")))
+        with pytest.raises(RuntimeError):
+            record_audio_with_silence_detection(max_duration=1.0)
+        assert not (sim / "listening.json").exists()
+
+
+class TestEndReason:
+    def _stats(self, **kwargs):
+        stats = {}
+        record_audio_with_silence_detection(listen_stats=stats, **kwargs)
+        return stats
+
+    def test_send(self, sim):
+        _FakeVad.on_processed = _touch_at(sim / "turn-end.signal", 25)
+        stats = self._stats(max_duration=30.0)
+        assert stats["end_reason"] == "send"
+        assert stats["held"] is False
+
+    def test_silence(self, sim):
+        _FakeInputStream.script = _speech_then_silence(SPEECH_N)
+        assert self._stats(max_duration=30.0)["end_reason"] == "silence"
+
+    def test_no_speech(self, sim):
+        assert self._stats(max_duration=0.3)["end_reason"] == "no_speech"
+
+    def test_max_duration(self, sim):
+        _FakeInputStream.script = _speech_then_silence(200)
+        assert self._stats(max_duration=1.0)["end_reason"] == "max_duration"
+
+    def test_hold_ceiling(self, sim, monkeypatch):
+        monkeypatch.setenv("VOICEMODE_HOLD_MAX_SECONDS", "0.5")
+        (sim / "hold-mode").touch()
+        stats = self._stats(max_duration=30.0)
+        assert stats["end_reason"] == "hold_ceiling"
+        assert stats["held"] is True
+
+    def test_yield(self, sim, monkeypatch):
+        monkeypatch.setattr(C, "CONCH_YIELD_GRACE_SECONDS", 0.1)
+        stats = self._stats(max_duration=30.0, yield_check=lambda: True, yield_state={"yielded": False})
+        assert stats["end_reason"] == "yield"
+
+    def test_supersede(self, sim):
+        stats = self._stats(max_duration=30.0, supersede_check=lambda: True, yield_state={"yielded": False})
+        assert stats["end_reason"] == "supersede"
+
+    def test_endpoint(self, sim, monkeypatch):
+        monkeypatch.setattr(C, "ENDPOINTING_ENABLED", True)
+        monkeypatch.setattr(C, "SILERO_AVAILABLE", True)
+        monkeypatch.setattr(C, "Endpointer", _FakeEndpointer)
+        assert self._stats(max_duration=30.0)["end_reason"] == "endpoint"
+
+    def test_device_error(self, sim, monkeypatch):
+        class _BrokenStream(_FakeInputStream):
+            def __init__(self, **kw):
+                # Not one of the "recoverable" strings: those retry the open
+                # recursively (0.5s each) with no attempt cap.
+                raise RuntimeError("stream open failed")
+        C.sd.InputStream = _BrokenStream
+        monkeypatch.setattr(C, "record_audio", MagicMock(return_value=np.zeros(10, dtype=np.int16)))
+        assert self._stats(max_duration=1.0)["end_reason"] == "device_error"
+
+    def test_held_no_vad_send(self, sim):
+        (sim / "hold-mode").touch()
+        _FakeInputStream.on_chunk = _touch_at(sim / "turn-end.signal", 30)
+        stats = self._stats(max_duration=30.0, disable_silence_detection=True)
+        assert stats["end_reason"] == "send"
+        assert stats["held"] is True
+
+    def test_stats_carry_samples_and_seconds(self, sim):
+        _FakeInputStream.script = _speech_then_silence(SPEECH_N)
+        stats = {}
+        audio, _ = record_audio_with_silence_detection(max_duration=30.0, listen_stats=stats)
+        assert stats["samples"] == len(audio)
+        assert stats["audio_seconds"] == pytest.approx(len(audio) / SAMPLE_RATE)
+        assert stats["wall_seconds"] > 0
+
+
+class TestRecordingEndEventData:
+    def test_fields(self):
+        data, starved = C.recording_end_event_data(
+            2.5, 48000, {"end_reason": "send", "held": True, "wall_seconds": 2.4,
+                         "chunks_delivered": 70, "chunks_processed": 66, "chunks_drained": 4})
+        assert data == {
+            "duration": 2.5, "samples": 48000, "audio_seconds": 2.0, "wall_seconds": 2.4,
+            "end_reason": "send", "held": True,
+            "chunks_delivered": 70, "chunks_processed": 66, "chunks_drained": 4,
+        }
+        assert starved is False
+
+    def test_live_failure_signature_is_starved(self):
+        # The 2026-10-23 20:31 turn: 12240 samples (0.51s) in 23.6s.
+        data, starved = C.recording_end_event_data(23.637, 12240, {"wall_seconds": 23.6})
+        assert data["audio_seconds"] == 0.51
+        assert starved is True
+
+    def test_short_listens_never_flag(self):
+        _, starved = C.recording_end_event_data(0.4, 0, {"wall_seconds": 0.4, "end_reason": "supersede"})
+        assert starved is False
+
+    def test_missing_stats_fall_back(self):
+        data, _ = C.recording_end_event_data(3.0, 72000, None)
+        assert data["end_reason"] == "other"
+        assert data["held"] is False
+        assert data["wall_seconds"] == 3.0
