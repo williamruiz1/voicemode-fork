@@ -1323,15 +1323,21 @@ def _listening_state_path() -> str:
     return os.path.expanduser("~/.voicemode/listening.json")
 
 
-def _write_listening_state(started_at: float, held: bool) -> None:
+def _write_listening_state(started_at: float, held: bool, paused_at: Optional[float] = None,
+                           paused_seconds: float = 0.0) -> None:
     """Atomically publish ~/.voicemode/listening.json while the mic is open, so
-    a hotkey/indicator can tell a listen is live and whether it is held."""
+    a hotkey/indicator can tell a listen is live, whether it is held, and
+    whether Pause has suspended it (B43): ``paused`` / ``paused_at`` (wall
+    time the current pause began) and ``paused_seconds`` (paused time already
+    finished this listen), so a counter can freeze and leave pauses out."""
     path = _listening_state_path()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
-            json.dump({"started_at": started_at, "held": bool(held), "pid": os.getpid()}, f)
+            json.dump({"started_at": started_at, "held": bool(held), "pid": os.getpid(),
+                       "paused": paused_at is not None, "paused_at": paused_at,
+                       "paused_seconds": round(float(paused_seconds), 3)}, f)
         os.replace(tmp, path)
     except Exception as e:
         logger.debug(f"listening state write failed (ignored): {e}")
@@ -1380,13 +1386,16 @@ def recording_end_event_data(duration: float, samples: int, listen_stats: Option
         "wall_seconds": round(wall, 3),
         "end_reason": stats.get("end_reason", "other"),
         "held": bool(stats.get("held", False)),
+        "paused_seconds": round(float(stats.get("paused_seconds", 0.0) or 0.0), 3),
     }
     if "send_source" in stats or data["end_reason"] == "send":
         data["send_source"] = stats.get("send_source") or SEND_SOURCE_UNKNOWN
-    for key in ("chunks_delivered", "chunks_processed", "chunks_drained"):
+    for key in ("chunks_delivered", "chunks_processed", "chunks_drained", "chunks_discarded_paused"):
         if key in stats:
             data[key] = stats[key]
-    starved = wall >= 1.0 and audio_seconds < 0.5 * wall
+    # Paused time discards audio on purpose (B43): it is not starvation.
+    live = max(0.0, wall - data["paused_seconds"])
+    starved = live >= 1.0 and audio_seconds < 0.5 * live
     return data, starved
 
 
@@ -1641,7 +1650,7 @@ def record_audio_with_silence_detection(*args, listen_stats: Optional[dict] = No
         _clear_listening_state()
 
 
-def _record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, yield_check: Optional[Callable[[], bool]] = None, yield_state: Optional[dict] = None, pre_roll: Optional[np.ndarray] = None, pause_check: Optional[Callable[[], bool]] = None, step_away_state: Optional[dict] = None, checkin_callback: Optional[Callable[[], None]] = None, append_window_override_ms: Optional[int] = None, step_away_enabled_override: Optional[bool] = None, supersede_check: Optional[Callable[[], bool]] = None, listen_stats: Optional[dict] = None, _device_attempt: int = 0, _listen_t0: Optional[float] = None) -> Tuple[np.ndarray, bool]:
+def _record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, yield_check: Optional[Callable[[], bool]] = None, yield_state: Optional[dict] = None, pre_roll: Optional[np.ndarray] = None, pause_check: Optional[Callable[[], bool]] = None, step_away_state: Optional[dict] = None, checkin_callback: Optional[Callable[[], None]] = None, append_window_override_ms: Optional[int] = None, step_away_enabled_override: Optional[bool] = None, supersede_check: Optional[Callable[[], bool]] = None, listen_stats: Optional[dict] = None, listen_pause_check: Optional[Callable[[], bool]] = None, pause_deadline: Optional[float] = None, _device_attempt: int = 0, _listen_t0: Optional[float] = None) -> Tuple[np.ndarray, bool]:
     """Record audio from microphone with automatic silence detection.
 
     Uses WebRTC VAD to detect when the user stops speaking and automatically
@@ -1700,7 +1709,23 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
         step_away_enabled_override: Optional bool to force step-away on/off (tests).
             None → resolved from env flag / flag file. Default resolves to OFF.
         listen_stats: Optional dict filled out-of-band with ``end_reason``,
-            ``held`` and chunk counters (see record_audio_with_silence_detection).
+            ``held``, ``paused_seconds`` and chunk counters (see
+            record_audio_with_silence_detection).
+        listen_pause_check: Optional callable (B43), polled every tick.
+            Defaults to convomode_paused (~/.voicemode/pause.flag). While it
+            returns True the listen is SUSPENDED: incoming audio is discarded
+            and no stop condition runs (silence, endpoint, max duration, hold
+            ceiling, stall watchdog, conch yield), so the turn neither ends nor
+            records. Audio captured before the pause is kept; on Proceed the
+            same turn resumes with a fresh silence clock. Send while paused
+            ends the turn with the audio captured so far. A pause longer than
+            VOICEMODE_PAUSE_MAX_SECONDS (or past ``pause_deadline``) ends the
+            listen with end_reason "paused_timeout". Exception: with step-away
+            enabled, a pause that starts before any speech is left to the
+            step-away policy (it must keep hearing him to notice he is back).
+        pause_deadline: Optional time.monotonic() deadline after which a
+            suspended listen gives up ("paused_timeout") -- converse passes
+            what is left of the call's pause budget.
         _device_attempt, _listen_t0: internal -- device-error recovery reopens
             the stream by recursing with the attempt number and the original
             listen start, so the attempt cap, the hold ceiling and Send's
@@ -1722,6 +1747,8 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
     if _step_away_on and pause_check is None:
         pause_check = convomode_paused  # reuse the existing pause primitive
     _step_away = StepAwayTracker(_step_away_on, max_duration, STEP_AWAY_GRACE_SECONDS, STEP_AWAY_CHECKIN_SECONDS)
+    if listen_pause_check is None:
+        listen_pause_check = convomode_paused  # B43: Pause suspends an open listen
     if _append_ms > 0:
         logger.info(f"🎙️ append-to-turn window enabled: +{_append_ms}ms after silence timer")
     if _step_away_on:
@@ -1914,15 +1941,93 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                 if _held:
                     logger.info(f"✋ Held listen: silence will not end the turn (max {_hold_max:.0f}s)")
 
+                # B43: Pause suspends the listen. Paused time (summed across a
+                # device-error reopen via stats) is kept out of the wall-clock
+                # hold ceiling.
+                _pause_max = pause_max_seconds()
+                _paused_total = float(stats.get("paused_seconds", 0.0) or 0.0)
+                _pause_started = None   # monotonic start of the current pause
+                _pause_started_wall = None  # same, wall clock (listening.json)
+                _pause_stepaway = False  # this pause belongs to step-away (idle)
+
                 while recording_duration < (_hold_max if _held else _step_away.effective_max()) and not stop_recording:
                     if not _held and hold_active():
                         _held = True
                         stats["held"] = True
-                        _write_listening_state(stats.get("started_at", time.time()), True)
+                        _write_listening_state(stats.get("started_at", time.time()), True,
+                                               paused_at=_pause_started_wall, paused_seconds=_paused_total)
                         logger.info(f"✋ Hold engaged at {recording_duration:.1f}s: silence will not end the turn (max {_hold_max:.0f}s)")
+
+                    # B43: Pause (pause.flag) suspends the whole listen, held or
+                    # not: chunks are discarded and every stop condition below is
+                    # skipped, so the turn neither ends nor records. Send still
+                    # ends it with what was captured before the pause.
+                    try:
+                        _paused_now = bool(listen_pause_check())
+                    except Exception:
+                        _paused_now = False
+                    if _paused_now and _pause_started is None and not _pause_stepaway:
+                        if _step_away_on and not speech_detected:
+                            # Step-away owns an idle pause: it keeps listening so
+                            # his return is heard (founder-os#11655).
+                            _pause_stepaway = True
+                        else:
+                            _pause_started = time.monotonic()
+                            _pause_started_wall = time.time()
+                            stats["pause_count"] = stats.get("pause_count", 0) + 1
+                            logger.info(f"⏸️ Listen paused at {recording_duration:.1f}s "
+                                        f"(held={_held}, speech={speech_detected}) - audio discarded until Proceed")
+                            _write_listening_state(stats.get("started_at", time.time()), _held,
+                                                   paused_at=_pause_started_wall, paused_seconds=_paused_total)
+                    elif not _paused_now:
+                        _pause_stepaway = False
+                        if _pause_started is not None:
+                            _this_pause = time.monotonic() - _pause_started
+                            _paused_total += _this_pause
+                            stats["paused_seconds"] = _paused_total
+                            _pause_started = _pause_started_wall = None
+                            # Fresh silence clock: the pause gap is not trailing
+                            # silence, and the stall watchdog restarts too.
+                            silence_duration_ms = 0
+                            if endpointer is not None:
+                                endpointer.restart_silence_clock()
+                            _last_audio_at = time.monotonic()
+                            logger.info(f"▶️ Listen resumed after {_this_pause:.1f}s paused - same turn continues")
+                            _write_listening_state(stats.get("started_at", time.time()), _held,
+                                                   paused_seconds=_paused_total)
+                    if _pause_started is not None:
+                        _now = time.monotonic()
+                        _this_pause = _now - _pause_started
+                        try:
+                            if os.path.exists(_turn_end_signal):
+                                logger.info("✓ Send while paused — ending the turn with the audio captured before the pause")
+                                _consume_send()
+                                _end_reason = "send"
+                                stop_recording = True
+                                speech_detected = True  # same contract as Send: transcribe what we have
+                                break
+                        except Exception:
+                            pass
+                        if _this_pause >= _pause_max or (pause_deadline is not None and _now >= pause_deadline):
+                            logger.warning(f"⏸️ Listen paused for {_this_pause:.0f}s - giving up (paused_timeout)")
+                            _end_reason = "paused_timeout"
+                            stop_recording = True
+                            break
+                        try:
+                            _discard = audio_queue.get(timeout=0.1)
+                        except queue.Empty:
+                            continue
+                        if _discard is None:
+                            stats["paused_seconds"] = _paused_total + (time.monotonic() - _pause_started)
+                            logger.error("Audio device error detected while paused - stopping recording")
+                            _end_reason = "device_error"
+                            raise sd.PortAudioError("Audio device disconnected or unavailable")
+                        stats["chunks_discarded_paused"] = stats.get("chunks_discarded_paused", 0) + 1
+                        continue
+
                     # Wall-clock backstop for a held listen: a stream that stops
                     # delivering never advances recording_duration.
-                    if _held and time.monotonic() - _listen_started >= _hold_max + 1.0:
+                    if _held and time.monotonic() - _listen_started - _paused_total >= _hold_max + 1.0:
                         logger.warning("Held listen hit its wall-clock ceiling - stopping")
                         _end_reason = "hold_ceiling"
                         break
@@ -2201,6 +2306,9 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                         _end_reason = "hold_ceiling"
                     else:
                         _end_reason = "max_duration" if speech_detected else "no_speech"
+                if _pause_started is not None:
+                    _paused_total += time.monotonic() - _pause_started
+                stats["paused_seconds"] = _paused_total
                 stats["end_reason"] = _end_reason
                 stats["held"] = _held
                 _loop_end_reason = _end_reason
@@ -2317,6 +2425,8 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                         step_away_enabled_override=step_away_enabled_override,
                         supersede_check=supersede_check,
                         listen_stats=stats,
+                        listen_pause_check=listen_pause_check,
+                        pause_deadline=pause_deadline,
                         _device_attempt=_device_attempt + 1,
                         _listen_t0=_t0,
                     )
@@ -2972,6 +3082,10 @@ consult the MCP resources listed above.
                         yield_check=listen_yield_check,
                         yield_state=yield_state,
                         supersede_check=listen_supersede_check,
+                        # B43: a paused listen gives up before the host's idle
+                        # timeout -- only what's left of the call's pause budget.
+                        pause_deadline=time.monotonic() + max(
+                            0.0, pause_max_seconds() - (time.perf_counter() - tts_start)),
                     )
                     kwargs.update(overrides)
                     return functools.partial(
@@ -3048,6 +3162,14 @@ consult the MCP resources listed above.
                     result = ("Yielded the mic — another agent requested the floor while "
                               "you were idle-listening. No response was captured. Re-call "
                               "converse (wait_for_conch=true) when you want to continue.")
+                    return result
+
+                # B43: the listen stayed paused past the pause budget.
+                if listen_stats.get("end_reason") == "paused_timeout" and not speech_detected:
+                    success = True
+                    result = (f"[PAUSED — timed out after {listen_stats.get('paused_seconds', 0):.0f}s "
+                              f"waiting for Proceed while listening. Nothing was said before the pause; "
+                              f"no response was captured.]")
                     return result
 
                 # Step-away outcome (founder-os#11655). Inert unless step-away armed.
