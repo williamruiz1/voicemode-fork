@@ -17,6 +17,8 @@ sys.modules.setdefault("webrtcvad", MagicMock())
 
 from voice_mode import airpods_press as ap
 
+_real_ensure_opted_in = ap._ensure_opted_in
+
 
 class FakeApp:
     def __init__(self, muted=False, register_ok=True, raise_on_register=False):
@@ -48,6 +50,14 @@ class FakeApp:
     def press(self):
         self.muted = not self.muted
         return self.handler(self.muted)
+
+
+@pytest.fixture(autouse=True)
+def opt_in_calls(monkeypatch):
+    """Never touch the real NSNotificationCenter; record opt-in attempts."""
+    calls = []
+    monkeypatch.setattr(ap, "_ensure_opted_in", lambda: calls.append(1) or True)
+    return calls
 
 
 @pytest.fixture
@@ -188,3 +198,101 @@ def test_listen_still_runs_when_unavailable(home, monkeypatch):
                         lambda *a, listen_stats=None, **k: (np.zeros(3, dtype=np.int16), False))
     audio, speech = C.record_audio_with_silence_detection(5.0)
     assert len(audio) == 3 and speech is False
+
+
+# ---- B32 source tag / B33 opt-in + debug log ----
+
+def _debug_log(home):
+    return home / ".voicemode" / "logs" / "airpods.log"
+
+
+def test_press_writes_airpods_source_tag(home, fake_app):
+    with ap.listening():
+        fake_app.press()
+    assert _signal(home).read_text() == "airpods\n"
+    assert not list((home / ".voicemode").glob("*.tmp"))
+
+
+def test_press_source_is_read_back_by_converse(home, fake_app):
+    import voice_mode.tools.converse as C
+
+    with ap.listening():
+        fake_app.press()
+    assert C._consume_send() == "airpods"
+    assert C._take_send_source() == "airpods"
+
+
+def test_register_opts_in_before_handler(home, fake_app, opt_in_calls):
+    with ap.listening():
+        assert opt_in_calls == [1]
+
+
+def test_debug_log_records_register_calls_and_unregister(home, fake_app):
+    with ap.listening():
+        fake_app.handler(False)  # initial sync
+        fake_app.press()
+    text = _debug_log(home).read_text()
+    assert "registered ok=True initial_muted=False opted_in=True" in text
+    assert "handler muted=False last=False closing=False -> ignored (initial sync / no change)" in text
+    assert "handler muted=True last=False -> SEND (turn-end.signal)" in text
+    assert "-> ignored (reset)" in text  # close() resets mute via the handler
+    assert "unregistered (presses=1, reset_mute=True)" in text
+    assert "thread=" in text and "pid=" in text
+
+
+def test_debug_log_records_paused_and_skips(home, fake_app, monkeypatch):
+    (home / ".voicemode" / "pause.flag").touch()
+    with ap.listening():
+        fake_app.press()
+    monkeypatch.setenv(ap.ENV_VAR, "off")
+    with ap.listening():
+        pass
+    text = _debug_log(home).read_text()
+    assert "-> ignored (paused)" in text
+    assert "register skipped: VOICEMODE_AIRPODS_PRESS_SEND is off" in text
+
+
+def test_debug_log_is_size_capped(home, monkeypatch):
+    monkeypatch.setattr(ap, "DEBUG_LOG_MAX_BYTES", 200)
+    for i in range(20):
+        ap.debug_log(f"line {i:02d} " + "x" * 40)
+    log = _debug_log(home)
+    assert log.stat().st_size <= 200 + 200
+    assert (log.parent / "airpods.log.1").exists()
+    assert "line 19" in log.read_text()
+
+
+def test_debug_log_never_raises(monkeypatch):
+    monkeypatch.setattr(ap, "_debug_log_path", lambda: "/nonexistent-root-dir/x/airpods.log")
+    ap.debug_log("hello")  # no exception
+
+
+def test_ensure_opted_in_adds_observer_once(home, monkeypatch):
+    monkeypatch.setattr(ap, "_opt_in_observer", None)
+    added = []
+
+    class FakeCenter:
+        def addObserverForName_object_queue_usingBlock_(self, name, obj, queue, block):
+            added.append(name)
+            block(types.SimpleNamespace(userInfo=lambda: {"AVAudioApplicationMuteStateKey": 1}))
+            return "observer"
+
+    center = FakeCenter()
+    monkeypatch.setitem(sys.modules, "AVFAudio", types.SimpleNamespace(
+        AVAudioApplicationInputMuteStateChangeNotification="AVAudioApplicationInputMuteStateChangeNotification"))
+    monkeypatch.setitem(sys.modules, "Foundation", types.SimpleNamespace(
+        NSNotificationCenter=types.SimpleNamespace(defaultCenter=lambda: center)))
+    assert _real_ensure_opted_in() is True
+    assert _real_ensure_opted_in() is True
+    assert added == ["AVAudioApplicationInputMuteStateChangeNotification"]
+    text = _debug_log(home).read_text()
+    assert "opt-in: observing" in text and "notification mute_state=1" in text
+
+
+def test_opt_in_failure_is_fail_open(home, fake_app, monkeypatch):
+    monkeypatch.setattr(ap, "_ensure_opted_in", lambda: False)
+    with ap.listening() as sender:
+        assert sender is not None  # handler still registered
+        fake_app.press()
+    assert _signal(home).exists()
+    assert "opted_in=False" in _debug_log(home).read_text()
