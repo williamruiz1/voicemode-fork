@@ -290,6 +290,10 @@ def load_voicemode_env():
 # Download chunk size in bytes (default: 4096)
 # VOICEMODE_STREAM_CHUNK_SIZE=4096
 
+# Request a short first piece of long messages and prefetch the rest while it
+# plays, so first audio is independent of message length (default: true)
+# VOICEMODE_TTS_SPLIT_FIRST=true
+
 # Initial buffer before playback starts in milliseconds (default: 150)
 # VOICEMODE_STREAM_BUFFER_MS=150
 
@@ -1103,6 +1107,11 @@ STREAMING_ENABLED = os.getenv("VOICEMODE_STREAMING_ENABLED", "true").lower() in 
 STREAM_CHUNK_SIZE = int(os.getenv("VOICEMODE_STREAM_CHUNK_SIZE", "4096"))  # Download chunk size
 STREAM_BUFFER_MS = int(os.getenv("VOICEMODE_STREAM_BUFFER_MS", "150"))  # Initial buffer before playback
 STREAM_MAX_BUFFER = float(os.getenv("VOICEMODE_STREAM_MAX_BUFFER", "2.0"))  # Max buffer in seconds
+
+# Split long messages so first audio doesn't wait on the whole message: the
+# first sentence (or clause) is requested alone and the rest is fetched while
+# it plays (voice_mode/tts_split.py). Set false to send one request per message.
+TTS_SPLIT_FIRST = env_bool("VOICEMODE_TTS_SPLIT_FIRST", True)
 
 # Trailing silence appended to TTS audio before stream stop.
 # On macOS CoreAudio (especially with aggregate devices), stream.stop() does

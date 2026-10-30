@@ -6,6 +6,7 @@ by playing audio chunks as they arrive from the TTS service.
 """
 
 import asyncio
+import contextlib
 import io
 import logging
 import time
@@ -32,6 +33,7 @@ from .utils import get_event_logger, update_latest_symlinks
 from . import audio_player
 from . import barge_in
 from .truncation import estimate_truncation
+from .tts_split import split_first_piece
 
 
 
@@ -298,6 +300,125 @@ def _mark_buffered_pause(metrics, text: str, stream, samples_written: int, sampl
         metrics.undelivered_text = text  # unknown split: replay everything
 
 
+class _SplitSpeechResponse:
+    """Streaming-response stand-in that speaks a message as several pieces.
+
+    ``iter_bytes`` yields the first piece's PCM as it arrives. Once that
+    piece's first chunk is in, the next piece is requested in the background
+    and buffered, so it is ready when the first piece's audio runs out.
+    """
+
+    def __init__(self, openai_client, request_params: dict, pieces: list):
+        self._client = openai_client
+        self._params = request_params
+        self._pieces = pieces
+        self._prefetch = None
+        self._gen = None
+        # Set when the remainder could not be fetched (after one retry); the
+        # first piece has already played by then, so the caller records the
+        # remainder as undelivered instead of failing the whole message.
+        self.remainder_failed = False
+        self.remainder_text = " ".join(pieces[1:])
+        self.delivered_text = pieces[0]
+        self.remainder_error = None
+
+    async def _fetch(self, piece: str, out: "asyncio.Queue", chunk_size: int):
+        """Read one piece's chunks into ``out``; None marks the end, an
+        exception object marks a failed request."""
+        try:
+            async with self._client.audio.speech.with_streaming_response.create(
+                **{**self._params, "input": piece}
+            ) as response:
+                async for chunk in response.iter_bytes(chunk_size=chunk_size):
+                    out.put_nowait(chunk)
+            out.put_nowait(None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            out.put_nowait(e)
+
+    def _start_prefetch(self, chunk_size: int) -> "asyncio.Queue":
+        out = asyncio.Queue()
+        self._prefetch = asyncio.ensure_future(
+            self._fetch(self.remainder_text, out, chunk_size)
+        )
+        return out
+
+    def iter_bytes(self, chunk_size: int):
+        self._gen = self._iter_bytes(chunk_size)
+        return self._gen
+
+    async def _iter_bytes(self, chunk_size: int):
+        out = None
+        async with self._client.audio.speech.with_streaming_response.create(
+            **{**self._params, "input": self._pieces[0]}
+        ) as response:
+            async for chunk in response.iter_bytes(chunk_size=chunk_size):
+                if out is None and chunk:
+                    out = self._start_prefetch(chunk_size)
+                yield chunk
+        if out is None:
+            # First piece produced no audio; still speak the rest.
+            out = self._start_prefetch(chunk_size)
+        retried = False
+        yielded = 0
+        while True:
+            item = await out.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                # The first piece already played, so never fail the message:
+                # retry the remainder once (only if none of it was heard, since
+                # a retry restarts it), else report it undelivered.
+                if not retried and yielded == 0:
+                    retried = True
+                    logger.warning(f"TTS remainder failed ({item}); retrying once")
+                    out = self._start_prefetch(chunk_size)
+                    continue
+                logger.error(f"TTS remainder failed ({item}); marking it undelivered")
+                self.remainder_failed = True
+                self.remainder_error = item
+                break
+            yielded += 1
+            yield item
+
+    async def close(self):
+        """Stop the prefetch and close a half-consumed stream (Pause/barge-in)."""
+        if self._gen is not None:
+            await self._gen.aclose()
+        task = self._prefetch
+        if task is not None and not task.done():
+            task.cancel()
+            # wait() does not raise the task's CancelledError, so a cancel of
+            # the caller itself still propagates out of here.
+            await asyncio.wait({task})
+        if task is not None and not task.cancelled():
+            task.exception()  # mark retrieved
+
+
+@contextlib.asynccontextmanager
+async def _tts_response(openai_client, request_params: dict):
+    """``with_streaming_response.create`` for the message, split into a quick
+    first piece plus a prefetched remainder when that helps first-audio time."""
+    from .config import TTS_SPLIT_FIRST
+    text = request_params.get("input")
+    pieces = split_first_piece(text) if TTS_SPLIT_FIRST and isinstance(text, str) else [text]
+    if len(pieces) < 2:
+        async with openai_client.audio.speech.with_streaming_response.create(
+            **request_params
+        ) as response:
+            yield response
+        return
+    logger.info(
+        f"TTS split-first: {len(pieces[0])} chars now, {len(pieces[1])} chars prefetched"
+    )
+    response = _SplitSpeechResponse(openai_client, request_params, pieces)
+    try:
+        yield response
+    finally:
+        await response.close()
+
+
 async def stream_pcm_audio(
     text: str,
     openai_client,
@@ -360,9 +481,7 @@ async def stream_pcm_audio(
         logger.info("Starting true HTTP streaming with iter_bytes()")
         
         # Use the streaming response API
-        async with openai_client.audio.speech.with_streaming_response.create(
-            **request_params
-        ) as response:
+        async with _tts_response(openai_client, request_params) as response:
             chunk_count = 0
             bytes_received = 0
 
@@ -506,6 +625,22 @@ async def stream_pcm_audio(
         else:
             # Wait for playback to finish
             stream.stop()
+
+        if getattr(response, "remainder_failed", False) and not metrics.truncated:
+            # Only the tail is missing: report it the way a cut is reported so
+            # the caller can fold it into the next reply, never replay it all.
+            metrics.truncated = True
+            metrics.delivered_text = response.delivered_text
+            metrics.undelivered_text = response.remainder_text
+            metrics.delivered_fraction = round(
+                len(metrics.delivered_text) / max(1, len(request_params["input"])), 3
+            )
+            metrics.elapsed_audio_seconds = round(bytes_received / (SAMPLE_RATE * 2), 3)
+            metrics.truncation_confidence = "tts-failure"
+            metrics.truncation_basis = (
+                f"TTS server failed on the remainder after one retry ({response.remainder_error}); "
+                "the first part played in full, the rest was not spoken"
+            )
 
         end_time = time.perf_counter()
 
