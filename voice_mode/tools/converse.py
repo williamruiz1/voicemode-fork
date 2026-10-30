@@ -1746,6 +1746,9 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
         
         # Use a queue for thread-safe communication
         import queue
+        # Imported before the stream opens: a cold scipy.signal import takes
+        # ~0.7s+, which used to stall the loop (and Send) on the first chunk.
+        from scipy import signal
         audio_queue = queue.Queue()
         
         # Save stdio state
@@ -1995,7 +1998,6 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                         
                         # For VAD, we need to downsample from 24kHz to 16kHz
                         # Use scipy's resample for proper downsampling
-                        from scipy import signal
                         # Calculate the number of samples we need after resampling
                         resampled_length = int(len(chunk_flat) * vad_sample_rate / SAMPLE_RATE)
                         vad_chunk = signal.resample(chunk_flat, resampled_length)

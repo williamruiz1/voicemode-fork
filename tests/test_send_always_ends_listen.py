@@ -385,3 +385,97 @@ class TestFixedLengthFallback:
         audio = C.record_audio(1.0)
         assert len(audio) == 0
         assert len(calls) == C.DEVICE_RECOVERY_MAX_ATTEMPTS
+
+
+class _MuteFlipStream:
+    """Duplex/input stream that models a device Mute property flip (or another
+    process re-grabbing the AirPods) mid listen: `before` chunks, then the
+    flip's effect, then -- if the stream survives -- live audio again."""
+
+    before = 10
+    effect = "stall"  # "stall" | "status_overflow" | "status_error"
+
+    def __init__(self, **kwargs):
+        self.callback = kwargs["callback"]
+        self.duplex = "device" in kwargs  # sd.Stream gets an (in, out) device pair
+        self._stop = threading.Event()
+
+    def _deliver(self, status=None):
+        if self.duplex:
+            self.callback(_chunk(), np.zeros((CHUNK_SAMPLES, 1), dtype=np.int16), CHUNK_SAMPLES, None, status)
+        else:
+            self.callback(_chunk(), CHUNK_SAMPLES, None, status)
+
+    def __enter__(self):
+        def pump():
+            for _ in range(_MuteFlipStream.before):
+                if self._stop.is_set():
+                    return
+                self._deliver()
+                time.sleep(0.0005)
+            effect = _MuteFlipStream.effect
+            if effect == "stall":
+                return  # IOProc gone: no callbacks, no status, no error
+            if effect == "status_error":
+                self._deliver("Unanticipated host error")
+                return
+            # status_overflow: a non-fatal glitch, then the stream keeps running
+            self._deliver("input overflow")
+            while not self._stop.is_set():
+                self._deliver()
+                time.sleep(0.03)
+        threading.Thread(target=pump, daemon=True).start()
+        return self
+
+    def __exit__(self, *a):
+        self._stop.set()
+        return False
+
+
+@pytest.fixture(params=["input", "bluetooth_duplex"])
+def mute_sim(request, sim, monkeypatch):
+    monkeypatch.setattr(C.sd, "InputStream", _MuteFlipStream)
+    monkeypatch.setattr(C.sd, "Stream", _MuteFlipStream)
+    if request.param == "bluetooth_duplex":
+        monkeypatch.setattr(C, "_bluetooth_input_active", lambda: True)
+        monkeypatch.setattr(C, "_duplex_device_pair", lambda: (95, 96))
+    (sim / "hold-mode").touch()
+    _MuteFlipStream.before = 10
+    return sim
+
+
+class TestMuteFlipDuringHeldListen:
+    """B17 follow-up: something flipped the AirPods input Mute property (or
+    re-grabbed the device) while the held stream was open. Whatever PortAudio
+    does with it -- silent stall, error status, or a benign glitch -- Send ends
+    the listen promptly and the audio captured so far is kept."""
+
+    def test_flip_causes_silent_stall_send_ends(self, mute_sim):
+        _MuteFlipStream.effect = "stall"
+        t, box = _listen_async(max_duration=30.0)
+        _send_and_wait(mute_sim, t, box)
+        assert box["stats"]["end_reason"] == "send"
+        assert len(box["result"][0]) == 10 * CHUNK_SAMPLES
+
+    def test_flip_at_listen_start_stall_send_ends(self, mute_sim):
+        # The flip lands as the listen opens (< 0.5s of audio): the incident.
+        _MuteFlipStream.before = 3
+        _MuteFlipStream.effect = "stall"
+        t, box = _listen_async(max_duration=30.0)
+        _send_and_wait(mute_sim, t, box)
+        assert box["stats"]["end_reason"] == "send"
+
+    def test_flip_causes_error_status_ends_with_audio(self, mute_sim):
+        _MuteFlipStream.effect = "status_error"
+        t, box = _listen_async(max_duration=30.0)
+        t.join(SEND_DEADLINE_S)
+        assert not t.is_alive()
+        assert box["stats"]["end_reason"] == "device_error"
+        assert len(box["result"][0]) == 10 * CHUNK_SAMPLES
+
+    def test_flip_causes_benign_status_listen_continues_then_send(self, mute_sim):
+        _MuteFlipStream.effect = "status_overflow"
+        t, box = _listen_async(max_duration=30.0)
+        _send_and_wait(mute_sim, t, box, after=0.6)
+        assert box["stats"]["end_reason"] == "send"
+        assert len(box["result"][0]) > 10 * CHUNK_SAMPLES  # kept recording past the glitch
