@@ -111,6 +111,7 @@ from voice_mode import audio_player
 from voice_mode import airpods_press
 from voice_mode.pause_resume import resume_after_pause, pause_max_seconds, we_hold_floor
 from voice_mode import barge_in
+from voice_mode import live_transcript
 from voice_mode.statistics_tracking import track_voice_interaction
 from voice_mode.utils import (
     get_event_logger,
@@ -656,7 +657,8 @@ async def speech_to_text(
     audio_data: np.ndarray,
     save_audio: bool = False,
     audio_dir: Optional[Path] = None,
-    transport: str = "local"
+    transport: str = "local",
+    archive_audio: Optional[np.ndarray] = None
 ) -> Optional[Dict]:
     """
     Convert audio to text with automatic failover.
@@ -677,6 +679,8 @@ async def speech_to_text(
         save_audio: Whether to save the audio file permanently
         audio_dir: Directory to save audio files (if save_audio is True)
         transport: Transport method (for logging context)
+        archive_audio: Whole recording to save instead of ``audio_data`` when
+            only the tail is being transcribed (incremental STT)
 
     Returns:
         Dict with transcription result or error information:
@@ -765,10 +769,10 @@ async def speech_to_text(
 
         if STT_SAVE_FORMAT == "wav":
             # Save as uncompressed WAV for full quality archival
-            write(str(save_file_path), SAMPLE_RATE, audio_data)
+            write(str(save_file_path), SAMPLE_RATE, archive_audio if archive_audio is not None else audio_data)
         else:
             # Save in configured compressed format
-            saved_audio = prepare_audio_for_stt(audio_data, STT_SAVE_FORMAT)
+            saved_audio = prepare_audio_for_stt(archive_audio if archive_audio is not None else audio_data, STT_SAVE_FORMAT)
             with open(save_file_path, 'wb') as f:
                 f.write(saved_audio)
 
@@ -818,6 +822,56 @@ async def speech_to_text(
                 pass
 
     return result
+
+
+def _incremental_segment_stt(segment: np.ndarray, transport: str = "local") -> str:
+    """Blocking STT of one finished segment, for IncrementalTranscriber's worker
+    thread (own event loop). "" = no speech; raises on failure so the turn falls
+    back to whole-recording transcription."""
+    result = asyncio.run(speech_to_text(segment, False, None, transport))
+    if not isinstance(result, dict):
+        raise RuntimeError("no STT result")
+    if result.get("error_type") == "no_speech":
+        return ""
+    if "error_type" in result:
+        raise RuntimeError(result["error_type"])
+    return result.get("text") or ""
+
+
+def _make_incremental(turn_id: str, transport: str = "local"):
+    """IncrementalTranscriber publishing user_partial to the live feed, or None
+    when VOICEMODE_INCREMENTAL_STT is off."""
+    if not live_transcript.incremental_stt_enabled():
+        return None
+    client_pid = live_transcript.resolve_client_pid()
+    return live_transcript.IncrementalTranscriber(
+        transcribe=lambda seg: _incremental_segment_stt(seg, transport),
+        sample_rate=SAMPLE_RATE,
+        on_partial=lambda text: live_transcript.append_event("user_partial", turn_id, text, client_pid),
+    )
+
+
+async def _speech_to_text_incremental(audio_data, incremental, save_audio, audio_dir, transport):
+    """Transcribe a finished recording. With finished incremental segments only the
+    untranscribed tail goes to STT and the texts are joined; any segment failure
+    (or a tail failure) falls back to one whole-recording transcription."""
+    collected = None
+    if incremental is not None and incremental.segments_started:
+        collected = await asyncio.get_event_loop().run_in_executor(None, incremental.collect, audio_data)
+    if collected is not None:
+        prefix, tail = collected
+        if len(tail) < SAMPLE_RATE * 0.2:
+            return {"text": prefix, "provider": "incremental"} if prefix else {"error_type": "no_speech", "provider": "incremental"}
+        tail_result = await speech_to_text(tail, save_audio, audio_dir, transport, archive_audio=audio_data)
+        if isinstance(tail_result, dict):
+            if "error_type" not in tail_result:
+                tail_result["text"] = " ".join(t for t in (prefix, tail_result.get("text") or "") if t)
+                return tail_result
+            if tail_result["error_type"] == "no_speech" and prefix:
+                return {"text": prefix, "provider": tail_result.get("provider", "incremental"),
+                        "metrics": tail_result.get("metrics")}
+        logger.warning("incremental STT: tail transcription failed - transcribing whole recording")
+    return await speech_to_text(audio_data, save_audio, audio_dir, transport)
 
 
 async def play_audio_feedback(
@@ -1399,7 +1453,7 @@ def recording_end_event_data(duration: float, samples: int, listen_stats: Option
     return data, starved
 
 
-def _record_held_until_send(fallback_max_duration: float, listen_stats: Optional[dict] = None) -> Tuple[np.ndarray, bool]:
+def _record_held_until_send(fallback_max_duration: float, listen_stats: Optional[dict] = None, incremental=None) -> Tuple[np.ndarray, bool]:
     """Held listen without VAD (disable_silence_detection, or webrtcvad missing):
     stream the mic until turn-end.signal (after MIN_RECORDING_DURATION) or the
     hold ceiling. Plain record_audio() never checks signals, so Send could not
@@ -1426,6 +1480,8 @@ def _record_held_until_send(fallback_max_duration: float, listen_stats: Optional
     _clear_stale_send()
 
     chunks = []
+    if incremental is not None:
+        incremental.begin(None)
     recorded = 0.0
     loop_done = False
     started = time.monotonic()
@@ -1465,6 +1521,8 @@ def _record_held_until_send(fallback_max_duration: float, listen_stats: Optional
                     last_audio_at = time.monotonic()
                     flat = chunk.flatten()
                     chunks.append(flat)
+                    if incremental is not None:
+                        incremental.feed(flat)
                     stats["chunks_processed"] += 1
                     recorded += len(flat) / SAMPLE_RATE
             if stalled and attempt + 1 < DEVICE_RECOVERY_MAX_ATTEMPTS:
@@ -1650,7 +1708,7 @@ def record_audio_with_silence_detection(*args, listen_stats: Optional[dict] = No
         _clear_listening_state()
 
 
-def _record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, yield_check: Optional[Callable[[], bool]] = None, yield_state: Optional[dict] = None, pre_roll: Optional[np.ndarray] = None, pause_check: Optional[Callable[[], bool]] = None, step_away_state: Optional[dict] = None, checkin_callback: Optional[Callable[[], None]] = None, append_window_override_ms: Optional[int] = None, step_away_enabled_override: Optional[bool] = None, supersede_check: Optional[Callable[[], bool]] = None, listen_stats: Optional[dict] = None, listen_pause_check: Optional[Callable[[], bool]] = None, pause_deadline: Optional[float] = None, _device_attempt: int = 0, _listen_t0: Optional[float] = None) -> Tuple[np.ndarray, bool]:
+def _record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, yield_check: Optional[Callable[[], bool]] = None, yield_state: Optional[dict] = None, pre_roll: Optional[np.ndarray] = None, pause_check: Optional[Callable[[], bool]] = None, step_away_state: Optional[dict] = None, checkin_callback: Optional[Callable[[], None]] = None, append_window_override_ms: Optional[int] = None, step_away_enabled_override: Optional[bool] = None, supersede_check: Optional[Callable[[], bool]] = None, listen_stats: Optional[dict] = None, listen_pause_check: Optional[Callable[[], bool]] = None, pause_deadline: Optional[float] = None, incremental=None, _device_attempt: int = 0, _listen_t0: Optional[float] = None) -> Tuple[np.ndarray, bool]:
     """Record audio from microphone with automatic silence detection.
 
     Uses WebRTC VAD to detect when the user stops speaking and automatically
@@ -1757,7 +1815,7 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
     if not VAD_AVAILABLE:
         logger.warning("webrtcvad not available, falling back to fixed duration recording")
         if hold_active():
-            return _record_held_until_send(max_duration, stats)
+            return _record_held_until_send(max_duration, stats, incremental)
         # For fallback, assume speech is present since we can't detect
         stats["end_reason"] = "max_duration"
         _clear_stale_send()
@@ -1771,7 +1829,7 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
         # Held: fixed-length record_audio() never checks signals, so Send
         # could not end it. Stream until Send instead.
         if hold_active():
-            return _record_held_until_send(max_duration, stats)
+            return _record_held_until_send(max_duration, stats, incremental)
         # For fallback, assume speech is present since we can't detect
         stats["end_reason"] = "max_duration"
         _clear_stale_send()
@@ -1827,6 +1885,8 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
         # than being thrown away.
         has_pre_roll = pre_roll is not None and len(pre_roll) > 0
         chunks = [pre_roll] if has_pre_roll else []
+        if incremental is not None:
+            incremental.begin(pre_roll if has_pre_roll else None)
         silence_duration_ms = 0
         recording_duration = (len(pre_roll) / SAMPLE_RATE) if has_pre_roll else 0
         speech_detected = has_pre_roll
@@ -2193,6 +2253,8 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                         # Flatten for consistency
                         chunk_flat = chunk.flatten()
                         chunks.append(chunk_flat)
+                        if incremental is not None:
+                            incremental.feed(chunk_flat)
                         
                         # For VAD, we need to downsample from 24kHz to 16kHz
                         # Use scipy's resample for proper downsampling
@@ -2446,6 +2508,7 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                         listen_stats=stats,
                         listen_pause_check=listen_pause_check,
                         pause_deadline=pause_deadline,
+                        incremental=incremental,
                         _device_attempt=_device_attempt + 1,
                         _listen_t0=_t0,
                     )
@@ -2721,6 +2784,8 @@ consult the MCP resources listed above.
     result = None
     success = False
     conch = Conch(agent_name="converse")  # Named for event logging
+    _turn_id = session_id or f"conv_{int(time.time() * 1000)}"
+    _incremental = None
 
     # AirPods press watcher for the whole call (TTS + listen); closed in finally.
     _press_session = airpods_press.session()
@@ -2817,6 +2882,8 @@ consult the MCP resources listed above.
             async with audio_operation_lock:
                 # Speak the message
                 tts_start = time.perf_counter()
+                if not should_skip_tts:
+                    live_transcript.append_event("agent", _turn_id, message)
                 _held_floor_at_start = we_hold_floor() is True
                 barge_in_result = None  # set below only when natural mode actually armed a listener
                 # Clear any barge-in flag left set by a prior turn before we
@@ -3135,7 +3202,9 @@ consult the MCP resources listed above.
                         logger.debug(f"step-away check-in failed (ignored): {_e}")
 
                 listen_stats = {}
+                _incremental = _make_incremental(_turn_id, transport)
                 _record_call = _listen_call(
+                    incremental=_incremental,
                     pre_roll=(barge_in_result.pre_roll if natural_mode_barge_in else None),
                     step_away_state=step_away_state,
                     checkin_callback=(_stepaway_checkin if _sa_on else None),
@@ -3259,7 +3328,8 @@ consult the MCP resources listed above.
                         event_logger.log_event(event_logger.STT_START)
 
                     stt_start = time.perf_counter()
-                    stt_result = await speech_to_text(audio_data, SAVE_AUDIO, AUDIO_DIR if SAVE_AUDIO else None, transport)
+                    stt_result = await _speech_to_text_incremental(
+                        audio_data, _incremental, SAVE_AUDIO, AUDIO_DIR if SAVE_AUDIO else None, transport)
                     timings['stt'] = time.perf_counter() - stt_start
 
                     # Handle structured STT result
@@ -3318,6 +3388,8 @@ consult the MCP resources listed above.
                         # Should not happen with new code, but handle gracefully
                         response_text = None
                         stt_provider = "unknown"
+
+                live_transcript.append_event("user_final", _turn_id, response_text or "")
 
                 # Spoken step-away / resume keywords (founder-os#11655). Inert unless
                 # step-away is armed. A whole-utterance "hold on" sets the pause flag
@@ -3457,6 +3529,7 @@ consult the MCP resources listed above.
                                 response_text = stt_result.get("text")
                                 stt_provider = stt_result.get("provider", "unknown")
                                 logger.info(f"New response after repeat: {response_text}")
+                                live_transcript.append_event("user_final", _turn_id, response_text or "")
 
                 # Check for wait phrase - if detected, pause for configured duration
                 if response_text and should_wait(response_text):
@@ -3526,6 +3599,7 @@ consult the MCP resources listed above.
                                 response_text = stt_result.get("text")
                                 stt_provider = stt_result.get("provider", "unknown")
                                 logger.info(f"New response after wait: {response_text}")
+                                live_transcript.append_event("user_final", _turn_id, response_text or "")
 
                 # Log STT complete with metrics
                 if event_logger:
@@ -3765,6 +3839,8 @@ consult the MCP resources listed above.
 
     finally:
         _press_session.__exit__(None, None, None)
+        if _incremental is not None:
+            _incremental.close()  # idempotent; frees the STT worker if the turn ended before collect
 
         # Drop any yield request we wrote while waiting (own-pid guarded no-op
         # if we never requested or another waiter's request is newer).
