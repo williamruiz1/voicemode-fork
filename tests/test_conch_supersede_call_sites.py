@@ -244,3 +244,44 @@ class TestMidUtteranceSupersessionSurfacedByConverse:
             )
         assert "hello there" in result, "his words must not be discarded"
         assert "floor lost mid-utterance" in result.lower()
+
+
+class TestLiveFeedFinalAfterRelisten:
+    """The live feed's last user_final must be the text converse returns, even
+    when the first transcript was a wait/repeat phrase and a re-listen replaced it."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("first_phrase", ["hold on, wait", "please repeat"])
+    async def test_last_user_final_is_relisten_text(self, clean_conch, tmp_path, first_phrase):
+        import json
+        from voice_mode import live_transcript
+        from voice_mode.tools.converse import converse
+
+        feed = tmp_path / "feed.jsonl"
+
+        def _record(*args, **kwargs):
+            return (_SPEECH_AUDIO.copy(), True)
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(live_transcript, "feed_path", lambda: feed))
+            stack.enter_context(patch.object(live_transcript, "resolve_client_pid", lambda: None))
+            stack.enter_context(patch("voice_mode.tools.converse.record_audio_with_silence_detection",
+                                      side_effect=_record))
+            stack.enter_context(patch("voice_mode.tools.converse.WAIT_DURATION", 0.01))
+            stack.enter_context(patch(
+                "voice_mode.simple_failover.simple_stt_failover",
+                new=AsyncMock(side_effect=[
+                    {"text": first_phrase, "provider": "test"},
+                    {"text": "yes ship it", "provider": "test"},
+                ]),
+            ))
+            _patch_tts_and_system_audio(stack)
+            result = await getattr(converse, "fn", converse)(
+                message="Test message", wait_for_response=True, chime_enabled=False)
+
+        rows = [json.loads(l) for l in feed.read_text().splitlines()]
+        finals = [r for r in rows if r["kind"] == "user_final"]
+        assert finals[0]["text"] == first_phrase
+        assert finals[-1]["text"] == "yes ship it"
+        assert len({r["turn_id"] for r in rows}) == 1
+        assert "yes ship it" in result

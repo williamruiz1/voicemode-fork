@@ -150,3 +150,38 @@ def test_recorders_feed_incremental(monkeypatch):
     inc = FakeInc()
     audio, ok = cv._record_held_until_send(5.0, {}, inc)
     assert ok and inc.began == 1 and inc.fed == len(audio) > 0
+
+
+def test_default_vad_recorder_feeds_incremental(monkeypatch):
+    """The default (webrtcvad) recorder, driven through a mocked queue with real
+    committed audio, begins and feeds the transcriber; no mic is opened."""
+    from pathlib import Path
+    from unittest.mock import MagicMock
+    from scipy.io import wavfile
+
+    wav = Path(__file__).parent / "fixtures" / "endpointing" / "clean_speech_then_pause.wav"
+    if not wav.exists():
+        pytest.skip("endpointing fixtures not generated")
+    sr, data = wavfile.read(wav)
+    assert sr == SR
+    n = int(SR * cv.VAD_CHUNK_DURATION_MS / 1000)
+    full = np.concatenate([np.asarray(data, dtype=np.int16).reshape(-1), np.zeros(5 * SR, dtype=np.int16)])
+    chunks = [full[i:i + n].reshape(-1, 1) for i in range(0, len(full) - n + 1, n)]
+
+    class FakeInc:
+        def __init__(self): self.began, self.fed = [], 0
+        def begin(self, pre): self.began.append(pre)
+        def feed(self, c): self.fed += len(c)
+
+    q = MagicMock()
+    q.get.side_effect = list(chunks)
+    inc = FakeInc()
+    with patch.object(cv, "ENDPOINTING_ENABLED", False), \
+         patch.object(cv, "sd") as sd, \
+         patch("queue.Queue", return_value=q):
+        sd.InputStream.return_value.__enter__.return_value = MagicMock()
+        sd.InputStream.return_value.__exit__.return_value = False
+        audio, speech = cv.record_audio_with_silence_detection(8.0, incremental=inc)
+    assert speech and len(audio) > 0
+    assert inc.began == [None]
+    assert inc.fed == len(audio)         # every recorded sample was offered to the transcriber

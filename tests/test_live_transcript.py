@@ -309,3 +309,46 @@ def test_env_gate(monkeypatch):
     assert lt.incremental_stt_enabled()
     monkeypatch.setenv("VOICEMODE_INCREMENTAL_STT", "false")
     assert not lt.incremental_stt_enabled()
+
+
+def test_stale_segment_cannot_write_after_begin_reset():
+    """A segment still running from an earlier recording must not touch the new state."""
+    import threading
+    gate, started = threading.Event(), threading.Event()
+    seen = []
+
+    def slow_then_text(seg):
+        started.set()
+        gate.wait(5)
+        return "stale-text"
+
+    partials = []
+    inc = lt.IncrementalTranscriber(slow_then_text, SR, on_partial=partials.append, min_segment_s=6.0)
+    inc.begin(None)
+    feed_all(inc, talk_with_pauses(14))
+    assert started.wait(5)
+    inc.begin(None)            # restart with unrelated audio -> reset while segment 0 is mid-flight
+    gen_after = inc._gen
+    gate.set()
+    inc._pool.shutdown(wait=True)
+    assert inc._texts == {} and not inc._failed and partials == []
+    assert inc._gen == gen_after
+
+
+def test_stale_segment_failure_does_not_poison_new_recording():
+    import threading
+    gate, started = threading.Event(), threading.Event()
+
+    def boom(seg):
+        started.set()
+        gate.wait(5)
+        raise RuntimeError("late failure")
+
+    inc = lt.IncrementalTranscriber(boom, SR, min_segment_s=6.0)
+    inc.begin(None)
+    feed_all(inc, talk_with_pauses(14))
+    assert started.wait(5)
+    inc.begin(None)
+    gate.set()
+    inc._pool.shutdown(wait=True)
+    assert not inc._failed

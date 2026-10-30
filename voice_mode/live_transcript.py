@@ -192,6 +192,8 @@ class IncrementalTranscriber:
         self._reset()
 
     def _reset(self) -> None:
+        # Generation: a segment still running from before a reset must not write into the new state.
+        self._gen = getattr(self, "_gen", 0) + 1
         self._buf: List[np.ndarray] = []
         self._buf_len = 0
         self._consumed = 0          # samples already handed to the worker
@@ -267,17 +269,20 @@ class IncrementalTranscriber:
         self._consumed += len(segment)
         self._fingerprint = self._crc(segment)  # same as crc of the recording's prefix ending here
         idx = len(self._futures)
-        self._futures.append(self._pool.submit(self._run_segment, idx, segment))
+        self._futures.append(self._pool.submit(self._run_segment, self._gen, idx, segment))
 
-    def _run_segment(self, idx: int, segment: np.ndarray) -> None:
+    def _run_segment(self, gen: int, idx: int, segment: np.ndarray) -> None:
         try:
             text = (self._transcribe(segment) or "").strip()
         except Exception as e:
             logger.warning(f"incremental STT segment {idx} failed: {e}")
             with self._lock:
-                self._failed = True
+                if gen == self._gen:
+                    self._failed = True
             return
         with self._lock:
+            if gen != self._gen:
+                return  # stale: the recording was restarted while this ran
             self._texts[idx] = text
             # Only the contiguous prefix of finished segments is a valid cumulative text.
             ordered, i = [], 0

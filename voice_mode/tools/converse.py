@@ -3529,6 +3529,7 @@ consult the MCP resources listed above.
                                 response_text = stt_result.get("text")
                                 stt_provider = stt_result.get("provider", "unknown")
                                 logger.info(f"New response after repeat: {response_text}")
+                                live_transcript.append_event("user_final", _turn_id, response_text or "")
 
                 # Check for wait phrase - if detected, pause for configured duration
                 if response_text and should_wait(response_text):
@@ -3598,6 +3599,7 @@ consult the MCP resources listed above.
                                 response_text = stt_result.get("text")
                                 stt_provider = stt_result.get("provider", "unknown")
                                 logger.info(f"New response after wait: {response_text}")
+                                live_transcript.append_event("user_final", _turn_id, response_text or "")
 
                 # Log STT complete with metrics
                 if event_logger:
