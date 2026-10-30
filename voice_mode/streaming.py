@@ -314,6 +314,13 @@ class _SplitSpeechResponse:
         self._pieces = pieces
         self._prefetch = None
         self._gen = None
+        # Set when the remainder could not be fetched (after one retry); the
+        # first piece has already played by then, so the caller records the
+        # remainder as undelivered instead of failing the whole message.
+        self.remainder_failed = False
+        self.remainder_text = " ".join(pieces[1:])
+        self.delivered_text = pieces[0]
+        self.remainder_error = None
 
     async def _fetch(self, piece: str, out: "asyncio.Queue", chunk_size: int):
         """Read one piece's chunks into ``out``; None marks the end, an
@@ -333,7 +340,7 @@ class _SplitSpeechResponse:
     def _start_prefetch(self, chunk_size: int) -> "asyncio.Queue":
         out = asyncio.Queue()
         self._prefetch = asyncio.ensure_future(
-            self._fetch(" ".join(self._pieces[1:]), out, chunk_size)
+            self._fetch(self.remainder_text, out, chunk_size)
         )
         return out
 
@@ -353,22 +360,40 @@ class _SplitSpeechResponse:
         if out is None:
             # First piece produced no audio; still speak the rest.
             out = self._start_prefetch(chunk_size)
+        retried = False
+        yielded = 0
         while True:
             item = await out.get()
             if item is None:
                 break
             if isinstance(item, Exception):
-                raise item
+                # The first piece already played, so never fail the message:
+                # retry the remainder once (only if none of it was heard, since
+                # a retry restarts it), else report it undelivered.
+                if not retried and yielded == 0:
+                    retried = True
+                    logger.warning(f"TTS remainder failed ({item}); retrying once")
+                    out = self._start_prefetch(chunk_size)
+                    continue
+                logger.error(f"TTS remainder failed ({item}); marking it undelivered")
+                self.remainder_failed = True
+                self.remainder_error = item
+                break
+            yielded += 1
             yield item
 
     async def close(self):
         """Stop the prefetch and close a half-consumed stream (Pause/barge-in)."""
         if self._gen is not None:
             await self._gen.aclose()
-        if self._prefetch is not None and not self._prefetch.done():
-            self._prefetch.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._prefetch
+        task = self._prefetch
+        if task is not None and not task.done():
+            task.cancel()
+            # wait() does not raise the task's CancelledError, so a cancel of
+            # the caller itself still propagates out of here.
+            await asyncio.wait({task})
+        if task is not None and not task.cancelled():
+            task.exception()  # mark retrieved
 
 
 @contextlib.asynccontextmanager
@@ -600,6 +625,22 @@ async def stream_pcm_audio(
         else:
             # Wait for playback to finish
             stream.stop()
+
+        if getattr(response, "remainder_failed", False) and not metrics.truncated:
+            # Only the tail is missing: report it the way a cut is reported so
+            # the caller can fold it into the next reply, never replay it all.
+            metrics.truncated = True
+            metrics.delivered_text = response.delivered_text
+            metrics.undelivered_text = response.remainder_text
+            metrics.delivered_fraction = round(
+                len(metrics.delivered_text) / max(1, len(request_params["input"])), 3
+            )
+            metrics.elapsed_audio_seconds = round(bytes_received / (SAMPLE_RATE * 2), 3)
+            metrics.truncation_confidence = "tts-failure"
+            metrics.truncation_basis = (
+                f"TTS server failed on the remainder after one retry ({response.remainder_error}); "
+                "the first part played in full, the rest was not spoken"
+            )
 
         end_time = time.perf_counter()
 

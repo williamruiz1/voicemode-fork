@@ -3,6 +3,7 @@ first piece, and streaming plays it, then the prefetched rest, with no gap and
 with Pause / failure behaviour intact."""
 
 import asyncio
+import time
 
 import numpy as np
 import pytest
@@ -204,10 +205,38 @@ class TestSplitPlayback:
         ok, m, stream = await _run(client, monkeypatch, text="Hello there.")
         assert ok and client.requests == ["Hello there."]
 
-    async def test_rest_failure_surfaces_as_failure(self, monkeypatch):
+    async def test_rest_failure_never_replays_whole_message(self, monkeypatch):
+        """Remainder fails after the first piece played: still ok, remainder
+        retried once, tail recorded undelivered, first piece not repeated."""
         client = _RecordingClient({FIRST: _chunks(100), REST: _chunks(200)}, fail_on=REST)
         ok, m, stream = await _run(client, monkeypatch)
-        assert not ok
+        assert ok, "must not return failure (core.py would replay the full text)"
+        assert client.requests == [FIRST, REST, REST]  # remainder retried once
+        assert FIRST not in client.requests[1:]
+        assert [int(w[0]) for w in stream.written] == [100] * 3  # first piece once, no replay
+        assert m.truncated and not m.paused
+        assert m.undelivered_text == REST
+        assert m.delivered_text == FIRST
+        assert m.truncation_confidence == "tts-failure"
+
+    async def test_rest_retry_succeeds(self, monkeypatch):
+        client = _RecordingClient({FIRST: _chunks(100), REST: _chunks(200)})
+        calls = {"n": 0}
+        orig = _Response.iter_bytes
+
+        async def flaky(self, chunk_size=None):
+            if self.text == REST:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise RuntimeError("blip")
+            async for c in orig(self, chunk_size):
+                yield c
+
+        monkeypatch.setattr(_Response, "iter_bytes", flaky)
+        ok, m, stream = await _run(client, monkeypatch)
+        assert ok and not m.truncated
+        assert client.requests == [FIRST, REST, REST]
+        assert [int(w[0]) for w in stream.written] == [100] * 3 + [200] * 3
 
     async def test_pause_during_first_piece_stops_and_cancels_prefetch(self, monkeypatch):
         client = _RecordingClient({FIRST: _chunks(100, 10), REST: _chunks(200, 10)},
@@ -224,7 +253,19 @@ class TestSplitPlayback:
             orig(self, samples)
 
         monkeypatch.setattr(_FakeOutputStream, "write", write)
+        tasks = []
+        orig_start = streaming._SplitSpeechResponse._start_prefetch
+
+        def spy(self, chunk_size):
+            q = orig_start(self, chunk_size)
+            tasks.append(self._prefetch)
+            return q
+
+        monkeypatch.setattr(streaming._SplitSpeechResponse, "_start_prefetch", spy)
+        t0 = time.perf_counter()
         ok, m, stream = await asyncio.wait_for(_run(client, monkeypatch), timeout=2)
+        assert time.perf_counter() - t0 < 1.0, "close() waited out the slow prefetch"
+        assert len(tasks) == 1 and tasks[0].cancelled(), "prefetch task was not cancelled"
         assert ok and m.paused and m.truncated
         assert len(stream.written) == 2
         assert m.undelivered_text
