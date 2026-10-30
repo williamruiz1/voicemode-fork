@@ -6,6 +6,7 @@ by playing audio chunks as they arrive from the TTS service.
 """
 
 import asyncio
+import contextlib
 import io
 import logging
 import time
@@ -32,6 +33,7 @@ from .utils import get_event_logger, update_latest_symlinks
 from . import audio_player
 from . import barge_in
 from .truncation import estimate_truncation
+from .tts_split import split_first_piece
 
 
 
@@ -298,6 +300,100 @@ def _mark_buffered_pause(metrics, text: str, stream, samples_written: int, sampl
         metrics.undelivered_text = text  # unknown split: replay everything
 
 
+class _SplitSpeechResponse:
+    """Streaming-response stand-in that speaks a message as several pieces.
+
+    ``iter_bytes`` yields the first piece's PCM as it arrives. Once that
+    piece's first chunk is in, the next piece is requested in the background
+    and buffered, so it is ready when the first piece's audio runs out.
+    """
+
+    def __init__(self, openai_client, request_params: dict, pieces: list):
+        self._client = openai_client
+        self._params = request_params
+        self._pieces = pieces
+        self._prefetch = None
+        self._gen = None
+
+    async def _fetch(self, piece: str, out: "asyncio.Queue", chunk_size: int):
+        """Read one piece's chunks into ``out``; None marks the end, an
+        exception object marks a failed request."""
+        try:
+            async with self._client.audio.speech.with_streaming_response.create(
+                **{**self._params, "input": piece}
+            ) as response:
+                async for chunk in response.iter_bytes(chunk_size=chunk_size):
+                    out.put_nowait(chunk)
+            out.put_nowait(None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            out.put_nowait(e)
+
+    def _start_prefetch(self, chunk_size: int) -> "asyncio.Queue":
+        out = asyncio.Queue()
+        self._prefetch = asyncio.ensure_future(
+            self._fetch(" ".join(self._pieces[1:]), out, chunk_size)
+        )
+        return out
+
+    def iter_bytes(self, chunk_size: int):
+        self._gen = self._iter_bytes(chunk_size)
+        return self._gen
+
+    async def _iter_bytes(self, chunk_size: int):
+        out = None
+        async with self._client.audio.speech.with_streaming_response.create(
+            **{**self._params, "input": self._pieces[0]}
+        ) as response:
+            async for chunk in response.iter_bytes(chunk_size=chunk_size):
+                if out is None and chunk:
+                    out = self._start_prefetch(chunk_size)
+                yield chunk
+        if out is None:
+            # First piece produced no audio; still speak the rest.
+            out = self._start_prefetch(chunk_size)
+        while True:
+            item = await out.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    async def close(self):
+        """Stop the prefetch and close a half-consumed stream (Pause/barge-in)."""
+        if self._gen is not None:
+            await self._gen.aclose()
+        if self._prefetch is not None and not self._prefetch.done():
+            self._prefetch.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._prefetch
+
+
+@contextlib.asynccontextmanager
+async def _tts_response(openai_client, request_params: dict):
+    """``with_streaming_response.create`` for the message, split into a quick
+    first piece plus a prefetched remainder when that helps first-audio time."""
+    from .config import TTS_SPLIT_FIRST
+    text = request_params.get("input")
+    pieces = split_first_piece(text) if TTS_SPLIT_FIRST and isinstance(text, str) else [text]
+    if len(pieces) < 2:
+        async with openai_client.audio.speech.with_streaming_response.create(
+            **request_params
+        ) as response:
+            yield response
+        return
+    logger.info(
+        f"TTS split-first: {len(pieces[0])} chars now, {len(pieces[1])} chars prefetched"
+    )
+    response = _SplitSpeechResponse(openai_client, request_params, pieces)
+    try:
+        yield response
+    finally:
+        await response.close()
+
+
 async def stream_pcm_audio(
     text: str,
     openai_client,
@@ -360,9 +456,7 @@ async def stream_pcm_audio(
         logger.info("Starting true HTTP streaming with iter_bytes()")
         
         # Use the streaming response API
-        async with openai_client.audio.speech.with_streaming_response.create(
-            **request_params
-        ) as response:
+        async with _tts_response(openai_client, request_params) as response:
             chunk_count = 0
             bytes_received = 0
 
