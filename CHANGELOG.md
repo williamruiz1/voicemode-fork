@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Live transcript feed** — VoiceMode now appends each turn to `~/.voicemode/live-transcript.jsonl` as it happens: the agent's message when speech starts (`agent`), the listener's words so far while the mic is open (`user_partial`), and the final transcript (`user_final`, also after a "wait"/"repeat" re-listen). Each line carries `turn_id`, `server_pid` and the calling Claude Code `client_pid` (stdio parent, or the shared daemon's resolved caller), so an on-screen widget can show the conversation as each party speaks. The file is truncated at 1 MB or on the first write of a new day; writes never block or fail a call. ([#39](https://github.com/williamruiz1/voicemode-fork/pull/39))
+
+### Changed
+
+- **Long turns are transcribed while you talk (B27)** — Recordings are cut into segments at natural pauses and transcribed in the background during the listen, so after Send only the last few seconds remain to transcribe instead of the whole recording. Any segment failure falls back to one whole-recording transcription. Disable with `VOICEMODE_INCREMENTAL_STT=false`. ([#39](https://github.com/williamruiz1/voicemode-fork/pull/39))
+- **Speech starts quickly regardless of message length** — With streamed PCM TTS (the mlx-audio/Kokoro path), messages of 100+ characters are spoken as a short first piece (first sentence or clause) while the rest is generated in the background, so first audio no longer waits for the whole message (measured median 0.39 s → 0.13 s on 180–200-character messages). If the remainder fails it is retried once, then the turn is marked truncated instead of replaying the whole message; Pause and barge-in cancel the prefetch. Disable with `VOICEMODE_TTS_SPLIT_FIRST=false`. ([#38](https://github.com/williamruiz1/voicemode-fork/pull/38))
+
 ### Fixed
 
 - **AirPods stem press now actually sends (macOS)** — A stem press during a listen played the AirPods' reject chime ("doo-doo-doo") and did nothing. The system log showed why: audiomxd found VoiceMode as the recording app with a handler but refused it, "audio app is not allowed to input mute (isOptedIn: 0, hasHandler: 1)". Apple's opt-in is observing `AVAudioApplicationInputMuteStateChangeNotification`, which VoiceMode never did. It now adds that observer once per process (it sets `PrefersBluetoothAccessoryMutingMacOS`, which stays set for the process's life) before registering the handler. Every opt-in, registration, handler call (mute value, thread, timestamp), notification and unregister is logged to `~/.voicemode/logs/airpods.log` (rotates at 512 KB).
