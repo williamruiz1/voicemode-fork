@@ -701,7 +701,7 @@ async def play_chime_start(
         chime_float = chime.astype(np.float32) / 32768.0
         # Use non-blocking audio player to avoid interference with concurrent playback
         player = NonBlockingAudioPlayer()
-        player.play(chime_float, sample_rate, blocking=True)
+        await asyncio.to_thread(player.play, chime_float, sample_rate, blocking=True)
         return True
     except Exception as e:
         logger.debug(f"Could not play start chime: {e}")
@@ -735,7 +735,7 @@ async def play_chime_end(
         chime_float = chime.astype(np.float32) / 32768.0
         # Use non-blocking audio player to avoid interference with concurrent playback
         player = NonBlockingAudioPlayer()
-        player.play(chime_float, sample_rate, blocking=True)
+        await asyncio.to_thread(player.play, chime_float, sample_rate, blocking=True)
         return True
     except Exception as e:
         logger.debug(f"Could not play end chime: {e}")
@@ -782,7 +782,7 @@ async def play_system_audio(message_key: str, fallback_text: Optional[str] = Non
 
             # Use non-blocking audio player to avoid interference with concurrent playback
             player = NonBlockingAudioPlayer()
-            player.play(samples, audio.frame_rate, blocking=True)
+            await asyncio.to_thread(player.play, samples, audio.frame_rate, blocking=True)
 
             logger.info(f"✓ System audio played successfully: {message_key}")
             return True

@@ -45,7 +45,7 @@ from typing import List, Optional
 import numpy as np
 import sounddevice as sd
 
-from voice_mode import audio_player
+from voice_mode import audio_player, audio_stop
 from voice_mode.aec import (
     EchoCanceller,
     SpeexEchoCanceller,
@@ -483,11 +483,7 @@ class BargeInListener:
         if self._thread is not None:
             self._thread.join(timeout=1.0)
         if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
+            audio_stop.stop_stream(self._stream)
             self._stream = None
 
         with self._result_lock:

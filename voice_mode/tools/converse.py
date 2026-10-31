@@ -109,7 +109,8 @@ from voice_mode.core import (
 from voice_mode.audio_player import NonBlockingAudioPlayer, SPEAKING_FLAG_PATH, convomode_paused, PAUSE_FLAG_PATH
 from voice_mode import audio_player
 from voice_mode import airpods_press
-from voice_mode.pause_resume import resume_after_pause, pause_max_seconds, we_hold_floor
+from voice_mode.pause_resume import dismissed_from_voice, resume_after_pause, pause_max_seconds, we_hold_floor
+from voice_mode import activity, audio_stop
 from voice_mode import barge_in
 from voice_mode import live_transcript
 from voice_mode.statistics_tracking import track_voice_interaction
@@ -1013,8 +1014,8 @@ def _record_audio_duplex(samples_to_record: int, honor_send: bool = False) -> np
     device = _duplex_device_pair()
     logger.info(f"🎧 Bluetooth input — full-duplex capture (F1), device pair {device}")
     deadline = _time.monotonic() + samples_to_record / SAMPLE_RATE + 2.0
-    with sd.Stream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
-                   device=device, callback=_callback):
+    with audio_stop.guarded(sd.Stream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
+                                      device=device, callback=_callback)):
         while remaining[0] > 0 and _time.monotonic() < deadline:
             if honor_send and _send_pending():
                 logger.info("✓ Manual turn-end signal received — stopping fixed-length recording")
@@ -1170,6 +1171,15 @@ def record_audio(duration: float, honor_send: bool = False, _attempt: int = 0) -
             sys.stdout = original_stdout
         if sys.stderr != original_stderr:
             sys.stderr = original_stderr
+
+
+DISMISSED_RESULT = ("[DISMISSED] The user dismissed you from voice, so nothing was spoken and the mic "
+                    "stayed closed. Reply in text only until the user runs /convomode again.")
+
+AUDIO_STUCK_RESULT = ("[AUDIO STUCK] An audio stream stopped responding, so this server can't open another "
+                      "one and the mic stayed closed. Anything already spoken was heard. The shared service "
+                      "restarts itself: call converse again in a few seconds. A tab with its own voice "
+                      "server needs /mcp to reconnect.")
 
 
 async def _preempt_conch_after_tts_grace(conch: Conch, speaking_flag_path: str = None) -> bool:
@@ -1524,7 +1534,7 @@ def _record_held_until_send(fallback_max_duration: float, listen_stats: Optional
                 stream_ctx = sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16,
                                             callback=_callback, blocksize=chunk_samples)
             stalled = False
-            with stream_ctx:
+            with audio_stop.guarded(stream_ctx):
                 last_audio_at = time.monotonic()
                 # Wall-clock backstop: a stream that stops delivering never
                 # advances `recorded`, and a held listen must still end.
@@ -2002,7 +2012,7 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                                             dtype=np.int16,
                                             callback=audio_callback,
                                             blocksize=chunk_samples)
-            with stream_ctx:
+            with audio_stop.guarded(stream_ctx):
                 
                 logger.debug("Started continuous audio stream")
 
@@ -2767,10 +2777,13 @@ consult the MCP resources listed above.
     await startup_initialization()
     
     # Refresh audio device cache to pick up any device changes (AirPods, etc.)
-    # This takes ~1ms and ensures we use the current default device
+    # This takes ~1ms and ensures we use the current default device.
+    # Pa_Terminate closes every stream in the process, so not while another tab's
+    # call on the shared service is using one, and not with an abandoned stream.
     import sounddevice as sd
-    sd._terminate()
-    sd._initialize()
+    if not audio_operation_lock.locked() and not audio_stop.stuck():
+        sd._terminate()
+        sd._initialize()
     
     # Get event logger and start session
     event_logger = get_event_logger()
@@ -2817,8 +2830,17 @@ consult the MCP resources listed above.
     # AirPods press watcher for the whole call (TTS + listen); closed in finally.
     _press_session = airpods_press.session()
     _press_session.__enter__()
+    activity.log("call_start", wait_for_mic=bool(wait_for_conch), speaks=not should_skip_tts,
+                 listens=bool(wait_for_response))
 
     try:
+        if dismissed_from_voice():
+            activity.log("call_refused_dismissed", at="start")
+            return DISMISSED_RESULT
+        if audio_stop.stuck():
+            activity.log("call_refused_audio_stuck", at="start")
+            return AUDIO_STUCK_RESULT
+
         # Try to acquire conch atomically (no race condition)
         # skip_conch=true bypasses coordination entirely: don't acquire, don't
         # check the holder, don't release. Speak regardless of who else has it.
@@ -2851,8 +2873,12 @@ consult the MCP resources listed above.
                         "timeout": CONCH_TIMEOUT
                     })
 
+                activity.log("mic_wait", holder=holder_agent)
                 waited = 0.0
                 while not conch.try_acquire() and waited < CONCH_TIMEOUT:
+                    if dismissed_from_voice():
+                        activity.log("call_refused_dismissed", at="waiting_for_mic", waited_seconds=round(waited, 1))
+                        return DISMISSED_RESULT
                     # Ask a merely-listening holder to hand the mic over
                     # (vibedispatcher#132). Refreshed every poll so the request
                     # stays fresh; an idle holder yields within seconds.
@@ -2862,9 +2888,13 @@ consult the MCP resources listed above.
                     waited += CONCH_CHECK_INTERVAL
 
                 if not conch._acquired and CONCH_YIELD_ENABLED:
+                    if dismissed_from_voice():
+                        activity.log("call_refused_dismissed", at="waiting_for_mic", waited_seconds=round(waited, 1))
+                        return DISMISSED_RESULT
                     # Hard timeout: preempt-and-acquire instead of failing — but
                     # NEVER mid-utterance (see _preempt_conch_after_tts_grace).
                     await _preempt_conch_after_tts_grace(conch)
+                    activity.log("mic_taken_by_force", from_holder=holder_agent, waited_seconds=round(waited, 1))
 
                 Conch.clear_yield_request(owner=conch.owner)
 
@@ -2878,7 +2908,17 @@ consult the MCP resources listed above.
                 if not conch._acquired:
                     return f"Timed out waiting for conch ({CONCH_TIMEOUT}s). {holder_agent} is still speaking."
 
+            # A dismissal that landed while this call was waiting.
+            if dismissed_from_voice():
+                activity.log("call_refused_dismissed", at="got_mic")
+                return DISMISSED_RESULT
+
+            if audio_stop.stuck():
+                activity.log("call_refused_audio_stuck", at="got_mic")
+                return AUDIO_STUCK_RESULT
+
             # Successfully acquired
+            activity.log("mic_taken")
             if event_logger:
                 event_logger.log_event("CONCH_ACQUIRE", {
                     "pid": os.getpid(),
@@ -2911,6 +2951,7 @@ consult the MCP resources listed above.
                 tts_start = time.perf_counter()
                 if not should_skip_tts:
                     live_transcript.append_event("agent", _turn_id, message)
+                    activity.log("speak_start", chars=len(message))
                 _held_floor_at_start = we_hold_floor() is True
                 barge_in_result = None  # set below only when natural mode actually armed a listener
                 # Clear any barge-in flag left set by a prior turn before we
@@ -3134,6 +3175,16 @@ consult the MCP resources listed above.
                     # with the audio the barge-in listener already captured.
                     logger.info("🎤 Natural mode barge-in — continuing to listen without a chime")
                 else:
+                    # Dismissed while speaking: don't open the mic.
+                    if dismissed_from_voice():
+                        activity.log("call_refused_dismissed", at="before_listen")
+                        return DISMISSED_RESULT
+
+                    # A stuck speech stream: anything else opened here would block too.
+                    if audio_stop.stuck():
+                        activity.log("call_refused_audio_stuck", at="before_listen")
+                        return AUDIO_STUCK_RESULT
+
                     # Brief pause before listening
                     await asyncio.sleep(0.5)
 
@@ -3150,7 +3201,12 @@ consult the MCP resources listed above.
                     # Record response
                     logger.info(f"🎤 Listening for {listen_duration_max} seconds...")
 
+                if audio_stop.stuck():
+                    activity.log("call_refused_audio_stuck", at="before_record")
+                    return AUDIO_STUCK_RESULT
+
                 # Log recording start
+                activity.log("listen_start")
                 if event_logger:
                     event_logger.log_event(event_logger.RECORDING_START)
 
@@ -3866,6 +3922,7 @@ consult the MCP resources listed above.
         return result
 
     finally:
+        activity.log("call_end", seconds=round(time.time() - start_time, 1), success=success)
         _press_session.__exit__(None, None, None)
         if _incremental is not None:
             _incremental.close()  # idempotent; frees the STT worker if the turn ended before collect

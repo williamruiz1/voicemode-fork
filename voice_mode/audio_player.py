@@ -14,7 +14,12 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 
+from . import audio_stop
+
 logger = logging.getLogger("voicemode.audio_player")
+
+# Longest wait for the callback's own stop before stopping anyway.
+STREAM_FINISH_WAIT_SECONDS = 2.0
 
 # --- Convomode live pause (interrupt mid-sentence) ---------------------------
 # The menu-bar widget (or `convomode-floor.py`) can pause live speech the instant
@@ -274,6 +279,8 @@ class NonBlockingAudioPlayer:
         self.buffer_size = buffer_size
         self.audio_queue: Optional[queue.Queue] = None
         self.stream: Optional[sd.OutputStream] = None
+        self._stream_finished = threading.Event()
+        self._end_requested = False
         self.playback_complete = threading.Event()
         self.playback_error: Optional[Exception] = None
         # Latched by the callback when a convomode pause cut this playback, so a
@@ -297,6 +304,10 @@ class NonBlockingAudioPlayer:
         # Natural-mode barge-in reuses this SAME instant mid-buffer stop path —
         # see trigger_barge_in() above — via a separate event (a barge-in
         # implies a new turn is starting; a manual pause does not).
+        if self._end_requested:
+            outdata[:] = 0
+            raise sd.CallbackStop()
+
         if _pause_event.is_set() or _barge_in_event.is_set():
             if _pause_event.is_set():
                 self.paused_cut = True
@@ -368,6 +379,8 @@ class NonBlockingAudioPlayer:
         self.playback_complete.clear()
         self.playback_error = None
         self.paused_cut = False
+        self._stream_finished.clear()
+        self._end_requested = False
 
         # Ensure samples are float32
         if samples.dtype != np.float32:
@@ -400,6 +413,7 @@ class NonBlockingAudioPlayer:
                 samplerate=sample_rate,
                 channels=channels,
                 callback=self._audio_callback,
+                finished_callback=self._stream_finished.set,
                 blocksize=self.buffer_size,
                 dtype=np.float32
             )
@@ -426,6 +440,24 @@ class NonBlockingAudioPlayer:
             logger.error(f"Error starting audio playback: {e}")
             raise
 
+    def _close_stream(self):
+        """Stop and close the stream, only after the callback's own stop has finished.
+
+        When the callback raises CallbackStop, PortAudio stops the audio unit on
+        CoreAudio's IO thread. playback_complete is set in that same callback, so
+        stopping as soon as it's set makes two threads stop one unit at once, each
+        holding the lock the other needs: both block forever. Let the callback end
+        the stream and wait for PortAudio's finished callback; the stop below then
+        has nothing to race. If the callback isn't running (a dead device) the wait
+        runs out and the stop is still bounded by audio_stop.
+        """
+        stream, self.stream = self.stream, None
+        if not stream:
+            return
+        self._end_requested = True
+        self._stream_finished.wait(STREAM_FINISH_WAIT_SECONDS)
+        audio_stop.stop_stream(stream)
+
     def wait(self, timeout: Optional[float] = None):
         """Wait for playback to complete.
 
@@ -439,11 +471,7 @@ class NonBlockingAudioPlayer:
         if not self.playback_complete.wait(timeout=timeout):
             logger.warning("Playback wait timed out")
 
-        # Stop and close stream
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+        self._close_stream()
 
         # Raise any error that occurred during playback
         if self.playback_error:
@@ -452,10 +480,7 @@ class NonBlockingAudioPlayer:
     def stop(self):
         """Stop playback immediately."""
         self.playback_complete.set()
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+        self._close_stream()
 
         # Clear queue
         if self.audio_queue:

@@ -2201,7 +2201,7 @@ def serve(host: str, port: int, transport: str, log_level: str, allow_anthropic:
     from .server import mcp
     from .config import setup_logging
     from . import client_identity
-    from .daemon import DEFAULT_IDLE_EXIT_SECONDS, ActiveRequests, ClientIdentityMiddleware, DrainingServer, IdleExit
+    from .daemon import DEFAULT_IDLE_EXIT_SECONDS, ActiveRequests, ClientIdentityMiddleware, DrainingServer, IdleExit, LoopWatchdog
     from .serve_middleware import (
         AccessLogMiddleware,
         IPAllowlistMiddleware,
@@ -2407,11 +2407,21 @@ def serve(host: str, port: int, transport: str, log_level: str, allow_anthropic:
                 def _stop():
                     server.should_exit = True
                 watcher = asyncio.ensure_future(idle.watch(_stop))
+            heartbeat = None
+            if daemon_mode:
+                from . import activity
+                activity.log("service_start")
+                loop_watchdog = LoopWatchdog()
+                heartbeat = asyncio.ensure_future(loop_watchdog.beat())
+                loop_watchdog.start_thread()
             try:
                 await server.serve(sockets=sockets)
             finally:
                 if idle:
                     watcher.cancel()
+                if heartbeat:
+                    heartbeat.cancel()
+                    loop_watchdog.stop()
 
         asyncio.run(_serve())
         if daemon_mode or (idle and idle.is_idle()):

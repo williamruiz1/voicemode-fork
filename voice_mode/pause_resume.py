@@ -38,6 +38,7 @@ def pause_max_seconds() -> float:
 
 
 FLOOR_QUEUE_PATH = os.path.expanduser("~/.voicemode/floor-queue.json")
+DISMISS_DIR = os.path.expanduser("~/.voicemode/convomode-dismissed")
 
 
 def _ancestor_pids(pid: Optional[int] = None, limit: int = 12) -> set:
@@ -84,6 +85,23 @@ def we_hold_floor() -> Optional[bool]:
     if client_pid is None and client_identity.SHARED_MODE:
         return None
     return holder in _ancestor_pids(client_pid)
+
+
+def dismissed_from_voice() -> bool:
+    """True if the user dismissed this session from voice (the widget's X).
+
+    The hooks check this when a call starts. A call already running (waiting for
+    the mic, or speaking) is past them, so converse asks again here."""
+    try:
+        markers = set(os.listdir(DISMISS_DIR))
+    except OSError:
+        return False
+    if not markers:
+        return False
+    client_pid = client_identity.current_client_pid()
+    if client_pid is None and client_identity.SHARED_MODE:
+        return False
+    return any(str(pid) in markers for pid in _ancestor_pids(client_pid))
 
 
 def floor_handed_off(held_at_start: bool) -> bool:
