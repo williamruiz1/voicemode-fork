@@ -1,6 +1,7 @@
 """Conversation tools for interactive voice interactions."""
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
@@ -110,7 +111,7 @@ from voice_mode.audio_player import NonBlockingAudioPlayer, SPEAKING_FLAG_PATH, 
 from voice_mode import audio_player
 from voice_mode import airpods_press
 from voice_mode.pause_resume import dismissed_from_voice, resume_after_pause, pause_max_seconds, we_hold_floor
-from voice_mode import activity, audio_stop, client_identity
+from voice_mode import activity, audio_stop
 from voice_mode import barge_in
 from voice_mode import live_transcript
 from voice_mode.statistics_tracking import track_voice_interaction
@@ -1178,6 +1179,38 @@ def record_audio(duration: float, honor_send: bool = False, _attempt: int = 0) -
 
 DISMISSED_RESULT = ("[DISMISSED] The user dismissed you from voice, so nothing was spoken and the mic "
                     "stayed closed. Reply in text only until the user runs /convomode again.")
+
+@contextlib.asynccontextmanager
+async def _end_listen_on_dismissal():
+    """While a listen runs, a dismissal presses Send for it.
+
+    Every listen honours Send: VAD, held, fixed-window, mid-utterance. Each caller
+    then drops what was heard (see _refused_after_listen), so the mic closes at
+    once however the listen was recording."""
+    async def _watch():
+        while not dismissed_from_voice():
+            await asyncio.sleep(0.25)
+        activity.log("listen_ended_dismissed")
+        try:
+            with open(_turn_end_signal_path(), "w") as f:
+                f.write("dismissed")
+        except OSError as e:
+            logger.warning(f"could not end the listen after a dismissal: {e}")
+
+    watcher = asyncio.ensure_future(_watch())
+    try:
+        yield
+    finally:
+        watcher.cancel()
+
+
+def _refused_after_listen() -> Optional[str]:
+    """Dismissed during the listen. Stuck audio doesn't count here: the words are already captured."""
+    if dismissed_from_voice():
+        activity.log("call_refused_dismissed", at="after_listen")
+        return DISMISSED_RESULT
+    return None
+
 
 def _refusal(at: str) -> Optional[str]:
     """Why this call must stop before making sound or opening the mic, or None."""
@@ -3244,18 +3277,11 @@ consult the MCP resources listed above.
                     if (CONCH_ENABLED and CONCH_YIELD_ENABLED and conch._acquired)
                     else None
                 )
-                _conch_superseded = (
+                listen_supersede_check = (
                     conch.is_superseded
                     if (CONCH_ENABLED and conch._acquired)
                     else None
                 )
-                # The recording thread has no tool-call context, so the caller is captured here.
-                _caller_pid = client_identity.current_client_pid()
-
-                def listen_supersede_check():
-                    if dismissed_from_voice(_caller_pid):
-                        return True
-                    return bool(_conch_superseded and _conch_superseded())
 
                 # Every listen-again call site in this function MUST route
                 # through here rather than calling record_audio_with_silence_
@@ -3320,9 +3346,10 @@ consult the MCP resources listed above.
                 record_start = time.perf_counter()
                 logger.debug(f"About to call record_audio_with_silence_detection with duration={listen_duration_max}, disable_silence_detection={disable_silence_detection}, min_duration={listen_duration_min}, vad_aggressiveness={vad_aggressiveness}, natural_mode_barge_in={natural_mode_barge_in}")
                 try:
-                    audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                        None, _record_call
-                    )
+                    async with _end_listen_on_dismissal():
+                        audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
+                            None, _record_call
+                        )
                 finally:
                     # Send/silence ended the listen: a still-playing "Still there?"
                     # check-in must not talk over the next turn.
@@ -3341,6 +3368,10 @@ consult the MCP resources listed above.
                                    f"{_rec_end['wall_seconds']:.2f}s of listening")
                     if event_logger:
                         event_logger.log_event("INPUT_STARVED", _rec_end)
+
+                refusal = _refused_after_listen()
+                if refusal:
+                    return refusal
 
                 if yield_state["yielded"]:
                     # Hand the mic over: skip the finished chime (the requester is
@@ -3548,7 +3579,7 @@ consult the MCP resources listed above.
                                 # Read and play the audio file using non-blocking player
                                 data, samplerate = sf.read(audio_path)
                                 player = NonBlockingAudioPlayer()
-                                await asyncio.to_thread(player.play, data, samplerate, blocking=True)
+                                await player.play_async(data, samplerate)
                                 logger.info("Audio replay completed")
                             except Exception as e:
                                 logger.warning(f"Failed to replay cached audio: {e}. Regenerating...")
@@ -3601,11 +3632,16 @@ consult the MCP resources listed above.
 
                         # Record audio
                         record_start = time.perf_counter()
-                        audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, _listen_call()
-                        )
+                        async with _end_listen_on_dismissal():
+                            audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
+                                None, _listen_call()
+                            )
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
+
+                        refusal = _refused_after_listen()
+                        if refusal:
+                            return refusal
 
                         if yield_state["yielded"]:
                             if event_logger:
@@ -3675,11 +3711,16 @@ consult the MCP resources listed above.
 
                         # Record audio
                         record_start = time.perf_counter()
-                        audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, _listen_call()
-                        )
+                        async with _end_listen_on_dismissal():
+                            audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
+                                None, _listen_call()
+                            )
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
+
+                        refusal = _refused_after_listen()
+                        if refusal:
+                            return refusal
 
                         if yield_state["yielded"]:
                             if event_logger:

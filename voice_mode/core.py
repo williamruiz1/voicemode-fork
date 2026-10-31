@@ -467,7 +467,7 @@ async def text_to_speech(
 
                         # Use non-blocking audio player for concurrent playback support
                         player = NonBlockingAudioPlayer()
-                        await asyncio.to_thread(player.play, samples_with_buffer, audio.frame_rate, blocking=True)
+                        await player.play_async(samples_with_buffer, audio.frame_rate)
                         # Pause cuts the callback; the cut point isn't tracked on
                         # this path, so converse replays the whole message.
                         if player.paused_cut or audio_player_mod.convomode_paused():
@@ -700,7 +700,7 @@ async def play_chime_start(
         chime_float = chime.astype(np.float32) / 32768.0
         # Use non-blocking audio player to avoid interference with concurrent playback
         player = NonBlockingAudioPlayer()
-        await asyncio.to_thread(player.play, chime_float, sample_rate, blocking=True)
+        await player.play_async(chime_float, sample_rate)
         return True
     except Exception as e:
         logger.debug(f"Could not play start chime: {e}")
@@ -734,7 +734,7 @@ async def play_chime_end(
         chime_float = chime.astype(np.float32) / 32768.0
         # Use non-blocking audio player to avoid interference with concurrent playback
         player = NonBlockingAudioPlayer()
-        await asyncio.to_thread(player.play, chime_float, sample_rate, blocking=True)
+        await player.play_async(chime_float, sample_rate)
         return True
     except Exception as e:
         logger.debug(f"Could not play end chime: {e}")
@@ -781,13 +781,7 @@ async def play_system_audio(message_key: str, fallback_text: Optional[str] = Non
 
             # Use non-blocking audio player to avoid interference with concurrent playback
             player = NonBlockingAudioPlayer()
-            try:
-                await asyncio.to_thread(player.play, samples, audio.frame_rate, blocking=True)
-            except asyncio.CancelledError:
-                # The clip keeps playing on its thread unless told: a cancelled
-                # "Still there?" must not talk over the next turn.
-                asyncio.get_running_loop().run_in_executor(None, player.stop)
-                raise
+            await player.play_async(samples, audio.frame_rate)
 
             logger.info(f"✓ System audio played successfully: {message_key}")
             return True

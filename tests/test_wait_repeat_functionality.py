@@ -40,13 +40,14 @@ class TestPlaySystemAudio:
 
             # Mock player
             mock_player_instance = MagicMock()
+            mock_player_instance.play_async = AsyncMock()
             mock_player.return_value = mock_player_instance
 
             # Test
             result = await play_system_audio("waiting-1-minute", fallback_text="Waiting")
 
             assert result is True
-            mock_player_instance.play.assert_called_once()
+            mock_player_instance.play_async.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_play_system_audio_fallback_to_tts(self):

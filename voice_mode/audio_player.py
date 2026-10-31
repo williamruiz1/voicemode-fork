@@ -4,6 +4,7 @@ This module provides a queue-based audio playback system that allows multiple
 concurrent audio streams without blocking or interference.
 """
 
+import asyncio
 import logging
 import os
 import queue
@@ -450,6 +451,16 @@ class NonBlockingAudioPlayer:
             logger.error(f"Error starting audio playback: {e}")
             raise
 
+    async def play_async(self, samples: np.ndarray, sample_rate: int) -> None:
+        """play(blocking=True) for the event loop: other calls keep running meanwhile."""
+        try:
+            await asyncio.to_thread(self.play, samples, sample_rate, blocking=True)
+        except asyncio.CancelledError:
+            # The clip keeps playing on its thread unless told: a cancelled call
+            # releases the audio lock, and the next one must not talk over it.
+            asyncio.get_running_loop().run_in_executor(None, self.stop)
+            raise
+
     def _close_stream(self):
         """Stop and close the stream, only after the callback's own stop has finished.
 
@@ -478,12 +489,16 @@ class NonBlockingAudioPlayer:
         Raises:
             Exception: If playback error occurred
         """
-        if timeout is None:
+        bounded = timeout is None
+        if bounded:
             timeout = self._audio_seconds + PLAYBACK_MARGIN_SECONDS
 
         # Wait for playback to complete
         if not self.playback_complete.wait(timeout=timeout):
             logger.warning("Playback wait timed out")
+            if bounded:
+                # Nothing more came out of the speaker: don't report it as spoken.
+                self.playback_error = RuntimeError(f"Audio device stopped playing a {self._audio_seconds:.1f}s clip")
 
         self._close_stream()
 

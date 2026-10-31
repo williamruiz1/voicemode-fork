@@ -114,9 +114,34 @@ class TestPlayerBounds:
         player = audio_player.NonBlockingAudioPlayer()
         player.stream = MagicMock()
         started = time.monotonic()
-        player.wait()
+        with pytest.raises(RuntimeError):
+            player.wait()
         assert time.monotonic() - started < 2
         assert player.stream is None
+
+    def test_a_clip_that_never_finished_is_not_reported_as_played(self, monkeypatch):
+        monkeypatch.setattr(audio_player, "STREAM_FINISH_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(audio_player, "PLAYBACK_MARGIN_SECONDS", 0.05)
+        player = audio_player.NonBlockingAudioPlayer()
+        player.stream = MagicMock()
+        with pytest.raises(RuntimeError, match="stopped playing"):
+            player.wait()
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_clip_stops_instead_of_playing_on(self):
+        release = threading.Event()
+        player = audio_player.NonBlockingAudioPlayer()
+        stopped = threading.Event()
+        player.play = lambda *a, **k: release.wait(5)
+        player.stop = stopped.set
+        task = asyncio.ensure_future(player.play_async(np.zeros(8, dtype=np.float32), 24000))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.05)
+        release.set()
+        assert stopped.is_set()
 
     def test_no_new_stream_in_a_stuck_process(self):
         audio_stop._abandoned.append(object())
@@ -298,6 +323,60 @@ class TestStuckAudioRefusesCalls:
         assert "AUDIO STUCK" in result
         chime.assert_not_called()
         record.assert_not_called()
+
+
+class TestDismissedDuringAListen:
+    @pytest.mark.asyncio
+    async def test_a_dismissal_presses_send_for_a_running_listen(self, tmp_path, activity_log):
+        from voice_mode.tools import converse as mod
+
+        signal = tmp_path / "turn-end.signal"
+        answers = iter([False])
+        with patch.object(mod, "_turn_end_signal_path", return_value=str(signal)), \
+             patch.object(mod, "dismissed_from_voice", side_effect=lambda *a: next(answers, True)):
+            async with mod._end_listen_on_dismissal():
+                for _ in range(100):
+                    if signal.exists():
+                        break
+                    await asyncio.sleep(0.01)
+        assert signal.read_text() == "dismissed"
+        assert [e["event"] for e in activity_log()] == ["listen_ended_dismissed"]
+
+    @pytest.mark.asyncio
+    async def test_no_dismissal_touches_nothing(self, tmp_path, activity_log):
+        from voice_mode.tools import converse as mod
+
+        signal = tmp_path / "turn-end.signal"
+        with patch.object(mod, "_turn_end_signal_path", return_value=str(signal)), \
+             patch.object(mod, "dismissed_from_voice", return_value=False):
+            async with mod._end_listen_on_dismissal():
+                await asyncio.sleep(0.3)
+        assert not signal.exists()
+
+    @pytest.mark.asyncio
+    async def test_words_heard_before_the_dismissal_are_dropped_and_the_tab_told(self, clean_conch, activity_log):
+        from voice_mode.tools import converse as mod
+
+        tts = AsyncMock(return_value=(True, {}, {"provider": "test", "voice": "x"}))
+        calls = {"n": 0}
+
+        def dismissed(*a):
+            return calls["n"] > 0
+
+        def record(*a, **k):
+            calls["n"] += 1
+            return np.zeros(2400, dtype=np.int16), True
+
+        stt = AsyncMock()
+        with patch.object(mod, "text_to_speech_with_failover", tts), \
+             patch.object(mod, "dismissed_from_voice", side_effect=dismissed), \
+             patch.object(mod, "play_audio_feedback", AsyncMock()), \
+             patch.object(mod, "record_audio_with_silence_detection", side_effect=record), \
+             patch.object(mod, "speech_to_text", stt):
+            result = await getattr(mod.converse, "fn", mod.converse)(message="hello", wait_for_response=True)
+        assert "DISMISSED" in result
+        stt.assert_not_called()
+        assert [e for e in activity_log() if e["event"] == "call_refused_dismissed"][0]["at"] == "after_listen"
 
 
 class TestWaitingOnTheAudioLock:
