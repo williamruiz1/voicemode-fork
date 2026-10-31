@@ -180,7 +180,8 @@ class IncrementalTranscriber:
     the words show while the user talks, not only when a segment ends. That text is
     for display only: the turn's final text still comes from the segments. Segments
     go first (Whisper handles one request at a time), and a rolling failure only
-    ends the rolling updates. With ``wait_for_speech``, nothing is published until
+    ends the rolling updates. ``transcribe_rolling`` must never fail over to a paid
+    provider: it runs every few seconds. With ``wait_for_speech``, nothing is published until
     ``mark_speech()``: Whisper invents words from a quiet room.
     """
 
@@ -191,7 +192,8 @@ class IncrementalTranscriber:
                  on_partial: Optional[Callable[[str], None]] = None,
                  min_segment_s: Optional[float] = None, max_segment_s: Optional[float] = None,
                  pause_s: float = 0.4, silence_rms: float = 0.01,
-                 rolling_s: float = 0.0, wait_for_speech: bool = False):
+                 rolling_s: float = 0.0, wait_for_speech: bool = False,
+                 transcribe_rolling: Optional[Callable[[np.ndarray], str]] = None):
         self._transcribe = transcribe
         self._sr = sample_rate
         self._on_partial = on_partial
@@ -205,6 +207,7 @@ class IncrementalTranscriber:
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="incremental-stt")
         self._lock = threading.Lock()
         self._rolling_s = rolling_s
+        self._transcribe_rolling = transcribe_rolling or transcribe
         self._rolling_stop = threading.Event()
         self._rolling_thread: Optional[threading.Thread] = None
         self._speech_seen = not wait_for_speech
@@ -223,6 +226,7 @@ class IncrementalTranscriber:
         self._tail_text = ""        # provisional text of the audio not yet cut
         self._provisional: dict = {}  # provisional text of a cut segment still being transcribed
         self._rolled_at = 0         # total samples fed when the tail was last transcribed
+        self._display_from = 0      # first segment cut after speech was heard
 
     # -- recorder-facing --
 
@@ -263,8 +267,15 @@ class IncrementalTranscriber:
             self._failed = True
 
     def mark_speech(self) -> None:
-        """The recorder heard speech: provisional text can show from here on."""
+        """The recorder heard speech: text can show from here on. Segments cut before
+        now are left out of the display (not the final text): they were a quiet room."""
+        if not self._speech_seen:
+            self._display_from = len(self._futures)
         self._speech_seen = True
+
+    def stop_rolling(self) -> None:
+        """The listen is over: don't compete with the final transcription for Whisper."""
+        self._rolling_stop.set()
 
     def _start_rolling(self) -> None:
         if self._rolling_s <= 0 or self._on_partial is None or self._rolling_thread is not None:
@@ -278,7 +289,6 @@ class IncrementalTranscriber:
             try:
                 self._roll_once()
             except Exception as e:
-                # Stay off the failover path too: it could reach a paid provider every 2 seconds.
                 logger.debug(f"incremental STT rolling update failed, stopping them: {e}")
                 return
 
@@ -298,7 +308,7 @@ class IncrementalTranscriber:
         if self._rms(tail[-(total - self._rolled_at):]) < self._silence_rms:
             return  # nothing new was said
         self._rolled_at = total
-        text = (self._transcribe(tail) or "").strip()
+        text = (self._transcribe_rolling(tail) or "").strip()
         with self._lock:
             # Cut or restarted meanwhile: this audio now belongs to a segment.
             if gen != self._gen or base != self._consumed or self._rolling_stop.is_set():
@@ -309,7 +319,7 @@ class IncrementalTranscriber:
 
     def _display_text(self) -> str:
         """Finished segments, then provisional text for the rest. Caller holds the lock."""
-        pieces = [self._texts.get(i) or self._provisional.get(i, "") for i in range(len(self._futures))]
+        pieces = [self._texts.get(i) or self._provisional.get(i, "") for i in range(self._display_from, len(self._futures))]
         pieces.append(self._tail_text)
         return " ".join(p for p in pieces if p)
 

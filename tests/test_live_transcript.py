@@ -401,17 +401,18 @@ def test_quiet_after_speech_sends_nothing_to_whisper():
 def test_invented_words_from_a_quiet_room_never_show():
     """B9: nothing is published until the recorder has heard speech."""
     partials = []
-    inc = rolling(lambda a: "Blink", partials, wait_for_speech=True, min_segment_s=1.0, max_segment_s=2.0)
-    for _ in range(6):
-        inc.feed(LOUD)
+    inc = rolling(lambda a: "Blink", partials, wait_for_speech=True, min_segment_s=1.0, max_segment_s=4.0)
+    inc.feed(LOUD), inc.feed(LOUD), inc.feed(QUIET)  # a pause: this segment is cut
+    assert inc.segments_started == 1
     inc._roll_once()
     for f in inc._futures:
         f.result()
     assert partials == []
     inc.mark_speech()
+    inc._transcribe_rolling = lambda a: "hello there"
     inc.feed(LOUD), inc.feed(LOUD)
     inc._roll_once()
-    assert partials and "Blink" in partials[-1]
+    assert partials[-1] == "hello there", "segments from before speech stay off the display"
     inc.close()
 
 
@@ -491,3 +492,33 @@ def test_off_by_default_when_built_directly():
     inc.begin(None)
     assert inc._rolling_thread is None
     inc.close()
+
+
+def test_rolling_never_uses_the_failover_path():
+    """Failover can reach a paid provider; a display update every 2 seconds must not."""
+    from unittest.mock import MagicMock, patch
+    from voice_mode.tools import converse as cv
+
+    with patch.object(cv, "STT_BASE_URLS", ["https://api.openai.com/v1"]), patch.object(cv.httpx, "post") as post:
+        with pytest.raises(RuntimeError):
+            cv._rolling_local_stt(np.zeros(SR, dtype=np.int16))
+        post.assert_not_called()
+    answer = MagicMock()
+    answer.json.return_value = {"text": "hi"}
+    with patch.object(cv, "STT_BASE_URLS", ["https://api.openai.com/v1", "http://127.0.0.1:2022/v1"]), \
+         patch.object(cv.httpx, "post", return_value=answer) as post, \
+         patch.object(cv, "speech_to_text") as failover:
+        assert cv._rolling_local_stt(np.zeros(SR, dtype=np.int16)) == "hi"
+    assert post.call_args[0][0] == "http://127.0.0.1:2022/v1/audio/transcriptions"
+    failover.assert_not_called()
+
+
+def test_rolling_stops_when_the_listen_ends():
+    inc = lt.IncrementalTranscriber(lambda a: "x", SR, on_partial=lambda t: None, rolling_s=0.01)
+    inc.begin(None)
+    thread = inc._rolling_thread
+    inc.stop_rolling()
+    thread.join(2)
+    assert not thread.is_alive()
+    inc.close()
+
