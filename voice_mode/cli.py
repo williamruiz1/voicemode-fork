@@ -2201,7 +2201,7 @@ def serve(host: str, port: int, transport: str, log_level: str, allow_anthropic:
     from .server import mcp
     from .config import setup_logging
     from . import client_identity
-    from .daemon import DEFAULT_IDLE_EXIT_SECONDS, ClientIdentityMiddleware, IdleExit
+    from .daemon import DEFAULT_IDLE_EXIT_SECONDS, ClientIdentityMiddleware, DrainingServer, IdleExit
     from .serve_middleware import (
         AccessLogMiddleware,
         IPAllowlistMiddleware,
@@ -2384,14 +2384,14 @@ def serve(host: str, port: int, transport: str, log_level: str, allow_anthropic:
 
         # Disable uvicorn's access logging - we use our own AccessLogMiddleware
         # which shows X-Forwarded-For headers
-        server = uvicorn.Server(uvicorn.Config(
+        server = DrainingServer(uvicorn.Config(
             app,
             host=host,
             port=port,
             log_level=log_level.lower(),
             access_log=False,  # Disable uvicorn access log, use our middleware instead
             log_config=None if log_file else uvicorn.config.LOGGING_CONFIG,
-        ))
+        ), idle)
         sockets = None
         if launchd_socket:
             from .daemon import launchd_sockets

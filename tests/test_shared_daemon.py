@@ -11,6 +11,7 @@ import asyncio
 import atexit
 import json
 import os
+import signal
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -20,7 +21,7 @@ import pytest
 from voice_mode import client_identity
 from voice_mode.client_identity import ClientIdentity, owner_for_pid
 from voice_mode.conch import Conch
-from voice_mode.daemon import ClientIdentityMiddleware, IdleExit
+from voice_mode.daemon import ClientIdentityMiddleware, DrainingServer, IdleExit
 
 
 # Real, live client pids: a record whose owner pid is dead now counts as stale.
@@ -392,7 +393,7 @@ class TestServeDaemonFlag:
             exits.append(code)
             raise SystemExit(code)
         monkeypatch.setattr(os, "_exit", fake_exit)
-        with patch("uvicorn.Server", server), patch("uvicorn.Config"), \
+        with patch("voice_mode.daemon.DrainingServer", server), patch("uvicorn.Config"), \
                 patch("voice_mode.cli._init_event_logging"):
             result = CliRunner().invoke(voice_mode_main_cli, ["serve", "--daemon", "--port", "1"])
         assert result.exit_code == 0, result.output
@@ -402,3 +403,75 @@ class TestServeDaemonFlag:
         assert added[0].idle.seconds == 2700
         assert client_identity.SHARED_MODE is True
         assert "Idle exit after 2700s" in result.output
+
+
+class TestDrainingServer:
+    """A SIGTERM must not cut off a running tool call (a live recording)."""
+
+    def _server(self, idle, **kw):
+        import uvicorn
+        return DrainingServer(uvicorn.Config(lambda *a: None), idle, **kw)
+
+    def test_sigterm_with_no_call_exits_right_away(self):
+        server = self._server(IdleExit(60))
+        server.handle_exit(signal.SIGTERM, None)
+        assert server.should_exit
+
+    def test_sigterm_during_a_call_waits_until_it_ends(self):
+        idle = IdleExit(60)
+        server = self._server(idle)
+        idle.begin()
+        server.handle_exit(signal.SIGTERM, None)
+        assert not server.should_exit
+        asyncio.run(server.on_tick(1))
+        assert not server.should_exit
+        idle.end()
+        asyncio.run(server.on_tick(2))
+        assert server.should_exit
+
+    def test_a_call_started_while_waiting_is_waited_for_too(self):
+        idle = IdleExit(60)
+        server = self._server(idle)
+        idle.begin()
+        server.handle_exit(signal.SIGTERM, None)
+        idle.begin()
+        idle.end()
+        asyncio.run(server.on_tick(1))
+        assert not server.should_exit
+
+    def test_a_stuck_call_stops_waiting_at_the_limit(self):
+        now = [0.0]
+        idle = IdleExit(60)
+        server = self._server(idle, max_wait=900, clock=lambda: now[0])
+        idle.begin()
+        server.handle_exit(signal.SIGTERM, None)
+        now[0] = 899
+        asyncio.run(server.on_tick(1))
+        assert not server.should_exit
+        now[0] = 900
+        asyncio.run(server.on_tick(2))
+        assert server.should_exit
+
+    def test_a_repeat_sigterm_does_not_restart_the_limit(self):
+        now = [0.0]
+        idle = IdleExit(60)
+        server = self._server(idle, max_wait=900, clock=lambda: now[0])
+        idle.begin()
+        server.handle_exit(signal.SIGTERM, None)
+        now[0] = 800
+        server.handle_exit(signal.SIGTERM, None)
+        now[0] = 900
+        asyncio.run(server.on_tick(1))
+        assert server.should_exit
+
+    def test_ctrl_c_is_not_held_back(self):
+        idle = IdleExit(60)
+        server = self._server(idle)
+        idle.begin()
+        server.handle_exit(signal.SIGINT, None)
+        assert server.should_exit
+
+    def test_without_idle_tracking_sigterm_is_plain(self):
+        server = self._server(None)
+        server.handle_exit(signal.SIGTERM, None)
+        assert server.should_exit
