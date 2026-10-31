@@ -339,7 +339,14 @@ class TestDismissedDuringAListen:
                     if signal.exists():
                         break
                     await asyncio.sleep(0.01)
-        assert signal.read_text() == "dismissed"
+                assert signal.read_text() == "dismissed"
+                signal.unlink()  # a listen still opening clears a Send as stale
+                for _ in range(100):
+                    if signal.exists():
+                        break
+                    await asyncio.sleep(0.01)
+                assert signal.exists(), "the press must come back until the listen ends"
+        assert not signal.exists(), "nothing left behind for the next listen"
         assert [e["event"] for e in activity_log()] == ["listen_ended_dismissed"]
 
     @pytest.mark.asyncio

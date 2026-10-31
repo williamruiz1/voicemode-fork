@@ -1187,21 +1187,32 @@ async def _end_listen_on_dismissal():
     Every listen honours Send: VAD, held, fixed-window, mid-utterance. Each caller
     then drops what was heard (see _refused_after_listen), so the mic closes at
     once however the listen was recording."""
+    path = _turn_end_signal_path()
+    pressed = False
+
     async def _watch():
-        while not dismissed_from_voice():
+        nonlocal pressed
+        while True:
+            # Keeps pressing: a listen still opening clears a Send as stale.
+            if dismissed_from_voice() and not os.path.exists(path):
+                if not pressed:
+                    activity.log("listen_ended_dismissed")
+                pressed = True
+                try:
+                    with open(path, "w") as f:
+                        f.write("dismissed")
+                except OSError as e:
+                    logger.warning(f"could not end the listen after a dismissal: {e}")
             await asyncio.sleep(0.25)
-        activity.log("listen_ended_dismissed")
-        try:
-            with open(_turn_end_signal_path(), "w") as f:
-                f.write("dismissed")
-        except OSError as e:
-            logger.warning(f"could not end the listen after a dismissal: {e}")
 
     watcher = asyncio.ensure_future(_watch())
     try:
         yield
     finally:
         watcher.cancel()
+        if pressed:
+            with contextlib.suppress(OSError):
+                os.remove(path)
 
 
 def _refused_after_listen() -> Optional[str]:
