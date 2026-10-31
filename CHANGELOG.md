@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Restarts wait for running calls** — `serve --daemon` now holds a SIGTERM (`launchctl kickstart -k`, `bootout`, an install) until no tool call is running, for up to 15 minutes, so a restart can't cut off a recording. The launchd job's `ExitTimeOut` must stay above that limit.
+- **Restarts wait for running calls** — `serve --daemon` now holds a SIGTERM (`launchctl kickstart -k`, `bootout`, an install) until no request is being answered, for up to 55 seconds (launchd's `ExitTimeOut` cap is 60).
 
 - **Long turns are transcribed while you talk (B27)** — Recordings are cut into segments at natural pauses and transcribed in the background during the listen, so after Send only the last few seconds remain to transcribe instead of the whole recording. Any segment failure falls back to one whole-recording transcription. Disable with `VOICEMODE_INCREMENTAL_STT=false`. ([#39](https://github.com/williamruiz1/voicemode-fork/pull/39))
 - **Speech starts quickly regardless of message length** — With streamed PCM TTS (the mlx-audio/Kokoro path), messages of 100+ characters are spoken as a short first piece (first sentence or clause) while the rest is generated in the background, so first audio no longer waits for the whole message (measured median 0.39 s → 0.13 s on 180–200-character messages). If the remainder fails it is retried once, then the turn is marked truncated instead of replaying the whole message; Pause and barge-in cancel the prefetch. Disable with `VOICEMODE_TTS_SPLIT_FIRST=false`. ([#38](https://github.com/williamruiz1/voicemode-fork/pull/38))

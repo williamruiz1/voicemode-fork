@@ -21,7 +21,7 @@ import pytest
 from voice_mode import client_identity
 from voice_mode.client_identity import ClientIdentity, owner_for_pid
 from voice_mode.conch import Conch
-from voice_mode.daemon import ClientIdentityMiddleware, DrainingServer, IdleExit
+from voice_mode.daemon import DRAIN_MAX_SECONDS, ActiveRequests, ClientIdentityMiddleware, DrainingServer, IdleExit
 
 
 # Real, live client pids: a record whose owner pid is dead now counts as stale.
@@ -406,72 +406,91 @@ class TestServeDaemonFlag:
 
 
 class TestDrainingServer:
-    """A SIGTERM must not cut off a running tool call (a live recording)."""
+    """A SIGTERM must not cut off a request still being answered (a live recording)."""
 
-    def _server(self, idle, **kw):
+    def _server(self, active, **kw):
         import uvicorn
-        return DrainingServer(uvicorn.Config(lambda *a: None), idle, **kw)
+        return DrainingServer(uvicorn.Config(lambda *a: None), active, **kw)
 
-    def test_sigterm_with_no_call_exits_right_away(self):
-        server = self._server(IdleExit(60))
+    def test_sigterm_with_no_request_exits_right_away(self):
+        server = self._server(ActiveRequests(None))
         server.handle_exit(signal.SIGTERM, None)
         assert server.should_exit
 
-    def test_sigterm_during_a_call_waits_until_it_ends(self):
-        idle = IdleExit(60)
-        server = self._server(idle)
-        idle.begin()
+    def test_sigterm_during_a_request_waits_until_it_ends(self):
+        active = ActiveRequests(None)
+        server = self._server(active)
+        active.count = 1
         server.handle_exit(signal.SIGTERM, None)
         assert not server.should_exit
         asyncio.run(server.on_tick(1))
         assert not server.should_exit
-        idle.end()
+        active.count = 0
         asyncio.run(server.on_tick(2))
         assert server.should_exit
 
-    def test_a_call_started_while_waiting_is_waited_for_too(self):
-        idle = IdleExit(60)
-        server = self._server(idle)
-        idle.begin()
-        server.handle_exit(signal.SIGTERM, None)
-        idle.begin()
-        idle.end()
-        asyncio.run(server.on_tick(1))
-        assert not server.should_exit
-
-    def test_a_stuck_call_stops_waiting_at_the_limit(self):
+    def test_a_stuck_request_stops_waiting_at_the_limit(self):
         now = [0.0]
-        idle = IdleExit(60)
-        server = self._server(idle, max_wait=900, clock=lambda: now[0])
-        idle.begin()
+        active = ActiveRequests(None)
+        server = self._server(active, max_wait=55, clock=lambda: now[0])
+        active.count = 1
         server.handle_exit(signal.SIGTERM, None)
-        now[0] = 899
+        now[0] = 54
         asyncio.run(server.on_tick(1))
         assert not server.should_exit
-        now[0] = 900
+        now[0] = 55
         asyncio.run(server.on_tick(2))
         assert server.should_exit
 
     def test_a_repeat_sigterm_does_not_restart_the_limit(self):
         now = [0.0]
-        idle = IdleExit(60)
-        server = self._server(idle, max_wait=900, clock=lambda: now[0])
-        idle.begin()
+        active = ActiveRequests(None)
+        server = self._server(active, max_wait=55, clock=lambda: now[0])
+        active.count = 1
         server.handle_exit(signal.SIGTERM, None)
-        now[0] = 800
+        now[0] = 50
         server.handle_exit(signal.SIGTERM, None)
-        now[0] = 900
+        now[0] = 55
         asyncio.run(server.on_tick(1))
         assert server.should_exit
 
     def test_ctrl_c_is_not_held_back(self):
-        idle = IdleExit(60)
-        server = self._server(idle)
-        idle.begin()
+        active = ActiveRequests(None)
+        server = self._server(active)
+        active.count = 1
         server.handle_exit(signal.SIGINT, None)
         assert server.should_exit
 
-    def test_without_idle_tracking_sigterm_is_plain(self):
-        server = self._server(None)
-        server.handle_exit(signal.SIGTERM, None)
-        assert server.should_exit
+    def test_limit_stays_under_launchds_60s_cap(self):
+        assert DRAIN_MAX_SECONDS < 60
+
+
+class TestActiveRequests:
+    def test_counts_http_until_the_app_returns(self):
+        seen = []
+
+        async def app(scope, receive, send):
+            seen.append(active.count)
+
+        active = ActiveRequests(app)
+        asyncio.run(active({"type": "http"}, None, None))
+        assert seen == [1] and active.count == 0
+
+    def test_a_failing_request_is_still_uncounted(self):
+        async def app(scope, receive, send):
+            raise RuntimeError("boom")
+
+        active = ActiveRequests(app)
+        with pytest.raises(RuntimeError):
+            asyncio.run(active({"type": "http"}, None, None))
+        assert active.count == 0
+
+    def test_lifespan_is_not_counted(self):
+        seen = []
+
+        async def app(scope, receive, send):
+            seen.append(active.count)
+
+        active = ActiveRequests(app)
+        asyncio.run(active({"type": "lifespan"}, None, None))
+        assert seen == [0]
