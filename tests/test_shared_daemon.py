@@ -11,6 +11,7 @@ import asyncio
 import atexit
 import json
 import os
+import signal
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -20,7 +21,7 @@ import pytest
 from voice_mode import client_identity
 from voice_mode.client_identity import ClientIdentity, owner_for_pid
 from voice_mode.conch import Conch
-from voice_mode.daemon import ClientIdentityMiddleware, IdleExit
+from voice_mode.daemon import DRAIN_MAX_SECONDS, ActiveRequests, ClientIdentityMiddleware, DrainingServer, IdleExit
 
 
 # Real, live client pids: a record whose owner pid is dead now counts as stale.
@@ -392,7 +393,7 @@ class TestServeDaemonFlag:
             exits.append(code)
             raise SystemExit(code)
         monkeypatch.setattr(os, "_exit", fake_exit)
-        with patch("uvicorn.Server", server), patch("uvicorn.Config"), \
+        with patch("voice_mode.daemon.DrainingServer", server), patch("uvicorn.Config"), \
                 patch("voice_mode.cli._init_event_logging"):
             result = CliRunner().invoke(voice_mode_main_cli, ["serve", "--daemon", "--port", "1"])
         assert result.exit_code == 0, result.output
@@ -402,3 +403,94 @@ class TestServeDaemonFlag:
         assert added[0].idle.seconds == 2700
         assert client_identity.SHARED_MODE is True
         assert "Idle exit after 2700s" in result.output
+
+
+class TestDrainingServer:
+    """A SIGTERM must not cut off a request still being answered (a live recording)."""
+
+    def _server(self, active, **kw):
+        import uvicorn
+        return DrainingServer(uvicorn.Config(lambda *a: None), active, **kw)
+
+    def test_sigterm_with_no_request_exits_right_away(self):
+        server = self._server(ActiveRequests(None))
+        server.handle_exit(signal.SIGTERM, None)
+        assert server.should_exit
+
+    def test_sigterm_during_a_request_waits_until_it_ends(self):
+        active = ActiveRequests(None)
+        server = self._server(active)
+        active.count = 1
+        server.handle_exit(signal.SIGTERM, None)
+        assert not server.should_exit
+        asyncio.run(server.on_tick(1))
+        assert not server.should_exit
+        active.count = 0
+        asyncio.run(server.on_tick(2))
+        assert server.should_exit
+
+    def test_a_stuck_request_stops_waiting_at_the_limit(self):
+        now = [0.0]
+        active = ActiveRequests(None)
+        server = self._server(active, max_wait=55, clock=lambda: now[0])
+        active.count = 1
+        server.handle_exit(signal.SIGTERM, None)
+        now[0] = 54
+        asyncio.run(server.on_tick(1))
+        assert not server.should_exit
+        now[0] = 55
+        asyncio.run(server.on_tick(2))
+        assert server.should_exit
+
+    def test_a_repeat_sigterm_does_not_restart_the_limit(self):
+        now = [0.0]
+        active = ActiveRequests(None)
+        server = self._server(active, max_wait=55, clock=lambda: now[0])
+        active.count = 1
+        server.handle_exit(signal.SIGTERM, None)
+        now[0] = 50
+        server.handle_exit(signal.SIGTERM, None)
+        now[0] = 55
+        asyncio.run(server.on_tick(1))
+        assert server.should_exit
+
+    def test_ctrl_c_is_not_held_back(self):
+        active = ActiveRequests(None)
+        server = self._server(active)
+        active.count = 1
+        server.handle_exit(signal.SIGINT, None)
+        assert server.should_exit
+
+    def test_limit_stays_under_launchds_60s_cap(self):
+        assert DRAIN_MAX_SECONDS < 60
+
+
+class TestActiveRequests:
+    def test_counts_http_until_the_app_returns(self):
+        seen = []
+
+        async def app(scope, receive, send):
+            seen.append(active.count)
+
+        active = ActiveRequests(app)
+        asyncio.run(active({"type": "http"}, None, None))
+        assert seen == [1] and active.count == 0
+
+    def test_a_failing_request_is_still_uncounted(self):
+        async def app(scope, receive, send):
+            raise RuntimeError("boom")
+
+        active = ActiveRequests(app)
+        with pytest.raises(RuntimeError):
+            asyncio.run(active({"type": "http"}, None, None))
+        assert active.count == 0
+
+    def test_lifespan_is_not_counted(self):
+        seen = []
+
+        async def app(scope, receive, send):
+            seen.append(active.count)
+
+        active = ActiveRequests(app)
+        asyncio.run(active({"type": "lifespan"}, None, None))
+        assert seen == [0]
