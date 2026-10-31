@@ -110,7 +110,7 @@ from voice_mode.audio_player import NonBlockingAudioPlayer, SPEAKING_FLAG_PATH, 
 from voice_mode import audio_player
 from voice_mode import airpods_press
 from voice_mode.pause_resume import dismissed_from_voice, resume_after_pause, pause_max_seconds, we_hold_floor
-from voice_mode import activity, audio_stop
+from voice_mode import activity, audio_stop, client_identity
 from voice_mode import barge_in
 from voice_mode import live_transcript
 from voice_mode.statistics_tracking import track_voice_interaction
@@ -1118,9 +1118,12 @@ def record_audio(duration: float, honor_send: bool = False, _attempt: int = 0) -
                 except:
                     old_device_name = 'Previous device'
                 
+                # Pa_Terminate would block on an abandoned stream.
+                if audio_stop.stuck():
+                    raise RuntimeError("an audio stream is stuck")
                 sd._terminate()
                 sd._initialize()
-                
+
                 # Get new default device info
                 try:
                     new_device = sd.query_devices(kind='input')
@@ -1175,6 +1178,17 @@ def record_audio(duration: float, honor_send: bool = False, _attempt: int = 0) -
 
 DISMISSED_RESULT = ("[DISMISSED] The user dismissed you from voice, so nothing was spoken and the mic "
                     "stayed closed. Reply in text only until the user runs /convomode again.")
+
+def _refusal(at: str) -> Optional[str]:
+    """Why this call must stop before making sound or opening the mic, or None."""
+    if dismissed_from_voice():
+        activity.log("call_refused_dismissed", at=at)
+        return DISMISSED_RESULT
+    if audio_stop.stuck():
+        activity.log("call_refused_audio_stuck", at=at)
+        return AUDIO_STUCK_RESULT
+    return None
+
 
 AUDIO_STUCK_RESULT = ("[AUDIO STUCK] An audio stream stopped responding, so this server can't open another "
                       "one and the mic stayed closed. Anything already spoken was heard. The shared service "
@@ -2511,9 +2525,12 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                     except:
                         old_device_name = 'Previous device'
                     
+                    # Pa_Terminate would block on an abandoned stream.
+                    if audio_stop.stuck():
+                        raise RuntimeError("an audio stream is stuck")
                     sd._terminate()
                     sd._initialize()
-                    
+
                     # Get new default device info
                     try:
                         new_device = sd.query_devices(kind='input')
@@ -2781,7 +2798,8 @@ consult the MCP resources listed above.
     # Pa_Terminate closes every stream in the process, so not while another tab's
     # call on the shared service is using one, and not with an abandoned stream.
     import sounddevice as sd
-    if not audio_operation_lock.locked() and not audio_stop.stuck():
+    _device_refresh_skipped = audio_operation_lock.locked() or audio_stop.stuck()
+    if not _device_refresh_skipped:
         sd._terminate()
         sd._initialize()
     
@@ -2834,12 +2852,9 @@ consult the MCP resources listed above.
                  listens=bool(wait_for_response))
 
     try:
-        if dismissed_from_voice():
-            activity.log("call_refused_dismissed", at="start")
-            return DISMISSED_RESULT
-        if audio_stop.stuck():
-            activity.log("call_refused_audio_stuck", at="start")
-            return AUDIO_STUCK_RESULT
+        refusal = _refusal("start")
+        if refusal:
+            return refusal
 
         # Try to acquire conch atomically (no race condition)
         # skip_conch=true bypasses coordination entirely: don't acquire, don't
@@ -2876,9 +2891,9 @@ consult the MCP resources listed above.
                 activity.log("mic_wait", holder=holder_agent)
                 waited = 0.0
                 while not conch.try_acquire() and waited < CONCH_TIMEOUT:
-                    if dismissed_from_voice():
-                        activity.log("call_refused_dismissed", at="waiting_for_mic", waited_seconds=round(waited, 1))
-                        return DISMISSED_RESULT
+                    refusal = _refusal("waiting_for_mic")
+                    if refusal:
+                        return refusal
                     # Ask a merely-listening holder to hand the mic over
                     # (vibedispatcher#132). Refreshed every poll so the request
                     # stays fresh; an idle holder yields within seconds.
@@ -2888,9 +2903,9 @@ consult the MCP resources listed above.
                     waited += CONCH_CHECK_INTERVAL
 
                 if not conch._acquired and CONCH_YIELD_ENABLED:
-                    if dismissed_from_voice():
-                        activity.log("call_refused_dismissed", at="waiting_for_mic", waited_seconds=round(waited, 1))
-                        return DISMISSED_RESULT
+                    refusal = _refusal("waiting_for_mic")
+                    if refusal:
+                        return refusal
                     # Hard timeout: preempt-and-acquire instead of failing — but
                     # NEVER mid-utterance (see _preempt_conch_after_tts_grace).
                     await _preempt_conch_after_tts_grace(conch)
@@ -2909,13 +2924,9 @@ consult the MCP resources listed above.
                     return f"Timed out waiting for conch ({CONCH_TIMEOUT}s). {holder_agent} is still speaking."
 
             # A dismissal that landed while this call was waiting.
-            if dismissed_from_voice():
-                activity.log("call_refused_dismissed", at="got_mic")
-                return DISMISSED_RESULT
-
-            if audio_stop.stuck():
-                activity.log("call_refused_audio_stuck", at="got_mic")
-                return AUDIO_STUCK_RESULT
+            refusal = _refusal("got_mic")
+            if refusal:
+                return refusal
 
             # Successfully acquired
             activity.log("mic_taken")
@@ -2947,6 +2958,14 @@ consult the MCP resources listed above.
         timings = {}
         try:
             async with audio_operation_lock:
+                # A call can wait for this lock a long time (skip_conch never waits for the conch).
+                refusal = _refusal("got_audio")
+                if refusal:
+                    return refusal
+                if _device_refresh_skipped:
+                    sd._terminate()
+                    sd._initialize()
+
                 # Speak the message
                 tts_start = time.perf_counter()
                 if not should_skip_tts:
@@ -2995,7 +3014,7 @@ consult the MCP resources listed above.
                         )
 
                     if barge_in_listener is not None:
-                        barge_in_result = barge_in_listener.stop()
+                        barge_in_result = await asyncio.to_thread(barge_in_listener.stop)
                         if barge_in_result.triggered:
                             logger.info("🗣️ Natural mode: William spoke over the agent — treating it as the next turn")
 
@@ -3022,6 +3041,8 @@ consult the MCP resources listed above.
                         # what's left of the budget after the TTS already played.
                         max_seconds=max(0.0, pause_max_seconds() - (time.perf_counter() - tts_start)),
                     )
+                    if pause_outcome and pause_outcome.dismissed:
+                        return DISMISSED_RESULT
                     if pause_outcome and pause_outcome.handed_off:
                         return (
                             f"[FLOOR HANDED OFF — not delivered: {pause_outcome.undelivered_text}] "
@@ -3167,6 +3188,11 @@ consult the MCP resources listed above.
 
                 natural_mode_barge_in = barge_in_result is not None and barge_in_result.triggered
 
+                # Dismissed while speaking, or the speech stream stuck: don't open the mic.
+                refusal = _refusal("before_listen")
+                if refusal:
+                    return refusal
+
                 if natural_mode_barge_in:
                     # He was already mid-utterance when he interrupted -- a
                     # "listening" chime now would be a confusing non-sequitur
@@ -3175,16 +3201,6 @@ consult the MCP resources listed above.
                     # with the audio the barge-in listener already captured.
                     logger.info("🎤 Natural mode barge-in — continuing to listen without a chime")
                 else:
-                    # Dismissed while speaking: don't open the mic.
-                    if dismissed_from_voice():
-                        activity.log("call_refused_dismissed", at="before_listen")
-                        return DISMISSED_RESULT
-
-                    # A stuck speech stream: anything else opened here would block too.
-                    if audio_stop.stuck():
-                        activity.log("call_refused_audio_stuck", at="before_listen")
-                        return AUDIO_STUCK_RESULT
-
                     # Brief pause before listening
                     await asyncio.sleep(0.5)
 
@@ -3201,9 +3217,9 @@ consult the MCP resources listed above.
                     # Record response
                     logger.info(f"🎤 Listening for {listen_duration_max} seconds...")
 
-                if audio_stop.stuck():
-                    activity.log("call_refused_audio_stuck", at="before_record")
-                    return AUDIO_STUCK_RESULT
+                refusal = _refusal("before_record")
+                if refusal:
+                    return refusal
 
                 # Log recording start
                 activity.log("listen_start")
@@ -3228,11 +3244,18 @@ consult the MCP resources listed above.
                     if (CONCH_ENABLED and CONCH_YIELD_ENABLED and conch._acquired)
                     else None
                 )
-                listen_supersede_check = (
+                _conch_superseded = (
                     conch.is_superseded
                     if (CONCH_ENABLED and conch._acquired)
                     else None
                 )
+                # The recording thread has no tool-call context, so the caller is captured here.
+                _caller_pid = client_identity.current_client_pid()
+
+                def listen_supersede_check():
+                    if dismissed_from_voice(_caller_pid):
+                        return True
+                    return bool(_conch_superseded and _conch_superseded())
 
                 # Every listen-again call site in this function MUST route
                 # through here rather than calling record_audio_with_silence_
@@ -3505,6 +3528,10 @@ consult the MCP resources listed above.
                 if response_text and should_repeat(response_text):
                     logger.info(f"🔁 Repeat requested: '{response_text}'")
 
+                    refusal = _refusal("before_repeat")
+                    if refusal:
+                        return refusal
+
                     # Play system message for repeat
                     await play_system_audio("repeating", fallback_text="Repeating")
 
@@ -3521,7 +3548,7 @@ consult the MCP resources listed above.
                                 # Read and play the audio file using non-blocking player
                                 data, samplerate = sf.read(audio_path)
                                 player = NonBlockingAudioPlayer()
-                                player.play(data, samplerate, blocking=True)
+                                await asyncio.to_thread(player.play, data, samplerate, blocking=True)
                                 logger.info("Audio replay completed")
                             except Exception as e:
                                 logger.warning(f"Failed to replay cached audio: {e}. Regenerating...")
@@ -3558,6 +3585,9 @@ consult the MCP resources listed above.
 
                         # Listen again for response - reuse the recording logic
                         logger.info("Listening for response after repeat...")
+                        refusal = _refusal("before_listen_after_repeat")
+                        if refusal:
+                            return refusal
 
                         # Play "listening" feedback sound
                         await play_audio_feedback(
@@ -3622,6 +3652,10 @@ consult the MCP resources listed above.
                     await play_system_audio("waiting-1-minute", fallback_text="Waiting one minute")
 
                     await asyncio.sleep(WAIT_DURATION)
+
+                    refusal = _refusal("after_wait")
+                    if refusal:
+                        return refusal
 
                     # Play system message when ready to listen again
                     await play_system_audio("ready-to-listen", fallback_text="Ready to listen")

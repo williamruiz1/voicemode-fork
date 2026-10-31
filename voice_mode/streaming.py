@@ -934,10 +934,7 @@ async def stream_with_buffering(
                 logger.error(f"Failed to decode final buffer: {e}")
         
         if pause_cut:
-            try:
-                stream.abort()
-            except Exception:
-                pass
+            await audio_stop.stop_stream_async(stream, abort=True, close=False)
             _mark_buffered_pause(metrics, text, stream, samples_written, sample_rate)
 
         metrics.generation_time = time.perf_counter() - start_time

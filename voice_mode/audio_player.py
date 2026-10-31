@@ -21,6 +21,9 @@ logger = logging.getLogger("voicemode.audio_player")
 # Longest wait for the callback's own stop before stopping anyway.
 STREAM_FINISH_WAIT_SECONDS = 2.0
 
+# How far past its length a clip can run before its stream counts as dead.
+PLAYBACK_MARGIN_SECONDS = 10.0
+
 # --- Convomode live pause (interrupt mid-sentence) ---------------------------
 # The menu-bar widget (or `convomode-floor.py`) can pause live speech the instant
 # William taps Pause — e.g. an incoming phone call — by creating the flag file
@@ -279,6 +282,7 @@ class NonBlockingAudioPlayer:
         self.buffer_size = buffer_size
         self.audio_queue: Optional[queue.Queue] = None
         self.stream: Optional[sd.OutputStream] = None
+        self._audio_seconds = 0.0
         self._stream_finished = threading.Event()
         self._end_requested = False
         self.playback_complete = threading.Event()
@@ -375,6 +379,10 @@ class NonBlockingAudioPlayer:
         Raises:
             Exception: If playback error occurs
         """
+        # After a stuck stop, opening another stream blocks forever.
+        if audio_stop.stuck():
+            raise RuntimeError("an audio stream is stuck")
+
         # Reset state
         self.playback_complete.clear()
         self.playback_error = None
@@ -385,6 +393,8 @@ class NonBlockingAudioPlayer:
         # Ensure samples are float32
         if samples.dtype != np.float32:
             samples = samples.astype(np.float32)
+
+        self._audio_seconds = len(samples) / sample_rate
 
         # Determine number of channels
         if samples.ndim == 1:
@@ -462,11 +472,15 @@ class NonBlockingAudioPlayer:
         """Wait for playback to complete.
 
         Args:
-            timeout: Maximum time to wait in seconds (None = wait forever)
+            timeout: Maximum time to wait in seconds (None = the clip's length plus a
+                margin: a device that stops calling back must not hold the audio lock forever)
 
         Raises:
             Exception: If playback error occurred
         """
+        if timeout is None:
+            timeout = self._audio_seconds + PLAYBACK_MARGIN_SECONDS
+
         # Wait for playback to complete
         if not self.playback_complete.wait(timeout=timeout):
             logger.warning("Playback wait timed out")

@@ -49,6 +49,13 @@ def no_abandoned_streams():
 
 
 @pytest.fixture
+def fresh_audio_lock(monkeypatch):
+    """The module's lock binds to the first event loop that contends for it; each test has its own."""
+    from voice_mode.tools import converse as mod
+    monkeypatch.setattr(mod, "audio_operation_lock", asyncio.Lock())
+
+
+@pytest.fixture
 def clean_conch():
     if Conch.LOCK_FILE.exists():
         Conch.LOCK_FILE.unlink()
@@ -98,6 +105,24 @@ class TestStuckStop:
         stream.abort.side_effect = RuntimeError("no")
         assert audio_stop.stop_stream(stream, abort=True) is True
         stream.stop.assert_called_once()
+
+
+class TestPlayerBounds:
+    def test_a_stream_whose_callback_never_runs_cannot_hold_the_wait_forever(self, monkeypatch):
+        monkeypatch.setattr(audio_player, "STREAM_FINISH_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(audio_player, "PLAYBACK_MARGIN_SECONDS", 0.05)
+        player = audio_player.NonBlockingAudioPlayer()
+        player.stream = MagicMock()
+        started = time.monotonic()
+        player.wait()
+        assert time.monotonic() - started < 2
+        assert player.stream is None
+
+    def test_no_new_stream_in_a_stuck_process(self):
+        audio_stop._abandoned.append(object())
+        with patch.object(audio_player.sd, "OutputStream") as opened, pytest.raises(RuntimeError):
+            audio_player.NonBlockingAudioPlayer().play(np.zeros(8, dtype=np.float32), 24000)
+        opened.assert_not_called()
 
 
 class TestPlayerWaitsForCallbackStop:
@@ -161,6 +186,34 @@ class TestDismissed:
         assert pause_resume.dismissed_from_voice() is False
 
 
+class TestDismissedAfterPause:
+    @pytest.mark.asyncio
+    async def test_the_pause_pulse_of_a_dismissal_does_not_replay_the_rest(self):
+        """Dismissed holder, nobody queued: the floor is empty, so it isn't a hand-off."""
+        replay = AsyncMock()
+        with patch.object(pause_resume, "wait_for_resume", AsyncMock(return_value=True)), \
+             patch.object(pause_resume, "dismissed_from_voice", return_value=True), \
+             patch.object(pause_resume, "we_hold_floor", return_value=None):
+            outcome = await pause_resume.resume_after_pause(
+                "whole", {"paused": True, "undelivered_text": "rest"}, replay, held_floor_at_start=True)
+        assert outcome.dismissed is True
+        replay.assert_not_called()
+
+
+class TestDismissedDuringListen:
+    def test_chain_is_looked_up_once_and_a_thread_can_pass_the_caller(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pause_resume, "DISMISS_DIR", str(tmp_path))
+        monkeypatch.setattr(client_identity, "SHARED_MODE", True)
+        monkeypatch.setattr(pause_resume, "_session_chains", {})
+        (tmp_path / "1111").write_text("other tab")
+        with patch.object(pause_resume, "_ancestor_pids", return_value={4242}) as chain:
+            assert pause_resume.dismissed_from_voice(4242) is False
+            assert pause_resume.dismissed_from_voice(4242) is False
+            (tmp_path / "4242").write_text("x")
+            assert pause_resume.dismissed_from_voice(4242) is True
+        chain.assert_called_once()
+
+
 class TestDismissedDuringCall:
     """The 6:32 AM report: dismissed while waiting for the mic, then spoke anyway."""
 
@@ -175,7 +228,7 @@ class TestDismissedDuringCall:
              patch.object(Conch, "request_yield"), \
              patch.object(mod, "CONCH_CHECK_INTERVAL", 0.01), \
              patch.object(mod, "text_to_speech_with_failover", tts), \
-             patch.object(mod, "dismissed_from_voice", side_effect=lambda: next(answers, True)):
+             patch.object(mod, "dismissed_from_voice", side_effect=lambda *a: next(answers, True)):
             result = await getattr(mod.converse, "fn", mod.converse)(
                 message="hello", wait_for_response=False, wait_for_conch=True)
 
@@ -191,7 +244,7 @@ class TestDismissedDuringCall:
         tts = AsyncMock()
         answers = iter([False, True])
         with patch.object(mod, "text_to_speech_with_failover", tts), \
-             patch.object(mod, "dismissed_from_voice", side_effect=lambda: next(answers, True)):
+             patch.object(mod, "dismissed_from_voice", side_effect=lambda *a: next(answers, True)):
             result = await getattr(mod.converse, "fn", mod.converse)(message="hello", wait_for_response=False)
 
         assert "DISMISSED" in result
@@ -247,9 +300,52 @@ class TestStuckAudioRefusesCalls:
         record.assert_not_called()
 
 
+class TestWaitingOnTheAudioLock:
+    @pytest.mark.asyncio
+    async def test_a_skip_conch_call_dismissed_while_waiting_stays_silent(self, clean_conch, activity_log, fresh_audio_lock):
+        from voice_mode.tools import converse as mod
+
+        tts = AsyncMock()
+        answers = iter([False])
+
+        async def call():
+            return await getattr(mod.converse, "fn", mod.converse)(
+                message="hello", wait_for_response=False, skip_conch=True)
+
+        with patch.object(mod, "text_to_speech_with_failover", tts), \
+             patch.object(mod, "dismissed_from_voice", side_effect=lambda *a: next(answers, True)):
+            async with mod.audio_operation_lock:
+                task = asyncio.ensure_future(call())
+                await asyncio.sleep(0.2)
+            result = await task
+        assert "DISMISSED" in result
+        tts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_skipped_device_refresh_happens_once_it_has_the_lock(self, clean_conch, activity_log, fresh_audio_lock):
+        import sounddevice as sd
+        from voice_mode.tools import converse as mod
+
+        tts = AsyncMock(return_value=(True, {}, {"provider": "test", "voice": "x"}))
+
+        async def call():
+            return await getattr(mod.converse, "fn", mod.converse)(
+                message="hello", wait_for_response=False, skip_conch=True)
+
+        with patch.object(sd, "_terminate") as term, patch.object(sd, "_initialize"), \
+             patch.object(mod, "text_to_speech_with_failover", tts), \
+             patch.object(mod, "dismissed_from_voice", return_value=False):
+            async with mod.audio_operation_lock:
+                task = asyncio.ensure_future(call())
+                await asyncio.sleep(0.2)
+                term.assert_not_called()
+            await task
+        term.assert_called_once()
+
+
 class TestRefreshSkipped:
     @pytest.mark.asyncio
-    async def test_no_device_refresh_while_another_call_is_using_audio(self, clean_conch, activity_log):
+    async def test_no_device_refresh_while_another_call_is_using_audio(self, clean_conch, activity_log, fresh_audio_lock):
         """Pa_Terminate closes every stream in the process, another tab's mic included."""
         import sounddevice as sd
         from voice_mode.tools import converse as mod

@@ -13,6 +13,7 @@ Read it with `voice-activity.py` (claude-user-config, bin/founder-os).
 from __future__ import annotations
 
 import datetime
+import fcntl
 import json
 import logging
 import os
@@ -38,6 +39,22 @@ def _tab_name(client_pid: Optional[int]) -> Optional[str]:
         return None
 
 
+def _rotate_if_full(path: str) -> None:
+    """Roll once however many servers notice: only the lock holder rolls, after re-checking."""
+    try:
+        if os.path.getsize(path) <= MAX_BYTES:
+            return
+        fd = os.open(path + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.path.getsize(path) > MAX_BYTES:
+                os.replace(path, path + ".1")
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def log(event: str, **fields) -> None:
     """Append one event. The calling tab is added when a tool call is in progress."""
     try:
@@ -58,11 +75,7 @@ def log(event: str, **fields) -> None:
         entry.update(fields)
         path = _path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        try:
-            if os.path.getsize(path) > MAX_BYTES:
-                os.replace(path, path + ".1")
-        except OSError:
-            pass
+        _rotate_if_full(path)
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
             os.write(fd, (json.dumps(entry, ensure_ascii=False) + "\n").encode())
