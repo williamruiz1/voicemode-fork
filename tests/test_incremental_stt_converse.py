@@ -112,10 +112,12 @@ def test_partials_reach_feed_with_turn_id(monkeypatch, tmp_path):
     feed = tmp_path / "f.jsonl"
     monkeypatch.setattr(lt, "feed_path", lambda: feed)
     monkeypatch.setattr(lt, "resolve_client_pid", lambda: 11)
+    monkeypatch.setenv("VOICEMODE_INCREMENTAL_STT_ROLLING_S", "0")
     audio = talk(30)
     with patch.object(cv, "speech_to_text", fake_stt_factory(0, [])):
         inc = cv._make_incremental("conv_77", "local")
         inc.begin(None)
+        inc.mark_speech()
         for i in range(0, len(audio), int(0.1 * SR)):
             inc.feed(audio[i:i + int(0.1 * SR)])
         inc.collect(audio)
@@ -132,6 +134,7 @@ def test_recorders_feed_incremental(monkeypatch):
         def __init__(self): self.began, self.fed = 0, 0
         def begin(self, pre): self.began += 1
         def feed(self, c): self.fed += len(c)
+        def mark_speech(self): pass
 
     chunk = np.ones(int(SR * cv.VAD_CHUNK_DURATION_MS / 1000), dtype=np.int16)
 
@@ -172,6 +175,7 @@ def test_default_vad_recorder_feeds_incremental(monkeypatch):
         def __init__(self): self.began, self.fed = [], 0
         def begin(self, pre): self.began.append(pre)
         def feed(self, c): self.fed += len(c)
+        def mark_speech(self): pass
 
     q = MagicMock()
     q.get.side_effect = list(chunks)

@@ -850,6 +850,8 @@ def _make_incremental(turn_id: str, transport: str = "local"):
         transcribe=lambda seg: _incremental_segment_stt(seg, transport),
         sample_rate=SAMPLE_RATE,
         on_partial=lambda text: live_transcript.append_event("user_partial", turn_id, text, client_pid),
+        rolling_s=live_transcript.rolling_seconds(),
+        wait_for_speech=True,
     )
 
 
@@ -1577,6 +1579,7 @@ def _record_held_until_send(fallback_max_duration: float, listen_stats: Optional
     chunks = []
     if incremental is not None:
         incremental.begin(None)
+        incremental.mark_speech()  # no VAD here to say when speech starts
     recorded = 0.0
     loop_done = False
     started = time.monotonic()
@@ -2373,6 +2376,8 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                                 if VAD_DEBUG:
                                     logger.info(f"[VAD_DEBUG] STATE CHANGE: WAITING_FOR_SPEECH -> SPEECH_ACTIVE at t={recording_duration:.1f}s")
                                 speech_detected = True
+                                if incremental is not None:
+                                    incremental.mark_speech()
                             if VAD_DEBUG and int(recording_duration * 1000) % 500 == 0:
                                 logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: speech_prob={endpoint_state.speech_prob:.3f}, "
                                             f"speech_started={endpoint_state.speech_started}, endpointed={endpoint_state.endpointed}")
@@ -2424,6 +2429,8 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                                         logger.info(f"[VAD_DEBUG] STATE CHANGE: WAITING_FOR_SPEECH -> SPEECH_ACTIVE at t={recording_duration:.1f}s")
                                     speech_detected = True
                                     silence_duration_ms = 0
+                                    if incremental is not None:
+                                        incremental.mark_speech()
                                 # No timeout in this state - just keep waiting
                                 # The only exit is speech detection or max_duration
                             else:
