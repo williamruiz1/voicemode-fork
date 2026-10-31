@@ -851,6 +851,33 @@ def _make_incremental(turn_id: str, transport: str = "local"):
     )
 
 
+def _no_speech_message(audio_data) -> str:
+    """"No speech detected", plus a mic hint when the recording itself was near-silent.
+
+    A clip under the silence-gate floor means the input delivered almost no sound, so a
+    person who did speak needs to hear that the mic is the problem. Callers match the
+    "No speech detected" prefix, so it stays first. Fail-open: never raises.
+    """
+    message = "No speech detected"
+    try:
+        from voice_mode.config import STT_SILENCE_RMS_FLOOR
+        if audio_data is None or len(audio_data) == 0 or STT_SILENCE_RMS_FLOOR <= 0:
+            return message
+        rms = float(np.sqrt(np.mean((audio_data.astype(np.float64) / 32768.0) ** 2)))
+        if rms >= STT_SILENCE_RMS_FLOOR:
+            return message
+        try:
+            device = str(sd.query_devices(kind='input')['name'])
+        except Exception:
+            device = "unknown"
+        return (
+            f"{message}. The mic recorded almost nothing (input: {device}). "
+            "If you spoke, check that mic or switch the input device"
+        )
+    except Exception:
+        return message
+
+
 async def _speech_to_text_incremental(audio_data, incremental, save_audio, audio_dir, transport):
     """Transcribe a finished recording. With finished incremental segments only the
     untranscribed tail goes to STT and the texts are joined; any segment failure
@@ -3756,10 +3783,11 @@ consult the MCP resources listed above.
                     result = f"Voice response: {response_text}{stt_info} | Timing: {timing_str}"
                 success = True
             else:
+                no_speech = _no_speech_message(locals().get("audio_data"))
                 if effective_metrics_level == "minimal":
-                    result = "No speech detected"
+                    result = no_speech
                 else:
-                    result = f"No speech detected | Timing: {timing_str}"
+                    result = f"{no_speech} | Timing: {timing_str}"
                 success = True  # Not an error, just no speech
 
             # W3c: surface barge-in truncation context (if any) ahead of the
