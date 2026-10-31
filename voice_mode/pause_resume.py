@@ -38,6 +38,7 @@ def pause_max_seconds() -> float:
 
 
 FLOOR_QUEUE_PATH = os.path.expanduser("~/.voicemode/floor-queue.json")
+DISMISS_DIR = os.path.expanduser("~/.voicemode/convomode-dismissed")
 
 
 def _ancestor_pids(pid: Optional[int] = None, limit: int = 12) -> set:
@@ -56,6 +57,9 @@ def _ancestor_pids(pid: Optional[int] = None, limit: int = 12) -> set:
         except Exception:
             break
     return chain
+
+
+_session_chains: dict = {}
 
 
 def floor_holder_pid() -> Optional[int]:
@@ -86,6 +90,27 @@ def we_hold_floor() -> Optional[bool]:
     return holder in _ancestor_pids(client_pid)
 
 
+def dismissed_from_voice(client_pid: Optional[int] = None) -> bool:
+    """True if the user dismissed this session from voice (the widget's X).
+
+    The hooks check this when a call starts. A call already running (waiting for
+    the mic, speaking, listening) is past them, so converse asks again. Pass the
+    caller's pid from a thread with no tool-call context. A session's parent chain
+    doesn't change, so it is looked up once: this runs on every poll of a listen."""
+    try:
+        markers = set(os.listdir(DISMISS_DIR))
+    except OSError:
+        return False
+    if not markers:
+        return False
+    client_pid = client_pid or client_identity.current_client_pid()
+    if client_pid is None and client_identity.SHARED_MODE:
+        return False
+    if client_pid not in _session_chains:
+        _session_chains[client_pid] = _ancestor_pids(client_pid)
+    return any(str(pid) in markers for pid in _session_chains[client_pid])
+
+
 def floor_handed_off(held_at_start: bool) -> bool:
     """True only if this session held the floor when it started speaking and a
     DIFFERENT holder is recorded now (a jump/advance displaced it)."""
@@ -98,6 +123,7 @@ class PauseOutcome:
     replayed: bool = False
     skipped_by_send: bool = False
     handed_off: bool = False
+    dismissed: bool = False
     undelivered_text: str = ""
     paused_for_seconds: float = 0.0
     final_metrics: Optional[dict] = field(default=None)
@@ -159,6 +185,10 @@ async def resume_after_pause(
         remaining = current.get("undelivered_text")
         if remaining is None:
             remaining = message  # unknown split: replay all rather than lose any
+        # A dismissal pulses pause.flag too; with nobody queued there's no new holder to see.
+        if dismissed_from_voice():
+            outcome.dismissed = True
+            break
         # A floor jump/advance pulses pause.flag to cut the displaced holder; the
         # flag clearing then is NOT a Proceed. Don't talk over the new holder.
         if floor_handed_off(held_floor_at_start):

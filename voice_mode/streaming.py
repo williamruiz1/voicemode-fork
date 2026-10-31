@@ -31,6 +31,7 @@ from .config import (
 )
 from .utils import get_event_logger, update_latest_symlinks
 from . import audio_player
+from . import audio_stop
 from . import barge_in
 from .truncation import estimate_truncation
 from .tts_split import split_first_piece
@@ -252,8 +253,7 @@ class AudioStreamPlayer:
         """Stop playback and cleanup."""
         self.playing = False
         if self.stream:
-            self.stream.stop()
-            self.stream.close()
+            await audio_stop.stop_stream_async(self.stream)
         logger.debug("Audio stream stopped")
 
 
@@ -573,11 +573,7 @@ async def stream_pcm_audio(
             # letting it drain (stream.stop()'s normal behaviour), so
             # bytes_received stays the closest available measure of what
             # was actually audible.
-            try:
-                stream.abort()
-            except Exception as e:
-                logger.debug(f"stream.abort() failed, falling back to stop(): {e}")
-                stream.stop()
+            await audio_stop.stop_stream_async(stream, abort=True, close=False)
 
             # elapsed_audio_seconds is EXACT (16-bit mono PCM at SAMPLE_RATE
             # -- 2 bytes/sample). The barge-in listener only fires after
@@ -624,7 +620,7 @@ async def stream_pcm_audio(
                 )
         else:
             # Wait for playback to finish
-            stream.stop()
+            await audio_stop.stop_stream_async(stream, close=False)
 
         if getattr(response, "remainder_failed", False) and not metrics.truncated:
             # Only the tail is missing: report it the way a cut is reported so
@@ -716,7 +712,7 @@ async def stream_pcm_audio(
         if speaking_marked:
             audio_player.playback_finished()
         if stream:
-            stream.close()
+            await audio_stop.stop_stream_async(stream, stop=False)
 
 
 async def stream_tts_audio(
@@ -938,10 +934,7 @@ async def stream_with_buffering(
                 logger.error(f"Failed to decode final buffer: {e}")
         
         if pause_cut:
-            try:
-                stream.abort()
-            except Exception:
-                pass
+            await audio_stop.stop_stream_async(stream, abort=True, close=False)
             _mark_buffered_pause(metrics, text, stream, samples_written, sample_rate)
 
         metrics.generation_time = time.perf_counter() - start_time
@@ -971,5 +964,4 @@ async def stream_with_buffering(
         if speaking_marked:
             audio_player.playback_finished()
         if stream:
-            stream.stop()
-            stream.close()
+            await audio_stop.stop_stream_async(stream)
