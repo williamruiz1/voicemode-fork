@@ -151,6 +151,11 @@ def incremental_stt_enabled() -> bool:
     return os.getenv("VOICEMODE_INCREMENTAL_STT", "true").strip().lower() in ("1", "true", "yes", "on")
 
 
+def rolling_seconds() -> float:
+    """How often the words so far are re-transcribed for display. 0 turns it off."""
+    return _env_float("VOICEMODE_INCREMENTAL_STT_ROLLING_S", 2.0)
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, default))
@@ -169,14 +174,26 @@ class IncrementalTranscriber:
     ``transcribe`` is a blocking callable ``(int16 ndarray) -> str`` (return ""
     for no speech, raise on failure); it runs on a single worker thread so
     segment order is preserved and the recorder loop never blocks.
+
+    With ``rolling_s`` set, what has been said since the last cut is also
+    transcribed every ``rolling_s`` seconds and published as provisional text, so
+    the words show while the user talks, not only when a segment ends. That text is
+    for display only: the turn's final text still comes from the segments. Segments
+    go first (Whisper handles one request at a time), and a rolling failure only
+    ends the rolling updates. ``transcribe_rolling`` must never fail over to a paid
+    provider: it runs every few seconds. With ``wait_for_speech``, nothing is published until
+    ``mark_speech()``: Whisper invents words from a quiet room.
     """
 
     FRAME_S = 0.05
+    ROLLING_MIN_NEW_S = 0.8     # don't re-transcribe for less new audio than this
 
     def __init__(self, transcribe: Callable[[np.ndarray], str], sample_rate: int,
                  on_partial: Optional[Callable[[str], None]] = None,
                  min_segment_s: Optional[float] = None, max_segment_s: Optional[float] = None,
-                 pause_s: float = 0.4, silence_rms: float = 0.01):
+                 pause_s: float = 0.4, silence_rms: float = 0.01,
+                 rolling_s: float = 0.0, wait_for_speech: bool = False,
+                 transcribe_rolling: Optional[Callable[[np.ndarray], str]] = None):
         self._transcribe = transcribe
         self._sr = sample_rate
         self._on_partial = on_partial
@@ -189,6 +206,11 @@ class IncrementalTranscriber:
         self._silence_rms = silence_rms
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="incremental-stt")
         self._lock = threading.Lock()
+        self._rolling_s = rolling_s
+        self._transcribe_rolling = transcribe_rolling or transcribe
+        self._rolling_stop = threading.Event()
+        self._rolling_thread: Optional[threading.Thread] = None
+        self._speech_seen = not wait_for_speech
         self._reset()
 
     def _reset(self) -> None:
@@ -201,6 +223,10 @@ class IncrementalTranscriber:
         self._futures: list = []
         self._texts: dict = {}
         self._failed = False
+        self._tail_text = ""        # provisional text of the audio not yet cut
+        self._provisional: dict = {}  # provisional text of a cut segment still being transcribed
+        self._rolled_at = 0         # total samples fed when the tail was last transcribed
+        self._display_from = 0      # first segment cut after speech was heard
 
     # -- recorder-facing --
 
@@ -211,6 +237,9 @@ class IncrementalTranscriber:
         same audio; otherwise everything is dropped (whole-file fallback).
         """
         try:
+            if pre_roll is not None and len(pre_roll):
+                self.mark_speech()  # a barge-in's audio, or a listen resuming after device recovery
+            self._start_rolling()
             if pre_roll is not None and len(pre_roll) >= self._consumed and self._consumed > 0 \
                     and self._crc(pre_roll[:self._consumed]) == self._fingerprint:
                 self._buf, self._buf_len = [], 0
@@ -236,6 +265,70 @@ class IncrementalTranscriber:
         except Exception as e:
             logger.debug(f"incremental STT feed failed (falling back): {e}")
             self._failed = True
+
+    def mark_speech(self) -> None:
+        """The recorder heard speech: text can show from here on. Segments cut before
+        now are left out of the display (not the final text): they were a quiet room."""
+        if not self._speech_seen:
+            self._display_from = len(self._futures)
+        self._speech_seen = True
+
+    def stop_rolling(self) -> None:
+        """The listen is over: don't compete with the final transcription for Whisper."""
+        self._rolling_stop.set()
+
+    def _start_rolling(self) -> None:
+        if self._rolling_s <= 0 or self._on_partial is None or self._rolling_thread is not None:
+            return
+        self._rolling_thread = threading.Thread(target=self._rolling_loop, daemon=True,
+                                                name="incremental-stt-rolling")
+        self._rolling_thread.start()
+
+    def _rolling_loop(self) -> None:
+        while not self._rolling_stop.wait(self._rolling_s):
+            try:
+                self._roll_once()
+            except Exception as e:
+                logger.debug(f"incremental STT rolling update failed, stopping them: {e}")
+                return
+
+    def _roll_once(self) -> None:
+        if not self._speech_seen or self._failed:
+            return
+        with self._lock:
+            if any(i not in self._texts for i in range(len(self._futures))):
+                return  # a segment is waiting for Whisper; it goes first
+        gen, base, parts = self._gen, self._consumed, list(self._buf)
+        if not parts:
+            return
+        tail = np.concatenate(parts)
+        total = base + len(tail)
+        if len(tail) < self.ROLLING_MIN_NEW_S * self._sr or total - self._rolled_at < self.ROLLING_MIN_NEW_S * self._sr:
+            return
+        if self._rms(tail[-(total - self._rolled_at):]) < self._silence_rms:
+            return  # nothing new was said
+        self._rolled_at = total
+        text = (self._transcribe_rolling(tail) or "").strip()
+        with self._lock:
+            # Cut or restarted meanwhile: this audio now belongs to a segment.
+            if gen != self._gen or base != self._consumed or self._rolling_stop.is_set():
+                return
+            self._tail_text = text
+            partial = self._display_text()
+        self._publish(partial)
+
+    def _display_text(self) -> str:
+        """Finished segments, then provisional text for the rest. Caller holds the lock."""
+        pieces = [self._texts.get(i) or self._provisional.get(i, "") for i in range(self._display_from, len(self._futures))]
+        pieces.append(self._tail_text)
+        return " ".join(p for p in pieces if p)
+
+    def _publish(self, partial: str) -> None:
+        if partial and self._on_partial and self._speech_seen:
+            try:
+                self._on_partial(partial)
+            except Exception as e:
+                logger.debug(f"incremental STT partial publish failed (ignored): {e}")
 
     def _rms(self, a: np.ndarray) -> float:
         if len(a) == 0:
@@ -269,7 +362,9 @@ class IncrementalTranscriber:
         self._consumed += len(segment)
         self._fingerprint = self._crc(segment)  # same as crc of the recording's prefix ending here
         idx = len(self._futures)
-        self._futures.append(self._pool.submit(self._run_segment, self._gen, idx, segment))
+        with self._lock:
+            self._provisional[idx], self._tail_text = self._tail_text, ""
+            self._futures.append(self._pool.submit(self._run_segment, self._gen, idx, segment))
 
     def _run_segment(self, gen: int, idx: int, segment: np.ndarray) -> None:
         try:
@@ -284,18 +379,8 @@ class IncrementalTranscriber:
             if gen != self._gen:
                 return  # stale: the recording was restarted while this ran
             self._texts[idx] = text
-            # Only the contiguous prefix of finished segments is a valid cumulative text.
-            ordered, i = [], 0
-            while i in self._texts:
-                if self._texts[i]:
-                    ordered.append(self._texts[i])
-                i += 1
-            partial = " ".join(ordered)
-        if partial and self._on_partial:
-            try:
-                self._on_partial(partial)
-            except Exception as e:
-                logger.debug(f"incremental STT partial publish failed (ignored): {e}")
+            partial = self._display_text()
+        self._publish(partial)
 
     def _futures_cancel(self) -> None:
         for f in self._futures:
@@ -314,6 +399,7 @@ class IncrementalTranscriber:
         recorded audio no longer matches what was cut): transcribe the whole
         recording instead. Blocking -- call from an executor.
         """
+        self._rolling_stop.set()
         try:
             for f in self._futures:
                 f.result()
@@ -334,5 +420,6 @@ class IncrementalTranscriber:
 
     def close(self) -> None:
         """Release the worker without collecting (turn abandoned)."""
+        self._rolling_stop.set()
         self._futures_cancel()
         self._pool.shutdown(wait=False)

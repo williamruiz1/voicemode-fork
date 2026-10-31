@@ -6,6 +6,8 @@ import os
 import time
 from unittest.mock import patch
 
+import threading
+
 import numpy as np
 import pytest
 
@@ -352,3 +354,171 @@ def test_stale_segment_failure_does_not_poison_new_recording():
     gate.set()
     inc._pool.shutdown(wait=True)
     assert not inc._failed
+
+
+# -- words while talking --------------------------------------------------------
+
+LOUD = (np.ones(SR // 2, dtype=np.int16) * 8000)
+QUIET = np.zeros(SR // 2, dtype=np.int16)
+
+
+def rolling(stt, partials, **kw):
+    inc = lt.IncrementalTranscriber(stt, SR, on_partial=partials.append, rolling_s=100, **kw)
+    inc.begin(None)
+    return inc
+
+
+def test_words_show_before_a_segment_is_cut():
+    partials = []
+    inc = rolling(lambda a: f"{len(a) / SR:.0f}s", partials)
+    inc.feed(LOUD), inc.feed(LOUD)
+    inc._roll_once()
+    assert partials == ["1s"]
+    assert inc.segments_started == 0
+    inc.close()
+
+
+def test_no_new_audio_means_no_new_request():
+    calls = []
+    inc = rolling(lambda a: calls.append(1) or "x", [])
+    inc.feed(LOUD), inc.feed(LOUD)
+    inc._roll_once(), inc._roll_once()
+    assert len(calls) == 1
+    inc.close()
+
+
+def test_quiet_after_speech_sends_nothing_to_whisper():
+    calls = []
+    inc = rolling(lambda a: calls.append(1) or "x", [])
+    inc.feed(LOUD), inc.feed(LOUD)
+    inc._roll_once()
+    inc.feed(QUIET), inc.feed(QUIET)
+    inc._roll_once()
+    assert len(calls) == 1
+    inc.close()
+
+
+def test_invented_words_from_a_quiet_room_never_show():
+    """B9: nothing is published until the recorder has heard speech."""
+    partials = []
+    inc = rolling(lambda a: "Blink", partials, wait_for_speech=True, min_segment_s=1.0, max_segment_s=4.0)
+    inc.feed(LOUD), inc.feed(LOUD), inc.feed(QUIET)  # a pause: this segment is cut
+    assert inc.segments_started == 1
+    inc._roll_once()
+    for f in inc._futures:
+        f.result()
+    assert partials == []
+    inc.mark_speech()
+    inc._transcribe_rolling = lambda a: "hello there"
+    inc.feed(LOUD), inc.feed(LOUD)
+    inc._roll_once()
+    assert partials[-1] == "hello there", "segments from before speech stay off the display"
+    inc.close()
+
+
+def test_final_text_ignores_provisional_text():
+    partials = []
+    inc = rolling(lambda a: "provisional" if len(a) < SR else "segment", partials, min_segment_s=1.0, max_segment_s=2.0)
+    inc.feed(LOUD)
+    inc.feed(QUIET[:SR // 4])  # under a second: no cut yet
+    inc._roll_once = lt.IncrementalTranscriber._roll_once.__get__(inc)
+    inc.feed(LOUD), inc.feed(LOUD), inc.feed(QUIET), inc.feed(QUIET)
+    audio = np.concatenate([LOUD, QUIET[:SR // 4], LOUD, LOUD, QUIET, QUIET])
+    prefix, tail = inc.collect(audio)
+    assert "provisional" not in prefix and prefix.startswith("segment")
+
+
+def test_a_segment_finishing_keeps_the_words_after_it():
+    partials = []
+    release = threading.Event()
+
+    def stt(a):
+        if len(a) >= 2 * SR:
+            release.wait(5)
+            return "SEG"
+        return "TAIL"
+    inc = rolling(stt, partials, min_segment_s=2.0, max_segment_s=3.0)
+    for _ in range(4):
+        inc.feed(LOUD)
+    inc.feed(QUIET)  # pause: the segment is cut
+    assert inc.segments_started == 1
+    inc._roll_once()  # the segment is still at Whisper: goes first, no request
+    assert partials == []
+    release.set()
+    inc._futures[0].result()
+    inc.feed(LOUD), inc.feed(LOUD)
+    inc._roll_once()
+    assert partials[-1] == "SEG TAIL"
+    inc.close()
+
+
+def test_a_cut_during_a_rolling_request_drops_its_result():
+    partials = []
+    inc = rolling(lambda a: inc._consumed or inc.feed(QUIET) or "stale", partials, min_segment_s=1.0, max_segment_s=2.0)
+    inc._consumed = 0
+    inc.feed(LOUD), inc.feed(LOUD)
+
+    def cut_then_answer(a):
+        inc._consumed += 1
+        return "stale"
+    inc._transcribe = cut_then_answer
+    inc._roll_once()
+    assert partials == []
+    inc.close()
+
+
+def test_a_rolling_failure_ends_rolling_but_not_the_turn():
+    inc = lt.IncrementalTranscriber(lambda a: (_ for _ in ()).throw(RuntimeError("no")), SR,
+                                    on_partial=lambda t: None, rolling_s=0.01)
+    inc.begin(None)
+    inc.feed(LOUD), inc.feed(LOUD)
+    inc._rolling_thread.join(2)
+    assert not inc._rolling_thread.is_alive()
+    assert inc._failed is False
+    inc.close()
+
+
+def test_close_stops_the_rolling_thread():
+    inc = lt.IncrementalTranscriber(lambda a: "x", SR, on_partial=lambda t: None, rolling_s=0.01)
+    inc.begin(None)
+    thread = inc._rolling_thread
+    inc.close()
+    thread.join(2)
+    assert not thread.is_alive()
+
+
+def test_off_by_default_when_built_directly():
+    inc = lt.IncrementalTranscriber(lambda a: "x", SR, on_partial=lambda t: None)
+    inc.begin(None)
+    assert inc._rolling_thread is None
+    inc.close()
+
+
+def test_rolling_never_uses_the_failover_path():
+    """Failover can reach a paid provider; a display update every 2 seconds must not."""
+    from unittest.mock import MagicMock, patch
+    from voice_mode.tools import converse as cv
+
+    with patch.object(cv, "STT_BASE_URLS", ["https://api.openai.com/v1"]), patch.object(cv.httpx, "post") as post:
+        with pytest.raises(RuntimeError):
+            cv._rolling_local_stt(np.zeros(SR, dtype=np.int16))
+        post.assert_not_called()
+    answer = MagicMock()
+    answer.json.return_value = {"text": "hi"}
+    with patch.object(cv, "STT_BASE_URLS", ["https://api.openai.com/v1", "http://127.0.0.1:2022/v1"]), \
+         patch.object(cv.httpx, "post", return_value=answer) as post, \
+         patch.object(cv, "speech_to_text") as failover:
+        assert cv._rolling_local_stt(np.zeros(SR, dtype=np.int16)) == "hi"
+    assert post.call_args[0][0] == "http://127.0.0.1:2022/v1/audio/transcriptions"
+    failover.assert_not_called()
+
+
+def test_rolling_stops_when_the_listen_ends():
+    inc = lt.IncrementalTranscriber(lambda a: "x", SR, on_partial=lambda t: None, rolling_s=0.01)
+    inc.begin(None)
+    thread = inc._rolling_thread
+    inc.stop_rolling()
+    thread.join(2)
+    assert not thread.is_alive()
+    inc.close()
+

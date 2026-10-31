@@ -20,6 +20,8 @@ from scipy.io.wavfile import write
 from pydub import AudioSegment
 from openai import AsyncOpenAI
 import httpx
+import io
+import wave
 
 # Optional webrtcvad for silence detection
 try:
@@ -39,6 +41,7 @@ from voice_mode.server import mcp
 from voice_mode.conch import Conch
 from voice_mode.conversation_logger import get_conversation_logger
 from voice_mode.config import (
+    STT_BASE_URLS,
     audio_operation_lock,
     SAMPLE_RATE,
     CHANNELS,
@@ -840,6 +843,28 @@ def _incremental_segment_stt(segment: np.ndarray, transport: str = "local") -> s
     return result.get("text") or ""
 
 
+def _rolling_local_stt(audio: np.ndarray) -> str:
+    """Provisional text from the local Whisper only, for the words shown while talking.
+
+    Not speech_to_text: its failover can reach a paid provider and restart Whisper,
+    neither of which a display update may do every few seconds. Raises when there's
+    no local Whisper or it fails, which ends the rolling updates for this listen."""
+    url = next((u for u in STT_BASE_URLS if "127.0.0.1" in u or "localhost" in u), None)
+    if url is None:
+        raise RuntimeError("no local speech-to-text")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(np.asarray(audio).astype(np.int16).tobytes())
+    response = httpx.post(f"{url.rstrip('/')}/audio/transcriptions",
+                          files={"file": ("tail.wav", buf.getvalue(), "audio/wav")},
+                          data={"model": "whisper-1", "response_format": "json"}, timeout=10.0)
+    response.raise_for_status()
+    return response.json().get("text") or ""
+
+
 def _make_incremental(turn_id: str, transport: str = "local"):
     """IncrementalTranscriber publishing user_partial to the live feed, or None
     when VOICEMODE_INCREMENTAL_STT is off."""
@@ -850,6 +875,9 @@ def _make_incremental(turn_id: str, transport: str = "local"):
         transcribe=lambda seg: _incremental_segment_stt(seg, transport),
         sample_rate=SAMPLE_RATE,
         on_partial=lambda text: live_transcript.append_event("user_partial", turn_id, text, client_pid),
+        rolling_s=live_transcript.rolling_seconds(),
+        transcribe_rolling=_rolling_local_stt,
+        wait_for_speech=True,
     )
 
 
@@ -885,6 +913,8 @@ async def _speech_to_text_incremental(audio_data, incremental, save_audio, audio
     untranscribed tail goes to STT and the texts are joined; any segment failure
     (or a tail failure) falls back to one whole-recording transcription."""
     collected = None
+    if incremental is not None:
+        incremental.stop_rolling()
     if incremental is not None and incremental.segments_started:
         collected = await asyncio.get_event_loop().run_in_executor(None, incremental.collect, audio_data)
     if collected is not None:
@@ -1577,6 +1607,7 @@ def _record_held_until_send(fallback_max_duration: float, listen_stats: Optional
     chunks = []
     if incremental is not None:
         incremental.begin(None)
+        incremental.mark_speech()  # no VAD here to say when speech starts
     recorded = 0.0
     loop_done = False
     started = time.monotonic()
@@ -2373,6 +2404,8 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                                 if VAD_DEBUG:
                                     logger.info(f"[VAD_DEBUG] STATE CHANGE: WAITING_FOR_SPEECH -> SPEECH_ACTIVE at t={recording_duration:.1f}s")
                                 speech_detected = True
+                                if incremental is not None:
+                                    incremental.mark_speech()
                             if VAD_DEBUG and int(recording_duration * 1000) % 500 == 0:
                                 logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: speech_prob={endpoint_state.speech_prob:.3f}, "
                                             f"speech_started={endpoint_state.speech_started}, endpointed={endpoint_state.endpointed}")
@@ -2424,6 +2457,8 @@ def _record_audio_with_silence_detection(max_duration: float, disable_silence_de
                                         logger.info(f"[VAD_DEBUG] STATE CHANGE: WAITING_FOR_SPEECH -> SPEECH_ACTIVE at t={recording_duration:.1f}s")
                                     speech_detected = True
                                     silence_duration_ms = 0
+                                    if incremental is not None:
+                                        incremental.mark_speech()
                                 # No timeout in this state - just keep waiting
                                 # The only exit is speech detection or max_duration
                             else:

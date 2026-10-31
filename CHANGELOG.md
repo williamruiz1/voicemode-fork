@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Activity log** — `~/.voicemode/activity.jsonl` records each call starting and ending, waiting for the mic, taking it (and from whom, if by force), speaking, listening, refused calls, stuck audio and service restarts, with the calling tab. The floor script and VibeDispatcher write to the same file. Read it with `voice-activity.py` (claude-user-config).
 - **Frozen service detection** — `serve --daemon` watches its own event loop from a thread. Silent for 20 s: stacks go to the log and the phone is alerted. Silent for 60 s: the process exits and launchd starts a new one on the next connection.
 
+- **Your words show while you talk** — What you've said since the last finished segment is transcribed every 2 seconds and sent to the live feed as provisional text, so a short answer shows before Send. Provisional text is display only; the final text still comes from the segments. `VOICEMODE_INCREMENTAL_STT_ROLLING_S` sets the interval (0 turns it off). In-progress text no longer appears until speech is detected, which stops Whisper's invented words from a quiet room reaching the widget.
+
 ### Changed
 
 - **Restarts wait for running calls** — `serve --daemon` now holds a SIGTERM (`launchctl kickstart -k`, `bootout`, an install) until no request is being answered, for up to 55 seconds (launchd's `ExitTimeOut` cap is 60).
