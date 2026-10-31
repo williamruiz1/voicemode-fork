@@ -92,3 +92,27 @@ async def test_transcribe_short_circuits_silence_without_calling_stt(monkeypatch
     speech = _int16_at_rms(0.09)
     await conv.speech_to_text(speech)
     assert calls["n"] == 1, "STT must be called for real speech"
+
+
+@pytest.mark.parametrize("target_rms,expect_hint", [
+    (0.0008, True),   # dead or muted mic
+    (0.095,  False),  # working mic: the speech check failed for another reason
+])
+def test_no_speech_message_names_the_mic_only_when_the_clip_is_silent(target_rms, expect_hint, monkeypatch):
+    pytest.importorskip("sounddevice")
+    import voice_mode.tools.converse as conv
+    monkeypatch.setattr(conv.sd, "query_devices", lambda kind=None: {"name": "Test AirPods"})
+    message = conv._no_speech_message(_int16_at_rms(target_rms))
+    assert message.startswith("No speech detected")
+    assert ("Test AirPods" in message) is expect_hint
+
+
+def test_no_speech_message_survives_no_audio_and_device_errors(monkeypatch):
+    pytest.importorskip("sounddevice")
+    import voice_mode.tools.converse as conv
+    assert conv._no_speech_message(None) == "No speech detected"
+
+    def broken(kind=None):
+        raise RuntimeError("no device")
+    monkeypatch.setattr(conv.sd, "query_devices", broken)
+    assert "input: unknown" in conv._no_speech_message(_int16_at_rms(0.0008))
